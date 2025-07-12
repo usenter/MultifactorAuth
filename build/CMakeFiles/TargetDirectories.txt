@@ -1,0 +1,7 @@
+C:/Users/shova/Summer2025_project/TCPserver/build/CMakeFiles/tcp_server.dir
+C:/Users/shova/Summer2025_project/TCPserver/build/CMakeFiles/tcp_client.dir
+C:/Users/shova/Summer2025_project/TCPserver/build/CMakeFiles/multi_client_test.dir
+C:/Users/shova/Summer2025_project/TCPserver/build/CMakeFiles/client_to_client_server.dir
+C:/Users/shova/Summer2025_project/TCPserver/build/CMakeFiles/chat_client.dir
+C:/Users/shova/Summer2025_project/TCPserver/build/CMakeFiles/edit_cache.dir
+C:/Users/shova/Summer2025_project/TCPserver/build/CMakeFiles/rebuild_cache.dir
