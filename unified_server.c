@@ -4,6 +4,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include "auth_system.h"
 
 #define PORT 12345
 #define BUFFER_SIZE 1024
@@ -27,6 +28,53 @@ typedef struct {
 client_t clients[MAX_CLIENTS];
 int client_count = 0;
 CRITICAL_SECTION clients_cs;
+
+// Function to handle authentication
+int handle_authentication(SOCKET client_socket, const char* message) {
+    char command[64], username[MAX_USERNAME_LEN], password[MAX_PASSWORD_LEN];
+    char response[BUFFER_SIZE];
+    
+    // Parse the authentication message
+    if (sscanf(message, "%63s %31s %63s", command, username, password) != 3) {
+        snprintf(response, BUFFER_SIZE, "%s Invalid format. Use: AUTH_LOGIN username password or AUTH_REGISTER username password", AUTH_FAILED);
+        send(client_socket, response, strlen(response), 0);
+        return 0;
+    }
+    
+    if (strcmp(command, AUTH_LOGIN) == 0) {
+        if (authenticate_user(username, password)) {
+            if (create_session(username, client_socket)) {
+                snprintf(response, BUFFER_SIZE, "%s Welcome, %s! You are now authenticated.", AUTH_SUCCESS, username);
+                send(client_socket, response, strlen(response), 0);
+                printf("User %s logged in successfully\n", username);
+                return 1;
+            } else {
+                snprintf(response, BUFFER_SIZE, "%s Session creation failed", AUTH_FAILED);
+                send(client_socket, response, strlen(response), 0);
+                return 0;
+            }
+        } else {
+            snprintf(response, BUFFER_SIZE, "%s Invalid username or password", AUTH_FAILED);
+            send(client_socket, response, strlen(response), 0);
+            return 0;
+        }
+    } else if (strcmp(command, AUTH_REGISTER) == 0) {
+        if (add_user(username, password)) {
+            snprintf(response, BUFFER_SIZE, "%s User %s registered successfully. You can now login.", AUTH_SUCCESS, username);
+            send(client_socket, response, strlen(response), 0);
+            printf("New user registered: %s\n", username);
+            return 0; // Still need to login
+        } else {
+            snprintf(response, BUFFER_SIZE, "%s Registration failed. Username may already exist.", AUTH_FAILED);
+            send(client_socket, response, strlen(response), 0);
+            return 0;
+        }
+    } else {
+        snprintf(response, BUFFER_SIZE, "%s Unknown command. Use AUTH_LOGIN or AUTH_REGISTER", AUTH_FAILED);
+        send(client_socket, response, strlen(response), 0);
+        return 0;
+    }
+}
 
 // Function to find client by nickname
 int find_client_by_nickname(const char* nickname) {
@@ -91,9 +139,14 @@ DWORD WINAPI handle_basic_client(LPVOID arg) {
     
     char buffer[BUFFER_SIZE];
     char response[BUFFER_SIZE];
+    int authenticated = 0;
     
     printf("Client connected from %s:%d\n", 
            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+    
+    // Send authentication prompt
+    snprintf(response, BUFFER_SIZE, "Authentication required. Use: AUTH_LOGIN username password or AUTH_REGISTER username password\n");
+    send(client_socket, response, strlen(response), 0);
     
     while (1) {
         int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
@@ -104,15 +157,46 @@ DWORD WINAPI handle_basic_client(LPVOID arg) {
         }
         
         buffer[bytes_received] = '\0';
+        buffer[strcspn(buffer, "\r\n")] = 0;
+        
         printf("Received from %s:%d: %s\n", 
                inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), buffer);
         
+        // Check if this is an authentication message
+        if (!authenticated && (strncmp(buffer, AUTH_LOGIN, strlen(AUTH_LOGIN)) == 0 || 
+                              strncmp(buffer, AUTH_REGISTER, strlen(AUTH_REGISTER)) == 0)) {
+            authenticated = handle_authentication(client_socket, buffer);
+            if (authenticated) {
+                snprintf(response, BUFFER_SIZE, "Authentication successful! You can now use the echo service.\n");
+                send(client_socket, response, strlen(response), 0);
+            }
+            continue;
+        }
+        
+        // If not authenticated, require authentication
+        if (!authenticated) {
+            snprintf(response, BUFFER_SIZE, "Please authenticate first. Use: AUTH_LOGIN username password\n");
+            send(client_socket, response, strlen(response), 0);
+            continue;
+        }
+        
+        // Check if session is still valid
+        if (!is_authenticated(client_socket)) {
+            snprintf(response, BUFFER_SIZE, "Session expired. Please authenticate again.\n");
+            send(client_socket, response, strlen(response), 0);
+            authenticated = 0;
+            continue;
+        }
+        
+        // Handle regular echo message
         size_t max_copy = BUFFER_SIZE - strlen("Server received: ") - 1;
         size_t safe_len = strnlen(buffer, max_copy);
         snprintf(response, BUFFER_SIZE, "Server received: %.*s", (int)safe_len, buffer);
         send(client_socket, response, strlen(response), 0);
     }
     
+    // Clean up session
+    remove_session(client_socket);
     closesocket(client_socket);
     free(client_data);
     return 0;
@@ -124,18 +208,14 @@ DWORD WINAPI handle_chat_client(LPVOID arg) {
     free(arg);
     
     SOCKET client_socket = clients[client_index].socket;
-    struct sockaddr_in client_addr = clients[client_index].addr;
     char buffer[BUFFER_SIZE];
     char broadcast_msg[BUFFER_SIZE + 64];
+    int authenticated = 0;
+    session_t* session = NULL;
     
-    // Send welcome message
+    // Send authentication prompt
     snprintf(broadcast_msg, sizeof(broadcast_msg), 
-             "Server: %s has joined the chat!", clients[client_index].nickname);
-    broadcast_message(broadcast_msg, client_socket);
-    
-    snprintf(broadcast_msg, sizeof(broadcast_msg), 
-             "Welcome to the chat! You are %s. Commands: /nick <name>, /list, /quit\n", 
-             clients[client_index].nickname);
+             "Authentication required. Use: AUTH_LOGIN username password or AUTH_REGISTER username password\n");
     send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
     
     while (1) {
@@ -145,21 +225,65 @@ DWORD WINAPI handle_chat_client(LPVOID arg) {
         buffer[bytes_received] = '\0';
         buffer[strcspn(buffer, "\r\n")] = 0;
         
+        // Check if this is an authentication message
+        if (!authenticated && (strncmp(buffer, AUTH_LOGIN, strlen(AUTH_LOGIN)) == 0 || 
+                              strncmp(buffer, AUTH_REGISTER, strlen(AUTH_REGISTER)) == 0)) {
+            authenticated = handle_authentication(client_socket, buffer);
+            if (authenticated) {
+                session = get_session(client_socket);
+                if (session) {
+                    // Update nickname to username
+                    EnterCriticalSection(&clients_cs);
+                    strncpy(clients[client_index].nickname, session->username, sizeof(clients[client_index].nickname) - 1);
+                    clients[client_index].nickname[sizeof(clients[client_index].nickname) - 1] = '\0';
+                    LeaveCriticalSection(&clients_cs);
+                    
+                    // Send welcome message
+                    snprintf(broadcast_msg, sizeof(broadcast_msg), 
+                             "Server: %s has joined the chat!", clients[client_index].nickname);
+                    broadcast_message(broadcast_msg, client_socket);
+                    
+                    snprintf(broadcast_msg, sizeof(broadcast_msg), 
+                             "Welcome to the chat! You are %s. Commands: /nick <name>, /list, /quit\n", 
+                             clients[client_index].nickname);
+                    send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+                }
+            }
+            continue;
+        }
+        
+        // If not authenticated, require authentication
+        if (!authenticated) {
+            snprintf(broadcast_msg, sizeof(broadcast_msg), "Please authenticate first. Use: AUTH_LOGIN username password\n");
+            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+            continue;
+        }
+        
+        // Check if session is still valid
+        if (!is_authenticated(client_socket)) {
+            snprintf(broadcast_msg, sizeof(broadcast_msg), "Session expired. Please authenticate again.\n");
+            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+            authenticated = 0;
+            continue;
+        }
+        
         if (strcmp(buffer, "/quit") == 0) break;
         
         if (strncmp(buffer, "/nick ", 6) == 0) {
             char new_nick[32];
             strncpy(new_nick, buffer + 6, sizeof(new_nick) - 1);
             new_nick[sizeof(new_nick) - 1] = '\0';
+            char old_nick[32];
             
             EnterCriticalSection(&clients_cs);
+            strncpy(old_nick, clients[client_index].nickname, sizeof(clients[client_index].nickname) - 1);
             strncpy(clients[client_index].nickname, new_nick, sizeof(clients[client_index].nickname) - 1);
             clients[client_index].nickname[sizeof(clients[client_index].nickname) - 1] = '\0';
             LeaveCriticalSection(&clients_cs);
             
             snprintf(broadcast_msg, sizeof(broadcast_msg), 
                      "Server: %s changed nickname to %s", 
-                     inet_ntoa(client_addr.sin_addr), new_nick);
+                     old_nick, new_nick);
             broadcast_message(broadcast_msg, client_socket);
             continue;
         }
@@ -187,6 +311,8 @@ DWORD WINAPI handle_chat_client(LPVOID arg) {
         }
     }
     
+    // Clean up session
+    remove_session(client_socket);
     remove_client(client_index);
     return 0;
 }
@@ -218,6 +344,9 @@ int main(int argc, char *argv[]) {
         printf("WSAStartup failed\n");
         return 1;
     }
+    
+    // Initialize authentication system
+    init_auth_system();
     
     // Initialize critical section for chat mode
     if (mode == 1) {

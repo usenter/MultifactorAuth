@@ -7,8 +7,44 @@
 
 #define PORT 12345
 #define BUFFER_SIZE 1024
+#define MAX_MESSAGES 100
 
 volatile int running = 1;
+
+// Global message storage
+typedef struct {
+    char message[BUFFER_SIZE];
+    int valid;
+} stored_message_t;
+
+stored_message_t message_buffer[MAX_MESSAGES];
+int message_count = 0;
+CRITICAL_SECTION message_cs;
+
+// Function to store a message
+void store_message(const char* msg) {
+    EnterCriticalSection(&message_cs);
+    if (message_count < MAX_MESSAGES) {
+        strncpy(message_buffer[message_count].message, msg, BUFFER_SIZE - 1);
+        message_buffer[message_count].message[BUFFER_SIZE - 1] = '\0';
+        message_buffer[message_count].valid = 1;
+        message_count++;
+    }
+    LeaveCriticalSection(&message_cs);
+}
+
+// Function to get stored messages
+int get_stored_messages(char messages[][BUFFER_SIZE], int max_count) {
+    EnterCriticalSection(&message_cs);
+    int count = (message_count < max_count) ? message_count : max_count;
+    for (int i = 0; i < count; i++) {
+        if (message_buffer[i].valid) {
+            strcpy(messages[i], message_buffer[i].message);
+        }
+    }
+    LeaveCriticalSection(&message_cs);
+    return count;
+}
 
 // Function to receive messages from server (chat mode)
 DWORD WINAPI receive_messages(LPVOID arg) {
@@ -24,6 +60,10 @@ DWORD WINAPI receive_messages(LPVOID arg) {
         }
         
         buffer[bytes_received] = '\0';
+        
+        // Store the message
+        store_message(buffer);
+        
         printf("\n%s\n", buffer);
         printf("> ");
         fflush(stdout);
@@ -141,6 +181,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
+    // Initialize critical section for message storage
+    InitializeCriticalSection(&message_cs);
+    
     // Create socket
     client_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (client_socket == INVALID_SOCKET) {
@@ -179,6 +222,7 @@ int main(int argc, char *argv[]) {
     
     // Cleanup
     closesocket(client_socket);
+    DeleteCriticalSection(&message_cs);
     WSACleanup();
     return 0;
 } 
