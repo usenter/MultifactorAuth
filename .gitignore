@@ -1,0 +1,42 @@
+# Executable files
+*.exe
+*.o
+*.obj
+*.out
+
+# Build directories
+build/
+.cache/
+.cursor/
+.vscode/
+
+# Temporary files
+temp.txt
+*.tmp
+*.log
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# CMake generated files
+CMakeFiles/
+cmake_install.cmake
+CMakeCache.txt
+compile_commands.json
+
+# Backup files
+*.bak
+*.backup 
