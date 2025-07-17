@@ -1,9 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <signal.h>
 #include "auth_system.h"
 
 #define PORT 12345
@@ -12,7 +15,7 @@
 
 // Structure to hold client information (for chat mode)
 typedef struct {
-    SOCKET socket;
+    int socket;
     struct sockaddr_in addr;
     char nickname[32];
     int active;
@@ -20,17 +23,17 @@ typedef struct {
 
 // Structure to pass client info to thread (for basic mode)
 typedef struct {
-    SOCKET client_socket;
+    int client_socket;
     struct sockaddr_in client_addr;
 } client_info_t;
 
 // Global variables for chat mode
 client_t clients[MAX_CLIENTS];
 int client_count = 0;
-CRITICAL_SECTION clients_cs;
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Function to handle authentication
-int handle_authentication(SOCKET client_socket, const char* message) {
+int handle_authentication(int client_socket, const char* message) {
     char command[64], username[MAX_USERNAME_LEN], password[MAX_PASSWORD_LEN];
     char response[BUFFER_SIZE];
     
@@ -87,19 +90,19 @@ int find_client_by_nickname(const char* nickname) {
 }
 
 // Function to broadcast message to all clients except sender (chat mode)
-void broadcast_message(const char* message, SOCKET sender_socket) {
-    EnterCriticalSection(&clients_cs);
+void broadcast_message(const char* message, int sender_socket) {
+    pthread_mutex_lock(&clients_mutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].active && clients[i].socket != sender_socket) {
             send(clients[i].socket, message, strlen(message), 0);
         }
     }
-    LeaveCriticalSection(&clients_cs);
+    pthread_mutex_unlock(&clients_mutex);
 }
 
 // Function to add a new client (chat mode)
-int add_client(SOCKET client_socket, struct sockaddr_in client_addr) {
-    EnterCriticalSection(&clients_cs);
+int add_client(int client_socket, struct sockaddr_in client_addr) {
+    pthread_mutex_lock(&clients_mutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!clients[i].active) {
             clients[i].socket = client_socket;
@@ -110,31 +113,31 @@ int add_client(SOCKET client_socket, struct sockaddr_in client_addr) {
             printf("Client %s connected from %s:%d (Total clients: %d)\n", 
                    clients[i].nickname, inet_ntoa(client_addr.sin_addr), 
                    ntohs(client_addr.sin_port), client_count);
-            LeaveCriticalSection(&clients_cs);
+            pthread_mutex_unlock(&clients_mutex);
             return i;
         }
     }
-    LeaveCriticalSection(&clients_cs);
+    pthread_mutex_unlock(&clients_mutex);
     return -1;
 }
 
 // Function to remove a client (chat mode)
 void remove_client(int client_index) {
     if (client_index >= 0 && client_index < MAX_CLIENTS && clients[client_index].active) {
-        EnterCriticalSection(&clients_cs);
+        pthread_mutex_lock(&clients_mutex);
         printf("Client %s disconnected (Total clients: %d)\n", 
                clients[client_index].nickname, client_count - 1);
-        closesocket(clients[client_index].socket);
+        close(clients[client_index].socket);
         clients[client_index].active = 0;
         client_count--;
-        LeaveCriticalSection(&clients_cs);
+        pthread_mutex_unlock(&clients_mutex);
     }
 }
 
 // Function to handle individual client in basic mode
-DWORD WINAPI handle_basic_client(LPVOID arg) {
+void* handle_basic_client(void* arg) {
     client_info_t *client_data = (client_info_t *)arg;
-    SOCKET client_socket = client_data->client_socket;
+    int client_socket = client_data->client_socket;
     struct sockaddr_in client_addr = client_data->client_addr;
     
     char buffer[BUFFER_SIZE];
@@ -197,30 +200,35 @@ DWORD WINAPI handle_basic_client(LPVOID arg) {
     
     // Clean up session
     remove_session(client_socket);
-    closesocket(client_socket);
+    close(client_socket);
     free(client_data);
-    return 0;
+    return NULL;
 }
 
 // Function to handle individual client in chat mode
-DWORD WINAPI handle_chat_client(LPVOID arg) {
+void* handle_chat_client(void* arg) {
     int client_index = *(int*)arg;
-    free(arg);
+    int client_socket = clients[client_index].socket;
+    struct sockaddr_in client_addr = clients[client_index].addr;
     
-    SOCKET client_socket = clients[client_index].socket;
     char buffer[BUFFER_SIZE];
-    char broadcast_msg[BUFFER_SIZE + 64];
+    char broadcast_msg[BUFFER_SIZE];
     int authenticated = 0;
-    session_t* session = NULL;
+    
+    printf("Chat client connected from %s:%d\n", 
+           inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
     
     // Send authentication prompt
-    snprintf(broadcast_msg, sizeof(broadcast_msg), 
-             "Authentication required. Use: AUTH_LOGIN username password or AUTH_REGISTER username password\n");
+    snprintf(broadcast_msg, sizeof(broadcast_msg), "Authentication required. Use: AUTH_LOGIN username password or AUTH_REGISTER username password\n");
     send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
     
     while (1) {
         int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
-        if (bytes_received <= 0) break;
+        if (bytes_received <= 0) {
+            printf("Chat client %s:%d disconnected\n", 
+                   inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+            break;
+        }
         
         buffer[bytes_received] = '\0';
         buffer[strcspn(buffer, "\r\n")] = 0;
@@ -230,24 +238,8 @@ DWORD WINAPI handle_chat_client(LPVOID arg) {
                               strncmp(buffer, AUTH_REGISTER, strlen(AUTH_REGISTER)) == 0)) {
             authenticated = handle_authentication(client_socket, buffer);
             if (authenticated) {
-                session = get_session(client_socket);
-                if (session) {
-                    // Update nickname to username
-                    EnterCriticalSection(&clients_cs);
-                    strncpy(clients[client_index].nickname, session->username, sizeof(clients[client_index].nickname) - 1);
-                    clients[client_index].nickname[sizeof(clients[client_index].nickname) - 1] = '\0';
-                    LeaveCriticalSection(&clients_cs);
-                    
-                    // Send welcome message
-                    snprintf(broadcast_msg, sizeof(broadcast_msg), 
-                             "Server: %s has joined the chat!", clients[client_index].nickname);
-                    broadcast_message(broadcast_msg, client_socket);
-                    
-                    snprintf(broadcast_msg, sizeof(broadcast_msg), 
-                             "Welcome to the chat! You are %s. Commands: /nick <name>, /list, /quit\n", 
-                             clients[client_index].nickname);
-                    send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-                }
+                snprintf(broadcast_msg, sizeof(broadcast_msg), "Server: %s joined the chat", clients[client_index].nickname);
+                broadcast_message(broadcast_msg, client_socket);
             }
             continue;
         }
@@ -275,11 +267,11 @@ DWORD WINAPI handle_chat_client(LPVOID arg) {
             new_nick[sizeof(new_nick) - 1] = '\0';
             char old_nick[32];
             
-            EnterCriticalSection(&clients_cs);
+            pthread_mutex_lock(&clients_mutex);
             strncpy(old_nick, clients[client_index].nickname, sizeof(clients[client_index].nickname) - 1);
             strncpy(clients[client_index].nickname, new_nick, sizeof(clients[client_index].nickname) - 1);
             clients[client_index].nickname[sizeof(clients[client_index].nickname) - 1] = '\0';
-            LeaveCriticalSection(&clients_cs);
+            pthread_mutex_unlock(&clients_mutex);
             
             snprintf(broadcast_msg, sizeof(broadcast_msg), 
                      "Server: %s changed nickname to %s", 
@@ -290,14 +282,14 @@ DWORD WINAPI handle_chat_client(LPVOID arg) {
         
         if (strcmp(buffer, "/list") == 0) {
             char list_msg[BUFFER_SIZE] = "Connected clients: ";
-            EnterCriticalSection(&clients_cs);
+            pthread_mutex_lock(&clients_mutex);
             for (int i = 0; i < MAX_CLIENTS; i++) {
                 if (clients[i].active) {
                     strcat(list_msg, clients[i].nickname);
                     strcat(list_msg, " ");
                 }
             }
-            LeaveCriticalSection(&clients_cs);
+            pthread_mutex_unlock(&clients_mutex);
             strcat(list_msg, "\n");
             send(client_socket, list_msg, strlen(list_msg), 0);
             continue;
@@ -314,15 +306,15 @@ DWORD WINAPI handle_chat_client(LPVOID arg) {
     // Clean up session
     remove_session(client_socket);
     remove_client(client_index);
-    return 0;
+    free(arg);
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
-    WSADATA wsaData;
-    SOCKET server_socket, client_socket;
+    int server_socket, client_socket;
     struct sockaddr_in server_addr, client_addr;
-    int client_addr_len = sizeof(client_addr);
-    HANDLE thread_handle;
+    socklen_t client_addr_len = sizeof(client_addr);
+    pthread_t thread_id;
     int mode = 0; // 0 = basic, 1 = chat
     
     // Parse command line arguments
@@ -339,34 +331,21 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    // Initialize Winsock
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        printf("WSAStartup failed\n");
-        return 1;
-    }
-    
     // Initialize authentication system
     init_auth_system();
     
-    // Initialize critical section for chat mode
-    if (mode == 1) {
-        InitializeCriticalSection(&clients_cs);
-    }
-    
     // Create socket
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_socket == INVALID_SOCKET) {
+    if (server_socket < 0) {
         printf("Socket creation failed\n");
-        WSACleanup();
         return 1;
     }
     
     // Set socket options
     int opt = 1;
-    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt)) < 0) {
+    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         printf("setsockopt failed\n");
-        closesocket(server_socket);
-        WSACleanup();
+        close(server_socket);
         return 1;
     }
     
@@ -378,16 +357,14 @@ int main(int argc, char *argv[]) {
     // Bind socket
     if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         printf("Bind failed\n");
-        closesocket(server_socket);
-        WSACleanup();
+        close(server_socket);
         return 1;
     }
     
     // Listen for connections
     if (listen(server_socket, 5) < 0) {
         printf("Listen failed\n");
-        closesocket(server_socket);
-        WSACleanup();
+        close(server_socket);
         return 1;
     }
     
@@ -397,7 +374,7 @@ int main(int argc, char *argv[]) {
     // Accept client connections
     while (1) {
         client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
-        if (client_socket == INVALID_SOCKET) {
+        if (client_socket < 0) {
             printf("Accept failed\n");
             continue;
         }
@@ -407,27 +384,26 @@ int main(int argc, char *argv[]) {
             client_info_t *client_data = malloc(sizeof(client_info_t));
             if (client_data == NULL) {
                 printf("Memory allocation failed\n");
-                closesocket(client_socket);
+                close(client_socket);
                 continue;
             }
             
             client_data->client_socket = client_socket;
             client_data->client_addr = client_addr;
             
-            thread_handle = CreateThread(NULL, 0, handle_basic_client, (LPVOID)client_data, 0, NULL);
-            if (thread_handle == NULL) {
+            if (pthread_create(&thread_id, NULL, handle_basic_client, (void*)client_data) != 0) {
                 printf("Thread creation failed\n");
                 free(client_data);
-                closesocket(client_socket);
+                close(client_socket);
                 continue;
             }
-            CloseHandle(thread_handle);
+            pthread_detach(thread_id);
         } else {
             // Chat mode
             int client_index = add_client(client_socket, client_addr);
             if (client_index == -1) {
                 printf("No space for new client\n");
-                closesocket(client_socket);
+                close(client_socket);
                 continue;
             }
             
@@ -439,21 +415,17 @@ int main(int argc, char *argv[]) {
             }
             *client_index_ptr = client_index;
             
-            thread_handle = CreateThread(NULL, 0, handle_chat_client, (LPVOID)client_index_ptr, 0, NULL);
-            if (thread_handle == NULL) {
+            if (pthread_create(&thread_id, NULL, handle_chat_client, (void*)client_index_ptr) != 0) {
                 printf("Thread creation failed\n");
                 free(client_index_ptr);
                 remove_client(client_index);
                 continue;
             }
-            CloseHandle(thread_handle);
+            pthread_detach(thread_id);
         }
     }
     
-    closesocket(server_socket);
-    if (mode == 1) {
-        DeleteCriticalSection(&clients_cs);
-    }
-    WSACleanup();
+    close(server_socket);
+    pthread_mutex_destroy(&clients_mutex);
     return 0;
 } 

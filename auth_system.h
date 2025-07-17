@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <winsock2.h>
+#include <time.h>
 
 #define MAX_USERNAME_LEN 32
 #define MAX_PASSWORD_LEN 64
@@ -22,7 +22,7 @@ typedef struct {
 // Session structure
 typedef struct {
     char username[MAX_USERNAME_LEN];
-    SOCKET client_socket;
+    int client_socket;
     time_t login_time;
     int authenticated;
 } session_t;
@@ -38,10 +38,10 @@ typedef struct {
 void init_auth_system(void);
 int add_user(const char* username, const char* password);
 int authenticate_user(const char* username, const char* password);
-int create_session(const char* username, SOCKET client_socket);
-void remove_session(SOCKET client_socket);
-session_t* get_session(SOCKET client_socket);
-int is_authenticated(SOCKET client_socket);
+int create_session(const char* username, int client_socket);
+void remove_session(int client_socket);
+session_t* get_session(int client_socket);
+int is_authenticated(int client_socket);
 void cleanup_expired_sessions(void);
 void hash_password(const char* password, char* hash);
 int verify_password(const char* password, const char* hash);

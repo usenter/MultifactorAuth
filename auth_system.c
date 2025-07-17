@@ -75,7 +75,7 @@ int authenticate_user(const char* username, const char* password) {
 }
 
 // Create a new session
-int create_session(const char* username, SOCKET client_socket) {
+int create_session(const char* username, int client_socket) {
     // Remove any existing session for this socket
     remove_session(client_socket);
     
@@ -94,7 +94,7 @@ int create_session(const char* username, SOCKET client_socket) {
 }
 
 // Remove a session
-void remove_session(SOCKET client_socket) {
+void remove_session(int client_socket) {
     for (int i = 0; i < session_count; i++) {
         if (sessions[i].authenticated && sessions[i].client_socket == client_socket) {
             // Move last session to this position
@@ -108,7 +108,7 @@ void remove_session(SOCKET client_socket) {
 }
 
 // Get session for a socket
-session_t* get_session(SOCKET client_socket) {
+session_t* get_session(int client_socket) {
     for (int i = 0; i < session_count; i++) {
         if (sessions[i].authenticated && sessions[i].client_socket == client_socket) {
             return &sessions[i];
@@ -118,7 +118,7 @@ session_t* get_session(SOCKET client_socket) {
 }
 
 // Check if a socket is authenticated
-int is_authenticated(SOCKET client_socket) {
+int is_authenticated(int client_socket) {
     session_t* session = get_session(client_socket);
     if (!session) return 0;
     

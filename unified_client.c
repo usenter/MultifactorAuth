@@ -1,9 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <signal.h>
 
 #define PORT 12345
 #define BUFFER_SIZE 1024
@@ -19,36 +22,36 @@ typedef struct {
 
 stored_message_t message_buffer[MAX_MESSAGES];
 int message_count = 0;
-CRITICAL_SECTION message_cs;
+pthread_mutex_t message_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Function to store a message
 void store_message(const char* msg) {
-    EnterCriticalSection(&message_cs);
+    pthread_mutex_lock(&message_mutex);
     if (message_count < MAX_MESSAGES) {
         strncpy(message_buffer[message_count].message, msg, BUFFER_SIZE - 1);
         message_buffer[message_count].message[BUFFER_SIZE - 1] = '\0';
         message_buffer[message_count].valid = 1;
         message_count++;
     }
-    LeaveCriticalSection(&message_cs);
+    pthread_mutex_unlock(&message_mutex);
 }
 
 // Function to get stored messages
 int get_stored_messages(char messages[][BUFFER_SIZE], int max_count) {
-    EnterCriticalSection(&message_cs);
+    pthread_mutex_lock(&message_mutex);
     int count = (message_count < max_count) ? message_count : max_count;
     for (int i = 0; i < count; i++) {
         if (message_buffer[i].valid) {
             strcpy(messages[i], message_buffer[i].message);
         }
     }
-    LeaveCriticalSection(&message_cs);
+    pthread_mutex_unlock(&message_mutex);
     return count;
 }
 
 // Function to receive messages from server (chat mode)
-DWORD WINAPI receive_messages(LPVOID arg) {
-    SOCKET client_socket = *(SOCKET*)arg;
+void* receive_messages(void* arg) {
+    int client_socket = *(int*)arg;
     char buffer[BUFFER_SIZE];
     
     while (running) {
@@ -69,11 +72,11 @@ DWORD WINAPI receive_messages(LPVOID arg) {
         fflush(stdout);
     }
     
-    return 0;
+    return NULL;
 }
 
 // Function to handle basic client mode (simple send/receive)
-void basic_client_mode(SOCKET client_socket) {
+void basic_client_mode(int client_socket) {
     char buffer[BUFFER_SIZE];
     char *test_messages[] = {
         "Hello, Server!",
@@ -104,24 +107,23 @@ void basic_client_mode(SOCKET client_socket) {
             break;
         }
         
-        Sleep(1000); // Wait 1 second between messages
+        sleep(1); // Wait 1 second between messages
     }
     
     printf("Basic client finished\n");
 }
 
 // Function to handle chat client mode (interactive)
-void chat_client_mode(SOCKET client_socket) {
+void chat_client_mode(int client_socket) {
     char buffer[BUFFER_SIZE];
-    HANDLE receive_thread;
+    pthread_t receive_thread;
     
     printf("Connected to chat server!\n");
     printf("Commands: /nick <name>, /list, /quit\n");
     printf("Type your messages below:\n\n");
     
     // Create thread to receive messages
-    receive_thread = CreateThread(NULL, 0, receive_messages, &client_socket, 0, NULL);
-    if (receive_thread == NULL) {
+    if (pthread_create(&receive_thread, NULL, receive_messages, &client_socket) != 0) {
         printf("Failed to create receive thread\n");
         return;
     }
@@ -137,7 +139,7 @@ void chat_client_mode(SOCKET client_socket) {
         }
         
         if (strlen(buffer) > 0) {
-            if (send(client_socket, buffer, (int)strlen(buffer), 0) == SOCKET_ERROR) {
+            if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
                 printf("Failed to send message\n");
                 running = 0;
                 break;
@@ -149,15 +151,13 @@ void chat_client_mode(SOCKET client_socket) {
     
     // Cleanup
     running = 0;
-    shutdown(client_socket, SD_BOTH);
-    WaitForSingleObject(receive_thread, INFINITE);
-    CloseHandle(receive_thread);
+    shutdown(client_socket, SHUT_RDWR);
+    pthread_join(receive_thread, NULL);
     printf("Disconnected from chat server\n");
 }
 
 int main(int argc, char *argv[]) {
-    WSADATA wsaData;
-    SOCKET client_socket;
+    int client_socket;
     struct sockaddr_in server_addr;
     int mode = 0; // 0 = basic, 1 = chat
     
@@ -175,20 +175,10 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    // Initialize Winsock
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        printf("WSAStartup failed\n");
-        return 1;
-    }
-    
-    // Initialize critical section for message storage
-    InitializeCriticalSection(&message_cs);
-    
     // Create socket
     client_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (client_socket == INVALID_SOCKET) {
+    if (client_socket < 0) {
         printf("Socket creation failed\n");
-        WSACleanup();
         return 1;
     }
     
@@ -199,17 +189,15 @@ int main(int argc, char *argv[]) {
     
     if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) <= 0) {
         printf("Invalid address\n");
-        closesocket(client_socket);
-        WSACleanup();
+        close(client_socket);
         return 1;
     }
     
     // Connect to server
     printf("Connecting to %s server...\n", mode == 1 ? "chat" : "basic");
-    if (connect(client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
+    if (connect(client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         printf("Connection failed\n");
-        closesocket(client_socket);
-        WSACleanup();
+        close(client_socket);
         return 1;
     }
     
@@ -221,8 +209,7 @@ int main(int argc, char *argv[]) {
     }
     
     // Cleanup
-    closesocket(client_socket);
-    DeleteCriticalSection(&message_cs);
-    WSACleanup();
+    close(client_socket);
+    pthread_mutex_destroy(&message_mutex);
     return 0;
 } 
