@@ -35,10 +35,10 @@
 - Sessions expire after 5 minutes of inactivity
 
 ### How to Use:
-1. **Start server**: `./unified_server chat`
-2. **Start client**: `./unified_client chat`
-3. **Create users.txt and put usernames as <user>:<password>**
-3. **Enter username and password** when prompted
+1. **Start server**: `./unified_server`
+2. **Start client**: `./unified_client`
+3. **Create users.txt and put usernames as <user>:<password>** - must encrypt password manually 
+3. **Enter username and password** - using the /login command
 
 
 **Chat Commands:**
