@@ -6,8 +6,8 @@ LIBS =
 # Targets
 all: unified_server unified_client authenticated_client simple_test_client
 
-# Server with authentication
-unified_server: unified_server.c auth_system.c
+# Server with authentication (includes hashmap dependency)
+unified_server: unified_server.c auth_system.c hashmap.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 # Original client (without authentication)

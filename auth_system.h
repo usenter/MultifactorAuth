@@ -28,11 +28,11 @@ typedef struct {
 } session_t;
 
 // Authentication commands
-#define AUTH_LOGIN "AUTH_LOGIN"
-#define AUTH_REGISTER "AUTH_REGISTER"
+#define AUTH_LOGIN "/login"
+#define AUTH_REGISTER "/register"
 #define AUTH_SUCCESS "AUTH_SUCCESS"
 #define AUTH_FAILED "AUTH_FAILED"
-#define AUTH_LOGOUT "AUTH_LOGOUT"
+#define AUTH_LOGOUT "/logout"
 
 // Function declarations
 void init_auth_system(void);

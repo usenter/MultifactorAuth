@@ -37,8 +37,8 @@
 - `user2` / `password2`
 
 ### Authentication Commands
-- `AUTH_LOGIN username password` - Login
-- `AUTH_REGISTER username password` - Register new user
+- `/login <username> <password>` - Login
+- `/register <username> <password>` - Register new user
 - Sessions expire after 5 minutes of inactivity
 
 ### How to Use:

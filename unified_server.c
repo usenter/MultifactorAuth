@@ -6,7 +6,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include <signal.h>
+
 #include "auth_system.h"
 
 #define PORT 12345
@@ -39,7 +39,7 @@ int handle_authentication(int client_socket, const char* message) {
     
     // Parse the authentication message
     if (sscanf(message, "%63s %31s %63s", command, username, password) != 3) {
-        snprintf(response, BUFFER_SIZE, "%s Invalid format. Use: AUTH_LOGIN username password or AUTH_REGISTER username password", AUTH_FAILED);
+        snprintf(response, BUFFER_SIZE, "%s Invalid format. Use: /login <username> <password> or /register <username> <password>", AUTH_FAILED);
         send(client_socket, response, strlen(response), 0);
         return 0;
     }
@@ -73,7 +73,7 @@ int handle_authentication(int client_socket, const char* message) {
             return 0;
         }
     } else {
-        snprintf(response, BUFFER_SIZE, "%s Unknown command. Use AUTH_LOGIN or AUTH_REGISTER", AUTH_FAILED);
+        snprintf(response, BUFFER_SIZE, "%s Unknown command. Use /login or /register", AUTH_FAILED);
         send(client_socket, response, strlen(response), 0);
         return 0;
     }
@@ -148,7 +148,7 @@ void* handle_basic_client(void* arg) {
            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
     
     // Send authentication prompt
-    snprintf(response, BUFFER_SIZE, "Authentication required. Use: AUTH_LOGIN username password or AUTH_REGISTER username password\n");
+    snprintf(response, BUFFER_SIZE, "Authentication required. Use: /login <username> <password> or /register <username> <password>\n");
     send(client_socket, response, strlen(response), 0);
     
     while (1) {
@@ -178,7 +178,7 @@ void* handle_basic_client(void* arg) {
         
         // If not authenticated, require authentication
         if (!authenticated) {
-            snprintf(response, BUFFER_SIZE, "Please authenticate first. Use: AUTH_LOGIN username password\n");
+            snprintf(response, BUFFER_SIZE, "Please authenticate first. Use: /login <username> <password>\n");
             send(client_socket, response, strlen(response), 0);
             continue;
         }
@@ -219,7 +219,7 @@ void* handle_chat_client(void* arg) {
            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
     
     // Send authentication prompt
-    snprintf(broadcast_msg, sizeof(broadcast_msg), "Authentication required. Use: AUTH_LOGIN username password or AUTH_REGISTER username password\n");
+    snprintf(broadcast_msg, sizeof(broadcast_msg), "Authentication required. Use: /login <username> <password> or /register <username> <password>\n");
     send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
     
     while (1) {
@@ -246,7 +246,7 @@ void* handle_chat_client(void* arg) {
         
         // If not authenticated, require authentication
         if (!authenticated) {
-            snprintf(broadcast_msg, sizeof(broadcast_msg), "Please authenticate first. Use: AUTH_LOGIN username password\n");
+            snprintf(broadcast_msg, sizeof(broadcast_msg), "Please authenticate first. Use: /login <username> <password>\n");
             send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
             continue;
         }
@@ -315,7 +315,7 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
     pthread_t thread_id;
-    int mode = 0; // 0 = basic, 1 = chat
+    int mode = 1; // 0 = basic, 1 = chat
     
     // Parse command line arguments
     if (argc > 1) {

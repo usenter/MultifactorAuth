@@ -1,12 +1,12 @@
 #include <stdio.h>
-#include <stdlib.h>
+//#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include <signal.h>
+//#include <signal.h>
 
 #define PORT 12345
 #define BUFFER_SIZE 1024
@@ -18,8 +18,8 @@ int authenticated = 0;
 char username[MAX_USERNAME_LEN];
 
 // Authentication commands
-#define AUTH_LOGIN "AUTH_LOGIN"
-#define AUTH_REGISTER "AUTH_REGISTER"
+#define AUTH_LOGIN "/login"
+#define AUTH_REGISTER "/register"
 #define AUTH_SUCCESS "AUTH_SUCCESS"
 #define AUTH_FAILED "AUTH_FAILED"
 

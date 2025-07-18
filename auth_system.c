@@ -1,8 +1,10 @@
 #include "auth_system.h"
 #include <time.h>
+#include "hashmap.h"
 
 // Global variables
-static user_t users[MAX_USERS];
+static struct hashmap *users = NULL;
+
 static session_t sessions[MAX_USERS];
 static int user_count = 0;
 static int session_count = 0;
@@ -18,7 +20,32 @@ void hash_password(const char* password, char* hash) {
     
     sprintf(hash, "%08lx", hash_val);
 }
+int user_compare(const void *a, const void *b, void* udata) {
+    const user_t *ua = a;
+    const user_t *ub = b;
+    return strcmp(ua->username, ub->username);
+}
 
+bool user_iter(const void *item, void* udata) {
+    const user_t *user = item;
+    printf("%s\n", user->username);
+    return true;
+}
+
+uint64_t user_hash(const void *item, uint64_t seed0, uint64_t seed1) {
+    const user_t *user = item;
+    return hashmap_sip(user->username, strlen(user->username), seed0, seed1);
+}
+
+// Constructor: create a user_t with just a username (for lookups)
+user_t create_user(const char* username) {
+    user_t user;
+    strncpy(user.username, username, MAX_USERNAME_LEN - 1);
+    user.username[MAX_USERNAME_LEN - 1] = '\0';
+    user.password_hash[0] = '\0';  // Empty password hash
+    user.active = 0;               // Default to inactive
+    return user;
+}
 // Verify password against hash
 int verify_password(const char* password, const char* hash) {
     char computed_hash[MAX_HASH_LEN];
@@ -28,17 +55,13 @@ int verify_password(const char* password, const char* hash) {
 
 // Initialize authentication system
 void init_auth_system(void) {
-    memset(users, 0, sizeof(users));
-    memset(sessions, 0, sizeof(sessions));
+    users = hashmap_new(sizeof(user_t), 0, 0, 0, user_hash, user_compare, NULL, NULL);
+
     user_count = 0;
     session_count = 0;
     
-    // Add some default users
-    add_user("admin", "admin123");
-    add_user("user1", "password1");
-    add_user("user2", "password2");
+    load_users_from_file("users.txt");
     
-    printf("Authentication system initialized with %d default users\n", user_count);
 }
 
 // Add a new user
@@ -48,27 +71,32 @@ int add_user(const char* username, const char* password) {
     }
     
     // Check if username already exists
-    for (int i = 0; i < user_count; i++) {
-        if (users[i].active && strcmp(users[i].username, username) == 0) {
-            return 0; // Username already exists
-        }
+    user_t lookup_user = create_user(username);
+    
+    const user_t *found_ptr = hashmap_get(users, &lookup_user);
+    if (found_ptr != NULL) {
+        return 0; // Username already exists
     }
     
-    // Add new user
-    strncpy(users[user_count].username, username, MAX_USERNAME_LEN - 1);
-    users[user_count].username[MAX_USERNAME_LEN - 1] = '\0';
-    hash_password(password, users[user_count].password_hash);
-    users[user_count].active = 1;
-    user_count++;
+    // Create new user with password and active status
+    hash_password(password, lookup_user.password_hash);
+    lookup_user.active = 1;
+    hashmap_set(users, &lookup_user);
+    
+
     
     return 1; // Success
 }
 
 // Authenticate a user
 int authenticate_user(const char* username, const char* password) {
-    for (int i = 0; i < user_count; i++) {
-        if (users[i].active && strcmp(users[i].username, username) == 0) {
-            return verify_password(password, users[i].password_hash);
+    user_t lookup_user = create_user(username);
+    
+    const user_t *found_ptr = hashmap_get(users, &lookup_user);
+    if (found_ptr != NULL) {
+        user_t found_user = *found_ptr;  // Copy the contents, not the pointer
+        if (found_user.active) {
+            return verify_password(password, found_user.password_hash);
         }
     }
     return 0; // User not found or password incorrect
@@ -143,7 +171,7 @@ void cleanup_expired_sessions(void) {
 }
 
 // Save users to file
-void save_users_to_file(const char* filename) {
+/*void save_users_to_file(const char* filename) {
     FILE* file = fopen(filename, "w");
     if (!file) {
         printf("Failed to open file for writing: %s\n", filename);
@@ -158,7 +186,7 @@ void save_users_to_file(const char* filename) {
     
     fclose(file);
     printf("Users saved to %s\n", filename);
-}
+}*/
 
 // Load users from file
 void load_users_from_file(const char* filename) {
@@ -171,18 +199,30 @@ void load_users_from_file(const char* filename) {
     char line[256];
     char username[MAX_USERNAME_LEN];
     char password_hash[MAX_HASH_LEN];
+    int loaded_count = 0;
     
     while (fgets(line, sizeof(line), file) && user_count < MAX_USERS) {
         if (sscanf(line, "%31[^:]:%64s", username, password_hash) == 2) {
-            strncpy(users[user_count].username, username, MAX_USERNAME_LEN - 1);
-            users[user_count].username[MAX_USERNAME_LEN - 1] = '\0';
-            strncpy(users[user_count].password_hash, password_hash, MAX_HASH_LEN - 1);
-            users[user_count].password_hash[MAX_HASH_LEN - 1] = '\0';
-            users[user_count].active = 1;
-            user_count++;
+            user_t new_user = create_user(username);
+            strncpy(new_user.password_hash, password_hash, MAX_HASH_LEN - 1);
+            new_user.password_hash[MAX_HASH_LEN - 1] = '\0';
+            new_user.active = 1;
+
+            // Check if user already exists
+            user_t lookup_user = create_user(username);
+            const user_t *found_ptr = hashmap_get(users, &lookup_user);
+            
+            if (found_ptr == NULL) {
+                // User doesn't exist, add them
+                hashmap_set(users, &new_user);
+                loaded_count++;
+                user_count++;
+                printf("Loaded user: %s and password: %s\n", username, password_hash);
+            }    
         }
     }
     
     fclose(file);
-    printf("Loaded %d users from %s\n", user_count, filename);
+    printf("Loaded %d new users from %s", loaded_count, filename);
+    
 } 
