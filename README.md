@@ -133,15 +133,15 @@ make run-test-client
 ### Chat Test
 ```bash
 # Terminal 1
-./unified_server chat
+./unified_server
 
 # Terminal 2
-./unified_client chat
-# Enter username when prompted
+./unified_client
+# Log in with account
 
 # Terminal 3
-./unified_client chat
-# Enter different username
+./unified_client
+# Log in with different account
 ```
 
 ## File Structure

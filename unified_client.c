@@ -76,9 +76,22 @@ void* receive_messages(void* arg) {
         // Store the message
         store_message(buffer);
         
-        printf("\n%s", buffer);
+        // Check if we got authenticated
+        if (strncmp(buffer, "AUTH_SUCCESS", 12) == 0) {
+            authenticated = 1;
+            printf("\n%s", buffer);
+            printf("You are now authenticated!\n");
+            printf("Chat commands: /nick <name>, /list, /quit\n");
+            printf("Type your messages below:\n");
+        } else {
+            printf("\n%s", buffer);
+        }
+        
+        // Show prompt based on authentication state
         if (authenticated) {
             printf("> ");
+        } else {
+            printf("auth> ");
         }
         fflush(stdout);
     }
@@ -93,13 +106,19 @@ void basic_client_mode(int client_socket) {
     
     printf("Connected to basic server at 127.0.0.1:%d\n", PORT);
     
-    // Interactive mode - let user type commands including authentication
+    // Interactive mode - authentication required first
     char input[BUFFER_SIZE];
-    printf("Connected! Type /login <username> <password> to authenticate, or other commands.\n");
+    printf("Authentication required. Commands: /login <username> <password>, /register <username> <password>\n");
     printf("Type 'quit' to exit.\n");
     
     while (1) {
-        printf("> ");
+        // Show appropriate prompt
+        if (authenticated) {
+            printf("> ");
+        } else {
+            printf("auth> ");
+        }
+        
         if (fgets(input, BUFFER_SIZE, stdin) == NULL) {
             break;
         }
@@ -111,10 +130,26 @@ void basic_client_mode(int client_socket) {
         }
         
         if (strlen(input) > 0) {
-            // Send user input to server
-            if (send(client_socket, input, strlen(input), 0) < 0) {
-                printf("Send failed\n");
-                break;
+            // Check authentication state and command restrictions
+            if (!authenticated) {
+                // Only allow authentication commands when not authenticated
+                if (strncmp(input, "/login", 6) == 0 || 
+                    strncmp(input, "/register", 9) == 0) {
+                    // Send authentication command
+                    if (send(client_socket, input, strlen(input), 0) < 0) {
+                        printf("Send failed\n");
+                        break;
+                    }
+                } else {
+                    printf("Please authenticate first. Use: /login <username> <password> or /register <username> <password>\n");
+                    continue;
+                }
+            } else {
+                // Send any command when authenticated
+                if (send(client_socket, input, strlen(input), 0) < 0) {
+                    printf("Send failed\n");
+                    break;
+                }
             }
             
             // Receive and display server response
@@ -127,6 +162,7 @@ void basic_client_mode(int client_socket) {
                 if (strncmp(buffer, "AUTH_SUCCESS", 12) == 0) {
                     authenticated = 1;
                     printf("You are now authenticated!\n");
+                    printf("You can now use the echo service! Type any message and it will be echoed back.\n");
                 }
             } else if (bytes_received == 0) {
                 printf("Server closed connection\n");
@@ -155,35 +191,16 @@ void chat_client_mode(int client_socket) {
         printf("Server: %s", buffer);
     }
     
-    fgets(buffer, BUFFER_SIZE, stdin);
-    buffer[strcspn(buffer, "\r\n")] = 0;
-     // Create thread to receive messages
-     if (pthread_create(&receive_thread, NULL, receive_messages, &client_socket) != 0) {
+    
+    
+    // Create thread to receive messages
+    if (pthread_create(&receive_thread, NULL, receive_messages, &client_socket) != 0) {
         printf("Failed to create receive thread\n");
         return;
     }
-    if (strcmp(buffer, "/quit") == 0) {
-        running = 0;
-        shutdown(client_socket, SHUT_RDWR);
-        pthread_join(receive_thread, NULL);
-        printf("Disconnected from chat server\n");
-    }
-    if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
-        printf("Failed to send message\n");
-        running = 0;
-        shutdown(client_socket, SHUT_RDWR);
-        pthread_join(receive_thread, NULL);
-        printf("Disconnected from chat server\n");
-        return;
-    }
-    printf("Commands: /nick <name>, /list, /quit\n");
-    printf("Type your messages below:\n\n");
-    
-   
-    
     
     // Main loop to send messages
-    printf("> ");
+    printf("auth> ");
     while (fgets(buffer, BUFFER_SIZE, stdin)) {
         buffer[strcspn(buffer, "\r\n")] = 0;
         
@@ -193,14 +210,40 @@ void chat_client_mode(int client_socket) {
         }
         
         if (strlen(buffer) > 0) {
-            if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
-                printf("Failed to send message\n");
-                running = 0;
-                break;
+            // Check authentication state and command restrictions
+            if (!authenticated) {
+                // Only allow authentication commands when not authenticated
+                if (strncmp(buffer, "/login", 6) == 0 || 
+                    strncmp(buffer, "/register", 9) == 0) {
+                    // Send authentication command
+                    if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
+                        printf("Failed to send message\n");
+                        running = 0;
+                        break;
+                    }
+                    // Don't show prompt immediately - wait for server response
+                    continue;
+                } else {
+                    printf("Please authenticate first. Use: /login <username> <password> or /register <username> <password>\n");
+                    printf("auth> ");
+                    continue;
+                }
+            } else {
+                // Send any command when authenticated
+                if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
+                    printf("Failed to send message\n");
+                    running = 0;
+                    break;
+                }
             }
         }
         
-        printf("> ");
+        // Show appropriate prompt (only for non-auth commands)
+        if (authenticated) {
+            printf("> ");
+        } else {
+            printf("auth> ");
+        }
     }
     
     // Cleanup

@@ -270,7 +270,7 @@ auth_result_t process_auth_command(const char* message, int client_socket) {
             result.success = 0;
             result.authenticated = 0;
             snprintf(result.response, sizeof(result.response), 
-                    "%s Invalid username or password", AUTH_FAILED);
+                    "%s Invalid username or password\n", AUTH_FAILED);
         }
     } else if (strcmp(command, AUTH_REGISTER) == 0) {
         if (add_user(username, password)) {

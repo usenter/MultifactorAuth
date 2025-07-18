@@ -103,7 +103,7 @@ void* handle_basic_client(void* arg) {
            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
     
     // Send authentication prompt
-    snprintf(response, BUFFER_SIZE, "Authentication required. Use: /login <username> <password> or /register <username> <password>\n");
+    snprintf(response, BUFFER_SIZE, "Authentication required. Use: /login <username> <password> or /register <username> <password>\nType your authentication command below:\n\n");
     send(client_socket, response, strlen(response), 0);
     
     while (1) {
