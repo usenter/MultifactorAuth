@@ -3,10 +3,9 @@
 ## Project Structure
 
 1. **`unified_server.c`** - Server supporting basic echo mode and chat mode with authentication
-2. **`unified_client.c`** - Original client without authentication
-3. **`authenticated_client.c`** - New client with authentication support
-4. **`simple_test_client.c`** - Simple test client for automated testing
-5. **`auth_system.c/h`** - Authentication system implementation
+2. **`unified_client.c`** - Unified client with authentication support and message storage
+3. **`simple_test_client.c`** - Simple test client for automated testing
+4. **`auth_system.c/h`** - Authentication system implementation
 
 ### Unified Server (`unified_server.c`)
 - **Basic Mode**: Echo server requiring authentication before use
@@ -14,15 +13,12 @@
 - **Authentication**: Username/password login and registration
 - **Command Line**: `./unified_server basic` or `./unified_server chat`
 
-### Authenticated Client (`authenticated_client.c`)
+### Unified Client (`unified_client.c`)
+- **Authentication Support**: Handles login/registration automatically
 - **Basic Mode**: Authenticates then sends test messages
-- **Chat Mode**: Interactive chat client with authentication
-- **Auto-login**: Prompts for username, uses default password "password123"
-- **Command Line**: `./authenticated_client basic` or `./authenticated_client chat`
-
-### Original Client (`unified_client.c`)
-- **Basic Mode**: Sends predefined test messages (no auth required)
-- **Chat Mode**: Interactive chat client (no auth required)
+- **Chat Mode(Default)**: Interactive chat client with authentication
+- **Message Storage**: Stores received messages in memory buffer
+- **Auto-Registration**: Tries to register if login fails
 - **Command Line**: `./unified_client basic` or `./unified_client chat`
 
 ### Simple Test Client (`simple_test_client.c`)
@@ -31,10 +27,7 @@
 
 ## Authentication System
 
-### Default Users
-- `admin` / `admin123`
-- `user1` / `password1` 
-- `user2` / `password2`
+
 
 ### Authentication Commands
 - `/login <username> <password>` - Login
@@ -43,9 +36,10 @@
 
 ### How to Use:
 1. **Start server**: `./unified_server chat`
-2. **Start authenticated client**: `./authenticated_client chat`
-3. **Enter username** when prompted
-4. **Client auto-authenticates** with password "password123"
+2. **Start client**: `./unified_client chat`
+3. **Create users.txt and put usernames as <user>:<password>**
+3. **Enter username and password** when prompted
+
 
 **Chat Commands:**
 - `/nick <name>` - Change nickname
@@ -60,7 +54,7 @@
 ## Building and Running
 
 ### Prerequisites
-- GCC compiler
+- Clang compiler
 - POSIX threads library (pthread)
 - Linux/Unix system
 
@@ -72,7 +66,6 @@ make all
 # Build individual components
 make unified_server
 make unified_client
-make authenticated_client
 make simple_test_client
 
 # Clean build files
@@ -87,11 +80,11 @@ make run-server-basic
 # Run server in chat mode
 make run-server-chat
 
-# Run authenticated client in basic mode
-make run-auth-client-basic
+# Run client in basic mode
+make run-client-basic
 
-# Run authenticated client in chat mode
-make run-auth-client-chat
+# Run client in chat mode
+make run-client-chat
 
 # Run simple test client
 make run-test-client
@@ -102,9 +95,66 @@ make run-test-client
 # Terminal 1: Start server
 ./unified_server chat
 
-# Terminal 2: Start authenticated client
-./authenticated_client chat
+# Terminal 2: Start client
+./unified_client chat
 
 # Terminal 3: Start simple test client
 ./simple_test_client
+```
+
+## Features
+
+### Unified Client Features
+- **Automatic Authentication**: Handles login/registration seamlessly
+- **Message Storage**: Stores up to 100 received messages in memory
+- **Dual Mode Support**: Works in both basic echo and chat modes
+- **Error Handling**: Graceful handling of authentication failures
+- **Interactive Interface**: User-friendly prompts and responses
+
+### Server Features
+- **Multi-threaded**: Handles multiple clients simultaneously
+- **Session Management**: Tracks authenticated users with timeouts
+- **Hashmap Storage**: Efficient user storage and lookup
+- **Persistent Users**: Saves/loads user data to/from file
+- **Secure Hashing**: Password hashing (DJB2 algorithm)
+
+## Testing
+
+### Basic Test
+```bash
+# Terminal 1
+./unified_server basic
+
+# Terminal 2
+./unified_client basic
+# Enter username when prompted
+```
+
+### Chat Test
+```bash
+# Terminal 1
+./unified_server chat
+
+# Terminal 2
+./unified_client chat
+# Enter username when prompted
+
+# Terminal 3
+./unified_client chat
+# Enter different username
+```
+
+## File Structure
+```
+MultifactorAuth/
+├── unified_server.c      # Main server implementation
+├── unified_client.c      # Unified client with authentication
+├── simple_test_client.c  # Basic test client
+├── auth_system.c         # Authentication system
+├── auth_system.h         # Authentication headers
+├── hashmap.c            # Hashmap implementation
+├── hashmap.h            # Hashmap headers
+├── Makefile             # Build configuration
+├── README.md            # This file
+└── users.txt            # User database (created at runtime)
 ``` 
