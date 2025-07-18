@@ -1,6 +1,6 @@
 #include "auth_system.h"
 #include <time.h>
-#include "hashmap.h"
+#include "hashmap/hashmap.h"
 
 // Global variables
 static struct hashmap *users = NULL;
@@ -217,7 +217,6 @@ void load_users_from_file(const char* filename) {
                 hashmap_set(users, &new_user);
                 loaded_count++;
                 user_count++;
-                printf("Loaded user: %s and password: %s\n", username, password_hash);
             }    
         }
     }
@@ -225,4 +224,81 @@ void load_users_from_file(const char* filename) {
     fclose(file);
     printf("Loaded %d new users from %s", loaded_count, filename);
     
+}
+
+// Check if a message is an authentication command
+int is_auth_command(const char* message) {
+    return (strncmp(message, AUTH_LOGIN, strlen(AUTH_LOGIN)) == 0 || 
+            strncmp(message, AUTH_REGISTER, strlen(AUTH_REGISTER)) == 0 ||
+            strncmp(message, AUTH_LOGOUT, strlen(AUTH_LOGOUT)) == 0);
+}
+
+// Process authentication command and return result
+auth_result_t process_auth_command(const char* message, int client_socket) {
+    auth_result_t result = {0};
+    char command[64], username[MAX_USERNAME_LEN], password[MAX_PASSWORD_LEN];
+    
+    // Parse the authentication message
+    if (sscanf(message, "%63s %31s %63s", command, username, password) != 3) {
+        result.success = 0;
+        result.authenticated = 0;
+        snprintf(result.response, sizeof(result.response), 
+                "%s Invalid format. Use: /login <username> <password> or /register <username> <password>", 
+                AUTH_FAILED);
+        return result;
+    }
+    
+    // Copy username for logging
+    strncpy(result.username, username, MAX_USERNAME_LEN - 1);
+    result.username[MAX_USERNAME_LEN - 1] = '\0';
+    
+    if (strcmp(command, AUTH_LOGIN) == 0) {
+        if (authenticate_user(username, password)) {
+            if (create_session(username, client_socket)) {
+                result.success = 1;
+                result.authenticated = 1;
+                snprintf(result.response, sizeof(result.response), 
+                        "%s Welcome, %s! You are now authenticated.", 
+                        AUTH_SUCCESS, username);
+            } else {
+                result.success = 0;
+                result.authenticated = 0;
+                snprintf(result.response, sizeof(result.response), 
+                        "%s Session creation failed", AUTH_FAILED);
+            }
+        } else {
+            result.success = 0;
+            result.authenticated = 0;
+            snprintf(result.response, sizeof(result.response), 
+                    "%s Invalid username or password", AUTH_FAILED);
+        }
+    } else if (strcmp(command, AUTH_REGISTER) == 0) {
+        if (add_user(username, password)) {
+            result.success = 1;
+            result.authenticated = 0; // Still need to login after registration
+            snprintf(result.response, sizeof(result.response), 
+                    "%s User %s registered successfully. You can now login.", 
+                    AUTH_SUCCESS, username);
+        } else {
+            result.success = 0;
+            result.authenticated = 0;
+            snprintf(result.response, sizeof(result.response), 
+                    "%s Registration failed. Username may already exist.", 
+                    AUTH_FAILED);
+        }
+    } else if (strcmp(command, AUTH_LOGOUT) == 0) {
+        remove_session(client_socket);
+        result.success = 1;
+        result.authenticated = 0;
+        snprintf(result.response, sizeof(result.response), 
+                "%s You have been logged out.", AUTH_SUCCESS);
+    } else {
+        result.success = 0;
+        result.authenticated = 0;
+        snprintf(result.response, sizeof(result.response), 
+                "%s Unknown command. Use /login, /register, or /logout", 
+                AUTH_FAILED);
+    }
+    
+    return result;
 } 

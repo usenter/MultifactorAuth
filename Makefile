@@ -7,7 +7,7 @@ LIBS =
 all: unified_server unified_client simple_test_client
 
 # Server with authentication (includes hashmap dependency)
-unified_server: unified_server.c auth_system.c hashmap.c
+unified_server: unified_server.c auth_system.c hashmap/hashmap.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 # Unified client with authentication support

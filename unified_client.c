@@ -1,12 +1,12 @@
 #include <stdio.h>
-#include <stdlib.h>
+//#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include <signal.h>
+//#include <signal.h>
 
 #define PORT 12345
 #define BUFFER_SIZE 1024
@@ -155,14 +155,32 @@ void chat_client_mode(int client_socket) {
         printf("Server: %s", buffer);
     }
     
-    printf("Commands: /nick <name>, /list, /quit\n");
-    printf("Type your messages below:\n\n");
-    
-    // Create thread to receive messages
-    if (pthread_create(&receive_thread, NULL, receive_messages, &client_socket) != 0) {
+    fgets(buffer, BUFFER_SIZE, stdin);
+    buffer[strcspn(buffer, "\r\n")] = 0;
+     // Create thread to receive messages
+     if (pthread_create(&receive_thread, NULL, receive_messages, &client_socket) != 0) {
         printf("Failed to create receive thread\n");
         return;
     }
+    if (strcmp(buffer, "/quit") == 0) {
+        running = 0;
+        shutdown(client_socket, SHUT_RDWR);
+        pthread_join(receive_thread, NULL);
+        printf("Disconnected from chat server\n");
+    }
+    if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
+        printf("Failed to send message\n");
+        running = 0;
+        shutdown(client_socket, SHUT_RDWR);
+        pthread_join(receive_thread, NULL);
+        printf("Disconnected from chat server\n");
+        return;
+    }
+    printf("Commands: /nick <name>, /list, /quit\n");
+    printf("Type your messages below:\n\n");
+    
+   
+    
     
     // Main loop to send messages
     printf("> ");
@@ -195,7 +213,7 @@ void chat_client_mode(int client_socket) {
 int main(int argc, char *argv[]) {
     int client_socket;
     struct sockaddr_in server_addr;
-    int mode = 0; // 0 = basic, 1 = chat
+    int mode = 1; // 0 = basic, 1 = chat (default to chat)
     
     // Parse command line arguments
     if (argc > 1) {

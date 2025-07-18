@@ -152,8 +152,9 @@ MultifactorAuth/
 ├── simple_test_client.c  # Basic test client
 ├── auth_system.c         # Authentication system
 ├── auth_system.h         # Authentication headers
-├── hashmap.c            # Hashmap implementation
-├── hashmap.h            # Hashmap headers
+├── hashmap/              # Hashmap library
+│   ├── hashmap.c         # Hashmap implementation
+│   └── hashmap.h         # Hashmap headers
 ├── Makefile             # Build configuration
 ├── README.md            # This file
 └── users.txt            # User database (created at runtime)

@@ -32,52 +32,7 @@ client_t clients[MAX_CLIENTS];
 int client_count = 0;
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Function to handle authentication
-int handle_authentication(int client_socket, const char* message) {
-    char command[64], username[MAX_USERNAME_LEN], password[MAX_PASSWORD_LEN];
-    char response[BUFFER_SIZE];
-    
-    // Parse the authentication message
-    if (sscanf(message, "%63s %31s %63s", command, username, password) != 3) {
-        snprintf(response, BUFFER_SIZE, "%s Invalid format. Use: /login <username> <password> or /register <username> <password>", AUTH_FAILED);
-        send(client_socket, response, strlen(response), 0);
-        return 0;
-    }
-    
-    if (strcmp(command, AUTH_LOGIN) == 0) {
-        if (authenticate_user(username, password)) {
-            if (create_session(username, client_socket)) {
-                snprintf(response, BUFFER_SIZE, "%s Welcome, %s! You are now authenticated.", AUTH_SUCCESS, username);
-                send(client_socket, response, strlen(response), 0);
-                printf("User %s logged in successfully\n", username);
-                return 1;
-            } else {
-                snprintf(response, BUFFER_SIZE, "%s Session creation failed", AUTH_FAILED);
-                send(client_socket, response, strlen(response), 0);
-                return 0;
-            }
-        } else {
-            snprintf(response, BUFFER_SIZE, "%s Invalid username or password", AUTH_FAILED);
-            send(client_socket, response, strlen(response), 0);
-            return 0;
-        }
-    } else if (strcmp(command, AUTH_REGISTER) == 0) {
-        if (add_user(username, password)) {
-            snprintf(response, BUFFER_SIZE, "%s User %s registered successfully. You can now login.", AUTH_SUCCESS, username);
-            send(client_socket, response, strlen(response), 0);
-            printf("New user registered: %s\n", username);
-            return 0; // Still need to login
-        } else {
-            snprintf(response, BUFFER_SIZE, "%s Registration failed. Username may already exist.", AUTH_FAILED);
-            send(client_socket, response, strlen(response), 0);
-            return 0;
-        }
-    } else {
-        snprintf(response, BUFFER_SIZE, "%s Unknown command. Use /login or /register", AUTH_FAILED);
-        send(client_socket, response, strlen(response), 0);
-        return 0;
-    }
-}
+// Function removed - authentication now handled by auth_system.c
 
 // Function to find client by nickname
 int find_client_by_nickname(const char* nickname) {
@@ -166,12 +121,22 @@ void* handle_basic_client(void* arg) {
                inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), buffer);
         
         // Check if this is an authentication message
-        if (!authenticated && (strncmp(buffer, AUTH_LOGIN, strlen(AUTH_LOGIN)) == 0 || 
-                              strncmp(buffer, AUTH_REGISTER, strlen(AUTH_REGISTER)) == 0)) {
-            authenticated = handle_authentication(client_socket, buffer);
-            if (authenticated) {
-                snprintf(response, BUFFER_SIZE, "Authentication successful! You can now use the echo service.\n");
-                send(client_socket, response, strlen(response), 0);
+        if (!authenticated && is_auth_command(buffer)) {
+            auth_result_t auth_result = process_auth_command(buffer, client_socket);
+            
+            // Send response to client
+            send(client_socket, auth_result.response, strlen(auth_result.response), 0);
+            
+            // Handle logging based on the command
+            if (auth_result.success) {
+                if (auth_result.authenticated) {
+                    printf("User %s logged in successfully\n", auth_result.username);
+                    authenticated = 1;
+                    snprintf(response, BUFFER_SIZE, "Authentication successful! You can now use the echo service.\n");
+                    send(client_socket, response, strlen(response), 0);
+                } else {
+                    printf("User %s registered successfully\n", auth_result.username);
+                }
             }
             continue;
         }
@@ -234,12 +199,22 @@ void* handle_chat_client(void* arg) {
         buffer[strcspn(buffer, "\r\n")] = 0;
         
         // Check if this is an authentication message
-        if (!authenticated && (strncmp(buffer, AUTH_LOGIN, strlen(AUTH_LOGIN)) == 0 || 
-                              strncmp(buffer, AUTH_REGISTER, strlen(AUTH_REGISTER)) == 0)) {
-            authenticated = handle_authentication(client_socket, buffer);
-            if (authenticated) {
-                snprintf(broadcast_msg, sizeof(broadcast_msg), "Server: %s joined the chat", clients[client_index].nickname);
-                broadcast_message(broadcast_msg, client_socket);
+        if (!authenticated && is_auth_command(buffer)) {
+            auth_result_t auth_result = process_auth_command(buffer, client_socket);
+            
+            // Send response to client
+            send(client_socket, auth_result.response, strlen(auth_result.response), 0);
+            
+            // Handle logging and broadcasting based on the command
+            if (auth_result.success) {
+                if (auth_result.authenticated) {
+                    printf("User %s logged in successfully\n", auth_result.username);
+                    authenticated = 1;
+                    snprintf(broadcast_msg, sizeof(broadcast_msg), "Server: %s joined the chat", clients[client_index].nickname);
+                    broadcast_message(broadcast_msg, client_socket);
+                } else {
+                    printf("User %s registered successfully\n", auth_result.username);
+                }
             }
             continue;
         }

@@ -34,6 +34,14 @@ typedef struct {
 #define AUTH_FAILED "AUTH_FAILED"
 #define AUTH_LOGOUT "/logout"
 
+// Authentication result structure
+typedef struct {
+    int success;                    // 1 if authentication succeeded, 0 otherwise
+    int authenticated;              // 1 if user is now authenticated, 0 otherwise
+    char response[1024];           // Response message to send to client
+    char username[MAX_USERNAME_LEN]; // Username from the command (for logging)
+} auth_result_t;
+
 // Function declarations
 void init_auth_system(void);
 int add_user(const char* username, const char* password);
@@ -47,5 +55,9 @@ void hash_password(const char* password, char* hash);
 int verify_password(const char* password, const char* hash);
 void save_users_to_file(const char* filename);
 void load_users_from_file(const char* filename);
+
+// New authentication processing functions
+auth_result_t process_auth_command(const char* message, int client_socket);
+int is_auth_command(const char* message);
 
 #endif // AUTH_SYSTEM_H 
