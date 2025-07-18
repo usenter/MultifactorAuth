@@ -16,13 +16,10 @@
 
 volatile int running = 1;
 int authenticated = 0;
-char username[MAX_USERNAME_LEN];
+// Remove the global username and password variables since users will type them manually
 
-// Authentication commands
-#define AUTH_LOGIN "/login"
-#define AUTH_REGISTER "/register"
+// Authentication response checking
 #define AUTH_SUCCESS "AUTH_SUCCESS"
-#define AUTH_FAILED "AUTH_FAILED"
 
 // Global message storage
 typedef struct {
@@ -59,41 +56,7 @@ int get_stored_messages(char messages[][BUFFER_SIZE], int max_count) {
     return count;
 }
 
-// Function to handle authentication
-int authenticate_with_server(int client_socket, const char* username, const char* password, int is_register) {
-    char auth_message[BUFFER_SIZE];
-    char response[BUFFER_SIZE];
-    
-    // Create authentication message
-    if (is_register) {
-        snprintf(auth_message, BUFFER_SIZE, "%s %s %s", AUTH_REGISTER, username, password);
-    } else {
-        snprintf(auth_message, BUFFER_SIZE, "%s %s %s", AUTH_LOGIN, username, password);
-    }
-    
-    // Send authentication request
-    if (send(client_socket, auth_message, strlen(auth_message), 0) < 0) {
-        printf("Failed to send authentication request\n");
-        return 0;
-    }
-    
-    // Receive response
-    int bytes_received = recv(client_socket, response, BUFFER_SIZE - 1, 0);
-    if (bytes_received <= 0) {
-        printf("Failed to receive authentication response\n");
-        return 0;
-    }
-    
-    response[bytes_received] = '\0';
-    printf("Server: %s", response);
-    
-    // Check if authentication was successful
-    if (strncmp(response, AUTH_SUCCESS, strlen(AUTH_SUCCESS)) == 0) {
-        return 1;
-    }
-    
-    return 0;
-}
+// Authentication is now handled by users typing /login commands directly
 
 // Function to receive messages from server (chat mode)
 void* receive_messages(void* arg) {
@@ -126,68 +89,53 @@ void* receive_messages(void* arg) {
 // Function to handle basic client mode (simple send/receive)
 void basic_client_mode(int client_socket) {
     char buffer[BUFFER_SIZE];
-    char *test_messages[] = {
-        "Hello, Server!",
-        "How are you?",
-        "Goodbye!"
-    };
-    int num_messages = sizeof(test_messages) / sizeof(test_messages[0]);
+    // Removed test messages - now using interactive mode
     
     printf("Connected to basic server at 127.0.0.1:%d\n", PORT);
     
-    // Wait for authentication prompt
-    int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
-    if (bytes_received > 0) {
-        buffer[bytes_received] = '\0';
-        printf("Server: %s", buffer);
-    }
+    // Interactive mode - let user type commands including authentication
+    char input[BUFFER_SIZE];
+    printf("Connected! Type /login <username> <password> to authenticate, or other commands.\n");
+    printf("Type 'quit' to exit.\n");
     
-    // Perform authentication
-    if (!authenticate_with_server(client_socket, username, "password123", 0)) {
-        printf("Authentication failed. Trying to register...\n");
-        if (!authenticate_with_server(client_socket, username, "password123", 1)) {
-            printf("Registration failed. Exiting.\n");
-            return;
-        }
-        printf("Registration successful. Now logging in...\n");
-        if (!authenticate_with_server(client_socket, username, "password123", 0)) {
-            printf("Login failed after registration. Exiting.\n");
-            return;
-        }
-    }
-    
-    authenticated = 1;
-    printf("Authentication successful!\n");
-    
-    // Wait for success message
-    bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
-    if (bytes_received > 0) {
-        buffer[bytes_received] = '\0';
-        printf("Server: %s", buffer);
-    }
-    
-    // Send test messages
-    for (int i = 0; i < num_messages; i++) {
-        printf("Sending: %s\n", test_messages[i]);
-        
-        if (send(client_socket, test_messages[i], strlen(test_messages[i]), 0) < 0) {
-            printf("Send failed\n");
+    while (1) {
+        printf("> ");
+        if (fgets(input, BUFFER_SIZE, stdin) == NULL) {
             break;
         }
         
-        bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
-        if (bytes_received > 0) {
-            buffer[bytes_received] = '\0';
-            printf("Server response: %s", buffer);
-        } else if (bytes_received == 0) {
-            printf("Server closed connection\n");
-            break;
-        } else {
-            printf("Receive failed\n");
+        input[strcspn(input, "\r\n")] = 0; // Remove newline
+        
+        if (strcmp(input, "quit") == 0) {
             break;
         }
         
-        sleep(1); // Wait 1 second between messages
+        if (strlen(input) > 0) {
+            // Send user input to server
+            if (send(client_socket, input, strlen(input), 0) < 0) {
+                printf("Send failed\n");
+                break;
+            }
+            
+            // Receive and display server response
+            int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
+            if (bytes_received > 0) {
+                buffer[bytes_received] = '\0';
+                printf("Server: %s\n", buffer);
+                
+                // Check if we got authenticated
+                if (strncmp(buffer, "AUTH_SUCCESS", 12) == 0) {
+                    authenticated = 1;
+                    printf("You are now authenticated!\n");
+                }
+            } else if (bytes_received == 0) {
+                printf("Server closed connection\n");
+                break;
+            } else {
+                printf("Receive failed\n");
+                break;
+            }
+        }
     }
     
     printf("Basic client finished\n");
@@ -200,32 +148,8 @@ void chat_client_mode(int client_socket) {
     
     printf("Connected to chat server!\n");
     
-    // Wait for authentication prompt
+    // Display initial server message
     int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
-    if (bytes_received > 0) {
-        buffer[bytes_received] = '\0';
-        printf("Server: %s", buffer);
-    }
-    
-    // Perform authentication
-    if (!authenticate_with_server(client_socket, username, "password123", 0)) {
-        printf("Authentication failed. Trying to register...\n");
-        if (!authenticate_with_server(client_socket, username, "password123", 1)) {
-            printf("Registration failed. Exiting.\n");
-            return;
-        }
-        printf("Registration successful. Now logging in...\n");
-        if (!authenticate_with_server(client_socket, username, "password123", 0)) {
-            printf("Login failed after registration. Exiting.\n");
-            return;
-        }
-    }
-    
-    authenticated = 1;
-    printf("Authentication successful!\n");
-    
-    // Wait for welcome message
-    bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
     if (bytes_received > 0) {
         buffer[bytes_received] = '\0';
         printf("Server: %s", buffer);
@@ -287,18 +211,7 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    // Get username from user
-    printf("Enter username: ");
-    if (fgets(username, MAX_USERNAME_LEN, stdin) == NULL) {
-        printf("Failed to read username\n");
-        return 1;
-    }
-    username[strcspn(username, "\r\n")] = 0;
-    
-    if (strlen(username) == 0) {
-        printf("Username cannot be empty\n");
-        return 1;
-    }
+    // No need to prompt for username/password - users will type /login commands
     
     // Create socket
     client_socket = socket(AF_INET, SOCK_STREAM, 0);
