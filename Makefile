@@ -23,6 +23,10 @@ hashmap/hashmap.o: hashmap/hashmap.c
 encryptionTools_test: encryptionTools.c encryptionTools.h
 	$(CC) $(CFLAGS) -DTEST_MAIN -o $@ $< $(LIBS)
 
+# Standalone file encryption/decryption tool
+user_encryptor: userEncryptionTools/user_encryptor.c
+	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
+
 # Server with authentication (uses object files)
 unified_server: unified_server.c $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
