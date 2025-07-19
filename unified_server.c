@@ -494,7 +494,10 @@ int main(int argc, char *argv[]) {
     
     // Initialize authentication system with encrypted database
     printf("Decrypting user database...\n");
-    init_encrypted_auth_system(user_file, (char*)database_password);
+    if(!init_encrypted_auth_system(user_file, (char*)database_password)){
+        printf("Failed to initialize authentication system\n");
+        return 0;
+    }
     printf("User database loaded successfully!\n");
     
     // Set up signal handlers for graceful shutdown

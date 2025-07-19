@@ -46,7 +46,7 @@ typedef struct {
 
 // Function declarations
 void init_auth_system(void);
-void init_encrypted_auth_system(char* userFile, char* key);
+int init_encrypted_auth_system(char* userFile, char* key);
 int add_user(const char* username, const char* password);
 int authenticate_user(const char* username, const char* password);
 int create_session(const char* username, int client_socket);
@@ -58,7 +58,7 @@ void hash_password(const char* password, char* hash);
 int verify_password(const char* password, const char* hash);
 void save_users_to_file(const char* filename);
 void load_users_from_file(const char* filename);
-void load_users_from_encrypted_file(const char* encrypted_filename, const char* key);
+int load_users_from_encrypted_file(const char* encrypted_filename, const char* key);
 
 // New authentication processing functions
 auth_result_t process_auth_command(const char* message, int client_socket);

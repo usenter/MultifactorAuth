@@ -70,7 +70,7 @@ void init_auth_system(void) {
     
 }
 
-void init_encrypted_auth_system(char* userFile, char* key) {
+int init_encrypted_auth_system(char* userFile, char* key) {
     users = hashmap_new(sizeof(user_t), 0, 0, 0, user_hash, user_compare, NULL, NULL);
     user_count = 0;
     session_count = 0;
@@ -241,7 +241,7 @@ void load_users_from_file(const char* filename) {
     
 }
 
-void load_users_from_encrypted_file(const char* encrypted_filename, const char* key) {
+int load_users_from_encrypted_file(const char* encrypted_filename, const char* key) {
     printf("Loading users from encrypted file: %s\n", encrypted_filename);
     
     // Decrypt file directly to memory using library function
@@ -250,7 +250,7 @@ void load_users_from_encrypted_file(const char* encrypted_filename, const char* 
     if (!decrypt_result.success) {
         printf("Failed to decrypt file: %s\n", encrypted_filename);
         printf("Check that the encryption key is correct.\n");
-        return;
+        return 0;
     }
     
     printf("Successfully decrypted file, processing users...\n");
@@ -330,6 +330,7 @@ void load_users_from_encrypted_file(const char* encrypted_filename, const char* 
     free_decryption_result(&decrypt_result);
     
     printf("Successfully loaded %d users from encrypted file\n", loaded_count);
+    return 1;
 }
 
 // Check if a message is an authentication command
