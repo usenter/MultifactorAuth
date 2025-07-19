@@ -16,22 +16,17 @@
 7. **`userEncryptionTools/`** - Tools for you to manually encrypt and decrypt a text file
 
 ### Unified Server (`unified_server.c`)
-- **Basic Mode**: Echo server requiring authentication before use
 - **Chat Mode**: Multi-client chat server with authentication and nicknames
 - **Authentication**: Username/password login and registration
-- **Command Line**: `./unified_server basic` or `./unified_server chat`
+- **Password protected user database**: User:password info is decrypted and stored on startup
+- **Command Line**: `./unified_server <password>` 
 
 ### Unified Client (`unified_client.c`)
 - **Authentication Support**: Handles login/registration automatically
-- **Basic Mode**: Authenticates then sends test messages
-- **Chat Mode(Default)**: Interactive chat client with authentication
+- **Chat Mode**: Interactive chat client with authentication
 - **Message Storage**: Stores received messages in memory buffer
-- **Auto-Registration**: Tries to register if login fails
-- **Command Line**: `./unified_client basic` or `./unified_client <password>`
+- **Command Line**: `./unified_client`after starting server
 
-### Simple Test Client (`simple_test_client.c`)
-- Automated testing client without authentication
-- Useful for testing basic server functionality
 
 ## Authentication System
 
@@ -74,40 +69,23 @@ make all
 # Build individual components
 make unified_server
 make unified_client
-make simple_test_client
+make user_encryptor
 
 # Clean build files
 make clean
 ```
 
-### Run Commands
-```bash
-# Run server in basic mode
-make run-server-basic
 
-# Run server in chat mode
-make run-server-chat
-
-# Run client in basic mode
-make run-client-basic
-
-# Run client in chat mode
-make run-client-chat
-
-# Run simple test client
-make run-test-client
-```
 
 ### Manual Execution
 ```bash
 # Terminal 1: Start server
-./unified_server  
+./unified_server <password>
 
 # Terminal 2: Start client
 ./unified_client
 
-# Terminal 3: Start simple test client
-./simple_test_client
+
 ```
 
 ## Features
@@ -115,9 +93,7 @@ make run-test-client
 ### Unified Client Features
 - **Automatic Authentication**: Handles login/registration seamlessly
 - **Message Storage**: Stores up to 100 received messages in memory
-- **Dual Mode Support**: Works in both basic echo and chat modes
-- **Error Handling**: Graceful handling of authentication failures
-- **Interactive Interface**: User-friendly prompts and responses
+- **Error Handling**: Handling of authentication failures
 
 ### Server Features
 - **Multi-threaded**: Handles multiple clients simultaneously

@@ -7,7 +7,7 @@ LIBS = -lssl -lcrypto
 OBJS = encryptionTools.o auth_system.o hashmap/hashmap.o
 
 # Targets
-all: unified_server unified_client simple_test_client encryptionTools_test user_encryptor
+all: unified_server unified_client encryptionTools_test user_encryptor
 
 # Object file rules with header dependencies
 encryptionTools.o: encryptionTools.c encryptionTools.h
@@ -35,32 +35,10 @@ unified_server: unified_server.c $(OBJS)
 unified_client: unified_client.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
-# Simple test client
-simple_test_client: simple_test_client.c
-	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
 
 # Clean
 clean:
-	rm -f unified_server unified_client simple_test_client encryptionTools_test user_encryptor $(OBJS)
+	rm -f unified_server unified_client encryptionTools_test user_encryptor $(OBJS)
 
-# Run server in basic mode
-run-server-basic: unified_server
-	./unified_server basic
-
-# Run server in chat mode
-run-server-chat: unified_server
-	./unified_server chat
-
-# Run client in basic mode
-run-client-basic: unified_client
-	./unified_client basic
-
-# Run client in chat mode
-run-client-chat: unified_client
-	./unified_client chat
-
-# Run simple test client
-run-test-client: simple_test_client
-	./simple_test_client
-
-.PHONY: all clean run-server-basic run-server-chat run-client-basic run-client-chat run-test-client 
+.PHONY: all clean 
