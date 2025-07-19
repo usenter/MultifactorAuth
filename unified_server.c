@@ -31,6 +31,7 @@ typedef struct {
 client_t clients[MAX_CLIENTS];
 int client_count = 0;
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+char* userFile = "encrypted_users.txt";  //change this if you want to use a different file
 
 // Function removed - authentication now handled by auth_system.c
 
@@ -292,22 +293,19 @@ int main(int argc, char *argv[]) {
     pthread_t thread_id;
     int mode = 1; // 0 = basic, 1 = chat
     
-    // Parse command line arguments
+    // Parse command line arguments, if no recognized argument, default to chat mode and use arg as key
     if (argc > 1) {
         if (strcmp(argv[1], "chat") == 0) {
             mode = 1;
+            init_auth_system();
         } else if (strcmp(argv[1], "basic") == 0) {
             mode = 0;
         } else {
-            printf("Usage: %s [basic|chat]\n", argv[0]);
-            printf("  basic: Simple echo server (default)\n");
-            printf("  chat:  Multi-client chat server\n");
-            return 1;
+            init_encrypted_auth_system(userFile, argv[1]);
         }
     }
     
-    // Initialize authentication system
-    init_auth_system();
+    
     
     // Create socket
     server_socket = socket(AF_INET, SOCK_STREAM, 0);

@@ -1,6 +1,10 @@
 #include "auth_system.h"
+#include <stdio.h>
 #include <time.h>
+#include <unistd.h>
+#include <string.h>
 #include "hashmap/hashmap.h"
+
 
 // Global variables
 static struct hashmap *users = NULL;
@@ -50,6 +54,8 @@ user_t create_user(const char* username) {
 int verify_password(const char* password, const char* hash) {
     char computed_hash[MAX_HASH_LEN];
     hash_password(password, computed_hash);
+    printf("recieved: %s expected: %s", computed_hash, hash);
+
     return strcmp(computed_hash, hash) == 0;
 }
 
@@ -61,6 +67,15 @@ void init_auth_system(void) {
     session_count = 0;
     
     load_users_from_file("users.txt");
+    
+}
+
+void init_encrypted_auth_system(char* userFile, char* key) {
+    users = hashmap_new(sizeof(user_t), 0, 0, 0, user_hash, user_compare, NULL, NULL);
+    user_count = 0;
+    session_count = 0;
+    
+    load_users_from_encrypted_file(userFile, key);
     
 }
 
@@ -224,6 +239,97 @@ void load_users_from_file(const char* filename) {
     fclose(file);
     printf("Loaded %d new users from %s", loaded_count, filename);
     
+}
+
+void load_users_from_encrypted_file(const char* encrypted_filename, const char* key) {
+    printf("Loading users from encrypted file: %s\n", encrypted_filename);
+    
+    // Decrypt file directly to memory using library function
+    decryption_result_t decrypt_result = decrypt_file_to_memory(encrypted_filename, key);
+    
+    if (!decrypt_result.success) {
+        printf("Failed to decrypt file: %s\n", encrypted_filename);
+        printf("Check that the encryption key is correct.\n");
+        return;
+    }
+    
+    printf("Successfully decrypted file, processing users...\n");
+    
+    char username[MAX_USERNAME_LEN];
+    char password[MAX_PASSWORD_LEN];  // Plaintext password from decrypted data
+    int loaded_count = 0;
+    
+    // Parse decrypted data line by line
+    char* data = decrypt_result.data;
+    char* line_start = data;
+    char* line_end;
+    
+    while ((line_end = strchr(line_start, '\n')) != NULL && user_count < MAX_USERS) {
+        // Null-terminate the line temporarily
+        *line_end = '\0';
+        
+        // Remove carriage return if present
+        char* cr = strchr(line_start, '\r');
+        if (cr) *cr = '\0';
+        
+        // Parse username:password format
+        if (sscanf(line_start, "%31[^:]:%63s", username, password) == 2) {
+            user_t new_user = create_user(username);
+            
+            // Hash the plaintext password immediately
+            hash_password(password, new_user.password_hash);
+            new_user.password_hash[MAX_HASH_LEN - 1] = '\0';
+            new_user.active = 1;
+
+            // Check if user already exists
+            user_t lookup_user = create_user(username);
+            const user_t *found_ptr = hashmap_get(users, &lookup_user);
+            
+            if (found_ptr == NULL) {
+                // User doesn't exist, add them
+                hashmap_set(users, &new_user);
+                loaded_count++;
+                user_count++;
+                printf("Loaded user: %s with password: %s\n", username, password);
+
+            }
+            
+            // Clear the plaintext password from memory immediately
+            memset(password, 0, sizeof(password));
+        }
+        
+        // Restore newline and move to next line
+        *line_end = '\n';
+        line_start = line_end + 1;
+    }
+    
+    // Handle last line if it doesn't end with newline
+    if (line_start < data + decrypt_result.size && user_count < MAX_USERS) {
+        if (sscanf(line_start, "%31[^:]:%63s", username, password) == 2) {
+            user_t new_user = create_user(username);
+            
+            hash_password(password, new_user.password_hash);
+            new_user.password_hash[MAX_HASH_LEN - 1] = '\0';
+            new_user.active = 1;
+
+            user_t lookup_user = create_user(username);
+            const user_t *found_ptr = hashmap_get(users, &lookup_user);
+            
+            if (found_ptr == NULL) {
+                hashmap_set(users, &new_user);
+                loaded_count++;
+                user_count++;
+                printf("Loaded user: %s with password: %s\n", username, password);
+            }
+            
+            memset(password, 0, sizeof(password));
+        }
+    }
+    
+    // Free the decrypted data (this also clears sensitive data)
+    free_decryption_result(&decrypt_result);
+    
+    printf("Successfully loaded %d users from encrypted file\n", loaded_count);
 }
 
 // Check if a message is an authentication command
