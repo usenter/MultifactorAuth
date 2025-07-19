@@ -7,7 +7,7 @@ LIBS = -lssl -lcrypto
 OBJS = encryptionTools.o auth_system.o hashmap/hashmap.o
 
 # Targets
-all: unified_server unified_client simple_test_client encryptionTools_test
+all: unified_server unified_client simple_test_client encryptionTools_test user_encryptor
 
 # Object file rules with header dependencies
 encryptionTools.o: encryptionTools.c encryptionTools.h
@@ -41,7 +41,7 @@ simple_test_client: simple_test_client.c
 
 # Clean
 clean:
-	rm -f unified_server unified_client simple_test_client encryptionTools_test $(OBJS)
+	rm -f unified_server unified_client simple_test_client encryptionTools_test user_encryptor $(OBJS)
 
 # Run server in basic mode
 run-server-basic: unified_server

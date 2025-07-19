@@ -4,6 +4,7 @@ unified_server
 unified_client
 authenticated_client
 simple_test_client
+user_encryptor
 *.o
 *.obj
 *.out

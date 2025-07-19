@@ -290,7 +290,7 @@ void load_users_from_encrypted_file(const char* encrypted_filename, const char* 
                 hashmap_set(users, &new_user);
                 loaded_count++;
                 user_count++;
-                printf("Loaded user: %s with password: %s\n", username, password);
+                printf("Loaded user: %s\n", username);
 
             }
             
@@ -319,7 +319,7 @@ void load_users_from_encrypted_file(const char* encrypted_filename, const char* 
                 hashmap_set(users, &new_user);
                 loaded_count++;
                 user_count++;
-                printf("Loaded user: %s with password: %s\n", username, password);
+                printf("Loaded user: %s\n", username);
             }
             
             memset(password, 0, sizeof(password));
