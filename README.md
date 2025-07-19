@@ -1,11 +1,19 @@
 # TCP Server/Client Project with Authentication (Linux)
 
+
+
+
+
+
 ## Project Structure
 
 1. **`unified_server.c`** - Server supporting basic echo mode and chat mode with authentication
 2. **`unified_client.c`** - Unified client with authentication support and message storage
 3. **`simple_test_client.c`** - Simple test client for automated testing
 4. **`auth_system.c/h`** - Authentication system implementation
+5. **`encryptionTools.c/h`** - Decrypts user database file and securely loads into server
+6. **`hashmap/`** - Tidwall's hashmap implementation in C https://github.com/tidwall/hashmap.c
+7. **`userEncryptionTools/`** - Tools for you to manually encrypt and decrypt a text file
 
 ### Unified Server (`unified_server.c`)
 - **Basic Mode**: Echo server requiring authentication before use
@@ -93,10 +101,10 @@ make run-test-client
 ### Manual Execution
 ```bash
 # Terminal 1: Start server
-./unified_server chat
+./unified_server  
 
 # Terminal 2: Start client
-./unified_client chat
+./unified_client
 
 # Terminal 3: Start simple test client
 ./simple_test_client
@@ -115,8 +123,8 @@ make run-test-client
 - **Multi-threaded**: Handles multiple clients simultaneously
 - **Session Management**: Tracks authenticated users with timeouts
 - **Hashmap Storage**: Efficient user storage and lookup
-- **Persistent Users**: Saves/loads user data to/from file
-- **Secure Hashing**: Password hashing (DJB2 algorithm)
+- **Persistent Users**: Saves/loads user data to/from encryted file
+- **Hashing**: Password hashing (DJB2 algorithm)
 
 ## Testing
 
@@ -133,7 +141,7 @@ make run-test-client
 ### Chat Test
 ```bash
 # Terminal 1
-./unified_server
+./unified_server rabbit
 
 # Terminal 2
 ./unified_client
