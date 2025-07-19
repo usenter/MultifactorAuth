@@ -27,7 +27,7 @@
 - **Chat Mode(Default)**: Interactive chat client with authentication
 - **Message Storage**: Stores received messages in memory buffer
 - **Auto-Registration**: Tries to register if login fails
-- **Command Line**: `./unified_client basic` or `./unified_client chat`
+- **Command Line**: `./unified_client basic` or `./unified_client <password>`
 
 ### Simple Test Client (`simple_test_client.c`)
 - Automated testing client without authentication
@@ -43,10 +43,10 @@
 - Sessions expire after 5 minutes of inactivity
 
 ### How to Use:
-1. **Start server**: `./unified_server`
-2. **Start client**: `./unified_client`
-3. **Create users.txt and put usernames as <user>:<password>** - must encrypt password manually 
-3. **Enter username and password** - using the /login command
+1.  **Encrypt your private user.txt file** - ./user_encryptor encrypt <users.txt> encrypted_users.txt <password>. You can change the name of destination file, but you need change it in unified_server.c as well. 
+2. **Start server**: `./unified_server <password>`
+3. **Start client**: `./unified_client`
+4. **Enter username and password** - using the /login command
 
 
 **Chat Commands:**
