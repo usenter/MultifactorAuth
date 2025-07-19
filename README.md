@@ -128,18 +128,24 @@ make clean
 # Log in with different account
 ```
 
-## File Structure
+
+```
+## Project File Structure
+
 ```
 MultifactorAuth/
-├── unified_server.c      # Main server implementation
-├── unified_client.c      # Unified client with authentication
-├── simple_test_client.c  # Basic test client
-├── auth_system.c         # Authentication system
-├── auth_system.h         # Authentication headers
-├── hashmap/              # Hashmap library
-│   ├── hashmap.c         # Hashmap implementation
-│   └── hashmap.h         # Hashmap headers
-├── Makefile             # Build configuration
-├── README.md            # This file
-└── users.txt            # User database (created at runtime)
+├── unified_server.c         # Secure authenticated chat server
+├── unified_client.c         # Multi-mode client application
+├── simple_test_client.c     # Basic test client (no auth)
+├── auth_system.c/h          # Authentication and session management
+├── encryptionTools.c/h      # Encryption library for server
+├── userEncryptionTools/     # Standalone encryption tools
+│   └── user_encryptor.c     # File encryption/decryption tool
+├── hashmap/                 # Third-party hashmap library
+│   ├── hashmap.c           # Hashmap implementation
+│   └── hashmap.h           # Hashmap headers
+├── Makefile                # Build configuration
+├── README.md               # This documentation
+├── users.txt               # Example user database (create manually)
+└── encrypted_users.txt     # Encrypted database (generated)
 ``` 
