@@ -44,14 +44,14 @@ Encrypt it:
 Replace names as you wish, but the encrypted file name must be changed in unified_server.c
 
 
-### 3. Create a folder ####RSAkeys/####. Then generate RSA Keys:
+### 3. Create a folder `RSAkeys/`. Then generate RSA Keys:
 ```bash
 # Generate server keys
 ./generate_rsa_keys server
 
 # Generate client keys (one per client)
-./generate_rsa_keys client <name>
-./generate_rsa_keys client <name>
+./generate_rsa_keys client <name1>
+./generate_rsa_keys client <name2>
 ```
 
 ### 4. Run
@@ -60,21 +60,21 @@ Replace names as you wish, but the encrypted file name must be changed in unifie
 ./unified_server myDatabasePassword
 
 # Connect clients
-./unified_client alice
-./unified_client bob
+./unified_client <name1>
+./unified_client <name2>
 ```
 
 ## Usage
 
 ### Authentication
 ```
-auth> /login alice password123
+auth> /login <name1> <password1>
 auth> /register newuser newpassword
 ```
 
 ### Chat Commands
 ```
-> /nick Alice          # Change nickname
+> /nick <name>        # Change nickname
 > /list               # Show connected users
 > /quit               # Leave chat
 > Hello everyone!     # Send message
