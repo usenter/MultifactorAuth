@@ -6,10 +6,13 @@ authenticated_client
 simple_test_client
 user_encryptor
 encryptionTools_test
+generate_rsa_keys
+RSA_AUTH_SETUP.md
 
 *.o
 *.obj
 *.out
+*.pem
 
 # Build directories
 build/
