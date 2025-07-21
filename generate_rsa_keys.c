@@ -43,7 +43,7 @@ int main(int argc, char *argv[]) {
     printf("\n");
     
     if (generate_rsa_keypair(private_key_file, public_key_file)) {
-        printf("\n✓ Success! %s RSA key pair generated.\n", entity);
+        printf("\nSuccess! %s RSA key pair generated.\n", entity);
         printf("\nIMPORTANT SECURITY NOTES:\n");
         printf("- Keep the private key (%s) SECURE and SECRET\n", private_key_file);
         printf("- The public key (%s) can be shared\n", public_key_file);
@@ -51,7 +51,7 @@ int main(int argc, char *argv[]) {
         printf("- For production, store keys in a secure key management system\n");
         return 0;
     } else {
-        printf("\n✗ Failed to generate %s RSA key pair\n", entity);
+        printf("\n Failed to generate %s RSA key pair\n", entity);
         return 1;
     }
 } 

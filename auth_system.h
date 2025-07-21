@@ -21,8 +21,18 @@
 // RSA Authentication constants
 #define RSA_KEY_SIZE 2048
 #define RSA_CHALLENGE_SIZE 32  // 256 bits of random data
-#define RSA_MAX_ENCRYPT_SIZE (RSA_KEY_SIZE/8 - 42)  // OAEP padding overhead
-#define MAX_RSA_ENCRYPTED_SIZE (RSA_KEY_SIZE/8)  // 256 bytes for 2048-bit key
+#define RSA_OAEP_PADDING_OVERHEAD 42  // OAEP padding overhead in bytes
+#define RSA_MAX_ENCRYPT_SIZE (RSA_KEY_SIZE/8 - RSA_OAEP_PADDING_OVERHEAD)  // Max plaintext size
+#define MAX_RSA_ENCRYPTED_SIZE (RSA_KEY_SIZE/8)  // Encrypted output size (256 bytes for 2048-bit)
+#define RSA_DECRYPT_BUFFER_SIZE MAX_RSA_ENCRYPTED_SIZE  // Buffer for RSA decryption operations
+#define RSA_HEX_BUFFER_SIZE (MAX_RSA_ENCRYPTED_SIZE * 2 + 64)  // Hex string + prefix/suffix
+#define MAX_FILE_PATH_LEN 512  // Maximum file path length for key files and such
+#define MAX_LINE_BUFFER_SIZE 512  // General line buffer for file reading
+
+// Verify challenge size is safe for OAEP padding
+#if RSA_CHALLENGE_SIZE > RSA_MAX_ENCRYPT_SIZE
+#error "RSA_CHALLENGE_SIZE too large for OAEP padding! Max size is RSA_MAX_ENCRYPT_SIZE bytes"
+#endif
 
 // User structure
 typedef struct {
@@ -91,7 +101,8 @@ int add_user(const char* username, const char* password);
 int authenticate_user(const char* username, const char* password, int client_socket);
 int create_session(const char* username, int client_socket);
 void remove_session(int client_socket);
-session_t* get_session(int client_socket);
+int get_session_copy(int client_socket, session_t* out_session);
+int update_session(int client_socket, const session_t* updated_session);
 int is_authenticated(int client_socket);
 void cleanup_expired_sessions(void);
 void hash_password(const char* password, char* hash);
@@ -116,7 +127,9 @@ EVP_PKEY* find_client_public_key(const char* client_id);
 int get_loaded_client_count(void);
 
 void cleanup_rsa_system(void);
-rsa_challenge_result_t start_rsa_challenge(int client_socket);
+void cleanup_auth_system(void);
+rsa_challenge_result_t start_rsa_challenge_for_client(int client_socket, const char* client_id);
+EVP_PKEY* get_client_public_key(const char* client_id);
 rsa_challenge_result_t verify_rsa_response(int client_socket, const unsigned char* encrypted_response, int response_size);
 int is_rsa_command(const char* message);
 rsa_challenge_result_t process_rsa_command(const char* message, int client_socket);

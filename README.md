@@ -1,10 +1,10 @@
 # MultifactorAuth - Secure Chat Server
 
-Authenticated chat server with RSA two-factor authentication and encrypted user database.
+Authenticated chat server with RSA authentication, password protection, and an encrypted user database.
 
 ## Features
 
-- **Two-Factor Authentication**: RSA cryptographic challenge + username/password
+- **Authentication**: RSA cryptographic challenge + username/password
 - **Encrypted User Database**: AES-256-CBC encrypted user storage  
 - **Session Management**: Automatic timeout and cleanup
 - **Multi-Client Chat**: Nicknames, user list, message broadcasting

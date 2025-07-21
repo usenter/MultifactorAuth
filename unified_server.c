@@ -40,7 +40,6 @@ void signal_handler(int sig) {
     (void)sig; // Suppress unused parameter warning
     printf("\nServer shutdown requested...\n");
     server_running = 0;
-    cleanup_rsa_system();  // Clean up RSA resources
 }
 
 // Function to find client index by socket
@@ -317,17 +316,36 @@ void* handle_new_connection(void* arg) {
     printf("New connection from %s:%d (authentication required)\n", 
            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
     
+    // Wait for client ID first (for RSA key selection)
+    char client_id_buffer[BUFFER_SIZE];
+    int id_bytes = recv(client_socket, client_id_buffer, BUFFER_SIZE - 1, 0);
+    char client_id[64] = "";
+    
+    if (id_bytes > 0) {
+        client_id_buffer[id_bytes] = '\0';
+        
+        // Parse CLIENT_ID:name format
+        if (strncmp(client_id_buffer, "CLIENT_ID:", 10) == 0) {
+            char* id_start = client_id_buffer + 10;  // Skip "CLIENT_ID:"
+            char* id_end = strchr(id_start, '\n');
+            if (id_end) *id_end = '\0';
+            
+            strncpy(client_id, id_start, sizeof(client_id) - 1);
+            client_id[sizeof(client_id) - 1] = '\0';
+        }
+    }
+    
     // Automatically initiate RSA challenge if RSA system is initialized
     if (is_rsa_system_initialized()) {
         printf("Initiating automatic RSA challenge for %s:%d\n", 
                inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
         
-        // Automatically start RSA challenge
-        rsa_challenge_result_t rsa_result = start_rsa_challenge(client_socket);
+        // Automatically start RSA challenge for specific client
+        rsa_challenge_result_t rsa_result = start_rsa_challenge_for_client(client_socket, client_id);
         
         if (rsa_result.success && rsa_result.encrypted_size > 0) {
             // Send RSA challenge automatically
-            char hex_output[MAX_RSA_ENCRYPTED_SIZE * 2 + 64];
+            char hex_output[RSA_HEX_BUFFER_SIZE];
             snprintf(hex_output, sizeof(hex_output), "RSA_CHALLENGE:");
             char *hex_ptr = hex_output + strlen(hex_output);
             
@@ -343,24 +361,19 @@ void* handle_new_connection(void* arg) {
         }
     }
     
-    // Send authentication prompt (with security requirements)
-    snprintf(response, sizeof(response),
-             "%s - Secure Authentication Required\n"
-             "========================================\n"
-             "%s"
-             "Please authenticate to access the secure chat:\n"
-             "  /login <username> <password> - Login with existing account\n"
-             "  /register <username> <password> - Create new account\n\n"
-             "%s\n", 
-             PROGRAM_NAME,
-             is_rsa_system_initialized() ? 
-             "SECURITY: RSA cryptographic authentication is REQUIRED.\n"
-             "Your client must complete RSA challenge before login.\n\n" :
-             "Password-only mode (RSA keys not configured).\n\n",
-             is_rsa_system_initialized() ? 
-             "Note: Ensure your client supports RSA authentication or you will be blocked." :
-             "Note: For enhanced security, configure RSA keys.");
-    send(client_socket, response, strlen(response), 0);
+    // Authentication prompt will be sent after RSA completion
+    // or immediately if RSA is not initialized
+    if (!is_rsa_system_initialized()) {
+        snprintf(response, sizeof(response),
+                 "%s - Authentication Required\n"
+                 "========================================\n"
+                 "Password-only mode (RSA keys not configured).\n\n"
+                 "Please authenticate to access the chat:\n"
+                 "  /login <username> <password> - Login with existing account\n"
+                 "  /register <username> <password> - Create new account\n\n"
+                 "Note: For enhanced security, configure RSA keys.\n", PROGRAM_NAME);
+        send(client_socket, response, strlen(response), 0);
+    }
     
     // Authentication loop
     while (server_running) {
@@ -388,13 +401,20 @@ void* handle_new_connection(void* arg) {
                 if (rsa_result.success && strstr(rsa_result.response, "RSA authentication successful")) {
                     printf("✓ RSA authentication completed for %s:%d\n", 
                            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-                    // Send confirmation that RSA is complete (optional feedback)
-                    snprintf(response, sizeof(response), 
-                             "RSA_COMPLETE - You may now login with username/password\n");
+                    // Send authentication prompt NOW that RSA is complete
+                    snprintf(response, sizeof(response),
+                             "%s - Secure Authentication Required\n"
+                             "========================================\n"
+                             "SECURITY: RSA cryptographic authentication COMPLETED.\n\n"
+                             "Please authenticate to access the secure chat:\n"
+                             "  /login <username> <password> - Login with existing account\n"
+                             "  /register <username> <password> - Create new account\n\n"
+                             "Ready for secure login.\n", PROGRAM_NAME);
                     send(client_socket, response, strlen(response), 0);
                 } else if (!rsa_result.success) {
                     printf("✗ RSA authentication FAILED for %s:%d - connection will be terminated\n", 
                            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+                           
                     snprintf(response, sizeof(response), 
                              "RSA_FAILED - RSA authentication failed. Connection terminated.\n");
                     send(client_socket, response, strlen(response), 0);
@@ -578,16 +598,16 @@ int main(int argc, char *argv[]) {
     
     // Initialize RSA authentication system
     printf("Initializing RSA authentication...\n");
-    if (!init_rsa_system("server_private.pem", "server_public.pem")) {
-        printf("WARNING: RSA authentication disabled - key files not found\n");
-        printf("To enable RSA authentication:\n");
+    if (!init_rsa_system("RSAkeys/server_private.pem", "RSAkeys/server_public.pem")) {
+        printf("ERROR: RSA authentication keys not found!\n");
+        printf("This server requires RSA two-factor authentication.\n");
+        printf("\nTo generate required keys:\n");
         printf("  1. Run: ./generate_rsa_keys server\n");
         printf("  2. Run: ./generate_rsa_keys client [client_id]  # e.g., alice, bob, etc.\n");
-        printf("  3. Set proper permissions: chmod 600 *.pem\n");
-        printf("Server will continue with password-only authentication.\n");
-    } else {
-        printf("RSA two-factor authentication enabled!\n");
+        printf("\nServer cannot start without RSA keys.\n");
+        return 1;
     }
+    printf("RSA two-factor authentication enabled!\n");
     
     // Set up signal handlers for graceful shutdown
     signal(SIGINT, signal_handler);
@@ -668,7 +688,7 @@ int main(int argc, char *argv[]) {
     // Cleanup and shutdown
     close(server_socket);
     cleanup_server();
-    cleanup_rsa_system();  // Clean up RSA authentication resources
+    cleanup_auth_system(); // Clean up authentication system hashmaps
     
     printf("%s shutdown complete\n", PROGRAM_NAME);
     return 0;

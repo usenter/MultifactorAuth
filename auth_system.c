@@ -9,8 +9,8 @@
 
 // Global variables
 static struct hashmap *users = NULL;
+static struct hashmap *sessions_map = NULL;  // Maps client_socket -> session_t
 
-static session_t sessions[MAX_USERS];
 static int user_count = 0;
 static int session_count = 0;
 
@@ -69,6 +69,26 @@ client_key_entry_t create_client_key_entry(const char* client_id) {
     return entry;
 }
 
+// Hashmap functions for sessions
+int session_compare(const void *a, const void *b, void* udata) {
+    const session_t *sa = a;
+    const session_t *sb = b;
+    return sa->client_socket - sb->client_socket;
+}
+
+uint64_t session_hash(const void *item, uint64_t seed0, uint64_t seed1) {
+    const session_t *session = item;
+    return hashmap_sip(&session->client_socket, sizeof(session->client_socket), seed0, seed1);
+}
+
+// Create a session for lookup
+session_t create_session_lookup(int client_socket) {
+    session_t session;
+    memset(&session, 0, sizeof(session));
+    session.client_socket = client_socket;
+    return session;
+}
+
 // Constructor: create a user_t with just a username (for lookups)
 user_t create_user(const char* username) {
     user_t user;
@@ -82,7 +102,6 @@ user_t create_user(const char* username) {
 int verify_password(const char* password, const char* hash) {
     char computed_hash[MAX_HASH_LEN];
     hash_password(password, computed_hash);
-    printf("recieved: %s expected: %s", computed_hash, hash);
 
     return strcmp(computed_hash, hash) == 0;
 }
@@ -100,11 +119,23 @@ int verify_password(const char* password, const char* hash) {
 
 int init_encrypted_auth_system(char* userFile, char* key) {
     users = hashmap_new(sizeof(user_t), 0, 0, 0, user_hash, user_compare, NULL, NULL);
+    if (!users) {
+        printf("Failed to create users hashmap\n");
+        return 0;
+    }
+    
+    sessions_map = hashmap_new(sizeof(session_t), 0, 0, 0, session_hash, session_compare, NULL, NULL);
+    if (!sessions_map) {
+        printf("Failed to create sessions hashmap\n");
+        hashmap_free(users);
+        users = NULL;
+        return 0;
+    }
+    
     user_count = 0;
     session_count = 0;
     
     return load_users_from_encrypted_file(userFile, key);
-    
 }
 
 // Add a new user
@@ -140,7 +171,7 @@ int authenticate_user(const char* username, const char* password, int client_soc
                    username, client_socket);
             return 0; // HARD BLOCK - no login without RSA
         }
-        printf("RSA authentication verified for user: %s from socket %d\n", username, client_socket);
+
     }
     
     user_t lookup_user = create_user(username);
@@ -157,18 +188,41 @@ int authenticate_user(const char* username, const char* password, int client_soc
 
 // Create a new session
 int create_session(const char* username, int client_socket) {
-    // Remove any existing session for this socket
-    remove_session(client_socket);
+    if (!sessions_map) {
+        printf("Sessions hashmap not initialized\n");
+        return 0;
+    }
     
+    // Check if session already exists (from RSA phase)
+    session_t existing_session;
+    if (get_session_copy(client_socket, &existing_session)) {
+        // Update existing session with username and set authenticated = 1
+        // Preserve RSA authentication status
+        strncpy(existing_session.username, username, MAX_USERNAME_LEN - 1);
+        existing_session.username[MAX_USERNAME_LEN - 1] = '\0';
+        existing_session.authenticated = 1;
+        existing_session.login_time = time(NULL);
+        
+        // Update the session in hashmap
+        hashmap_set(sessions_map, &existing_session);
+        return 1; // Success
+    }
+    
+    // No existing session - create new one (shouldn't happen in normal flow)
     if (session_count >= MAX_USERS) {
         return 0; // No space
     }
     
-    strncpy(sessions[session_count].username, username, MAX_USERNAME_LEN - 1);
-    sessions[session_count].username[MAX_USERNAME_LEN - 1] = '\0';
-    sessions[session_count].client_socket = client_socket;
-    sessions[session_count].login_time = time(NULL);
-    sessions[session_count].authenticated = 1;
+    session_t session;
+    memset(&session, 0, sizeof(session));
+    strncpy(session.username, username, MAX_USERNAME_LEN - 1);
+    session.username[MAX_USERNAME_LEN - 1] = '\0';
+    session.client_socket = client_socket;
+    session.login_time = time(NULL);
+    session.authenticated = 1;
+    session.rsa_authenticated = 0;
+    
+    hashmap_set(sessions_map, &session);
     session_count++;
     
     return 1; // Success
@@ -176,35 +230,66 @@ int create_session(const char* username, int client_socket) {
 
 // Remove a session
 void remove_session(int client_socket) {
-    for (int i = 0; i < session_count; i++) {
-        if (sessions[i].authenticated && sessions[i].client_socket == client_socket) {
-            // Move last session to this position
-            if (i < session_count - 1) {
-                sessions[i] = sessions[session_count - 1];
-            }
-            session_count--;
-            break;
-        }
+    if (!sessions_map) {
+        return; // Nothing to remove
+    }
+    
+    session_t lookup = create_session_lookup(client_socket);
+    const session_t *found = hashmap_get(sessions_map, &lookup);
+    
+    // Only remove if authenticated (i.e., after login)
+    if (found && found->authenticated) {
+        hashmap_delete(sessions_map, &lookup);
+        session_count--;
     }
 }
 
-// Get session for a socket
-session_t* get_session(int client_socket) {
-    for (int i = 0; i < session_count; i++) {
-        if (sessions[i].authenticated && sessions[i].client_socket == client_socket) {
-            return &sessions[i];
-        }
+// Get session for a socket (returns copy, not pointer!)
+int get_session_copy(int client_socket, session_t* out_session) {
+    if (!sessions_map || !out_session) {
+        return 0; // Failed
     }
-    return NULL;
+    
+    session_t lookup = create_session_lookup(client_socket);
+    const session_t *found = hashmap_get(sessions_map, &lookup);
+    
+    if (found) {
+        *out_session = *found; // Copy the session data
+        return 1; // Success
+    }
+    return 0; // Not found
+}
+
+// Update session data safely
+int update_session(int client_socket, const session_t* updated_session) {
+    if (!sessions_map || !updated_session) {
+        return 0; // Failed
+    }
+    
+    session_t lookup = create_session_lookup(client_socket);
+    const session_t *found = hashmap_get(sessions_map, &lookup);
+    
+    if (found) {
+        hashmap_set(sessions_map, updated_session);
+        return 1; // Success
+    }
+    return 0; // Not found
 }
 
 // Check if a socket is authenticated
 int is_authenticated(int client_socket) {
-    session_t* session = get_session(client_socket);
-    if (!session) return 0;
+    session_t session;
+    if (!get_session_copy(client_socket, &session)) {
+        return 0;
+    }
+    
+    // Must be authenticated (not just have a session)
+    if (!session.authenticated) {
+        return 0;
+    }
     
     // Check if session has expired
-    if (time(NULL) - session->login_time > AUTH_TIMEOUT) {
+    if (time(NULL) - session.login_time > AUTH_TIMEOUT) {
         remove_session(client_socket);
         return 0;
     }
@@ -214,12 +299,31 @@ int is_authenticated(int client_socket) {
 
 // Clean up expired sessions
 void cleanup_expired_sessions(void) {
+    if (!sessions_map) {
+        return; // Nothing to clean up
+    }
+    
     time_t current_time = time(NULL);
-    for (int i = session_count - 1; i >= 0; i--) {
-        if (current_time - sessions[i].login_time > AUTH_TIMEOUT) {
-            printf("Session expired for user: %s\n", sessions[i].username);
-            remove_session(sessions[i].client_socket);
+    
+    // Collect expired sessions first to avoid modifying hashmap during iteration
+    int expired_sockets[MAX_USERS];
+    int expired_count = 0;
+    
+    size_t iter = 0;
+    void *item;
+    while (hashmap_iter(sessions_map, &iter, &item)) {
+        session_t *session = (session_t*)item;
+        if (current_time - session->login_time > AUTH_TIMEOUT) {
+            printf("Session expired for user: %s\n", session->username);
+            if (expired_count < MAX_USERS) {
+                expired_sockets[expired_count++] = session->client_socket;
+            }
         }
+    }
+    
+    // Remove expired sessions
+    for (int i = 0; i < expired_count; i++) {
+        remove_session(expired_sockets[i]);
     }
 }
 
@@ -250,7 +354,7 @@ void load_users_from_file(const char* filename) {
         return;
     }
     
-    char line[256];
+    char line[MAX_LINE_BUFFER_SIZE];
     char username[MAX_USERNAME_LEN];
     char password_hash[MAX_HASH_LEN];
     int loaded_count = 0;
@@ -330,7 +434,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
                 hashmap_set(users, &new_user);
                 loaded_count++;
                 user_count++;
-                printf("Loaded user: %s\n", username);
+                //printf("Loaded user: %s\n", username);
 
             }
             
@@ -359,7 +463,6 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
                 hashmap_set(users, &new_user);
                 loaded_count++;
                 user_count++;
-                printf("Loaded user: %s\n", username);
             }
             
             memset(password, 0, sizeof(password));
@@ -369,7 +472,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
     // Free the decrypted data (this also clears sensitive data)
     free_decryption_result(&decrypt_result);
     
-    printf("Successfully loaded %d users from encrypted file\n", loaded_count);
+    printf("Loaded %d users from encrypted database\n", loaded_count);
     return 1;
 }
 
@@ -422,7 +525,7 @@ auth_result_t process_auth_command(const char* message, int client_socket) {
                         "%s RSA authentication required. Use %s first", AUTH_FAILED, RSA_AUTH_START);
             } else {
                 snprintf(result.response, sizeof(result.response), 
-                        "%s Invalid username or password", AUTH_FAILED);
+                        "%s Invalid username or password\n", AUTH_FAILED);
             }
         }
     } else if (strcmp(command, AUTH_REGISTER) == 0) {
@@ -473,10 +576,10 @@ int load_all_client_keys_dynamic(void) {
                                   client_key_hash, client_key_compare, NULL, NULL);
     client_key_count = 0;
     
-    // Open current directory
-    dir = opendir(".");
+    // Open RSAkeys directory
+    dir = opendir("RSAkeys");
     if (!dir) {
-        printf("Could not open current directory for key scanning\n");
+        printf("Could not open RSAkeys directory for key scanning\n");
         return 0;
     }
     
@@ -497,8 +600,10 @@ int load_all_client_keys_dynamic(void) {
                 strncpy(client_id, start, end - start);
                 client_id[end - start] = '\0';
                 
-                // Load the public key
-                EVP_PKEY* key = load_public_key(ent->d_name);
+                // Load the public key with full path
+                char key_path[MAX_FILE_PATH_LEN];
+                snprintf(key_path, sizeof(key_path), "RSAkeys/%s", ent->d_name);
+                EVP_PKEY* key = load_public_key(key_path);
                 if (key) {
                     // Create and store client key entry
                     client_key_entry_t entry = create_client_key_entry(client_id);
@@ -506,7 +611,7 @@ int load_all_client_keys_dynamic(void) {
                     
                     hashmap_set(client_keys_map, &entry);
                     client_key_count++;
-                    printf("Loaded client public key for '%s': %s\n", client_id, ent->d_name);
+                    printf("Loaded client public key for '%s': RSAkeys/%s\n", client_id, ent->d_name);
                 }
             }
         }
@@ -532,6 +637,19 @@ EVP_PKEY* find_client_public_key(const char* client_id) {
 // Get count of loaded client keys
 int get_loaded_client_count(void) {
     return client_key_count;
+}
+
+// Get specific client's public key by client_id
+EVP_PKEY* get_client_public_key(const char* client_id) {
+    if (!client_keys_map || !client_id) {
+        return NULL;
+    }
+    
+    client_key_entry_t lookup = create_client_key_entry(client_id);
+    const client_key_entry_t *found = hashmap_get(client_keys_map, &lookup);
+    
+    //if(found){PEM_write_PUBKEY(stdout, found->public_key);}
+    return found ? found->public_key : NULL;
 }
 
 // Initialize RSA authentication system
@@ -703,7 +821,7 @@ EVP_PKEY* load_public_key(const char* public_key_file) {
 }
 
 // Start RSA challenge for a client
-rsa_challenge_result_t start_rsa_challenge(int client_socket) {
+rsa_challenge_result_t start_rsa_challenge_for_client(int client_socket, const char* client_id) {
     rsa_challenge_result_t result;
     memset(&result, 0, sizeof(result));
     
@@ -714,8 +832,10 @@ rsa_challenge_result_t start_rsa_challenge(int client_socket) {
     }
     
     // Find or create session
-    session_t* session = get_session(client_socket);
-    if (!session) {
+    session_t session;
+    int has_session = get_session_copy(client_socket, &session);
+    
+    if (!has_session) {
         // Create temporary session for RSA auth
         if (session_count >= MAX_USERS) {
             snprintf(result.response, sizeof(result.response), 
@@ -723,44 +843,65 @@ rsa_challenge_result_t start_rsa_challenge(int client_socket) {
             return result;
         }
         
-        sessions[session_count].client_socket = client_socket;
-        sessions[session_count].login_time = time(NULL);
-        sessions[session_count].authenticated = 0;
-        sessions[session_count].rsa_authenticated = 0;
-        session = &sessions[session_count];
+        // Create new session for RSA auth
+        memset(&session, 0, sizeof(session));
+        session.client_socket = client_socket;
+        session.login_time = time(NULL);
+        session.authenticated = 0;
+        session.rsa_authenticated = 0;
+        
+        if (!sessions_map) {
+            snprintf(result.response, sizeof(result.response), 
+                    "%s Sessions not initialized", RSA_AUTH_FAILED);
+            return result;
+        }
+        
+        hashmap_set(sessions_map, &session);
         session_count++;
+        printf("Created new RSA session for client socket %d (auth=%d, rsa_auth=%d)\n", 
+               client_socket, session.authenticated, session.rsa_authenticated);
+    } else {
+        printf("Using existing session for client socket %d (auth=%d, rsa_auth=%d)\n", 
+               client_socket, session.authenticated, session.rsa_authenticated);
     }
     
     // Generate random challenge
-    if (RAND_bytes(session->challenge, RSA_CHALLENGE_SIZE) != 1) {
+    if (RAND_bytes(session.challenge, RSA_CHALLENGE_SIZE) != 1) {
         snprintf(result.response, sizeof(result.response), 
                 "%s Failed to generate challenge", RSA_AUTH_FAILED);
         return result;
     }
     
-    // Get any available client public key for challenge encryption
-    // Note: This uses the first available key - in practice, the client with the matching
-    // private key will be able to decrypt it, others will fail gracefully
-    EVP_PKEY* first_client_key = NULL;
+    // Get specific client's public key for challenge encryption
+    EVP_PKEY* client_key = NULL;
     
-    // Iterate through hashmap to find first available key
-    size_t iter = 0;
-    void *item;
-    while (hashmap_iter(client_keys_map, &iter, &item)) {
-        client_key_entry_t *entry = (client_key_entry_t*)item;
-        if (entry && entry->public_key) {
-            first_client_key = entry->public_key;
-            break;
+    if (client_id && strlen(client_id) > 0) {
+        client_key = get_client_public_key(client_id);
+        printf("Looking for client key for '%s': %s\n", client_id, client_key ? "FOUND" : "NOT FOUND");
+    }
+    
+    // If specific client key not found, fall back to first available (for backwards compatibility)
+    if (!client_key) {
+        printf("Client ID '%s' key not found, using first available key\n", client_id ? client_id : "NULL");
+        size_t iter = 0;
+        void *item;
+        while (hashmap_iter(client_keys_map, &iter, &item)) {
+            client_key_entry_t *entry = (client_key_entry_t*)item;
+            if (entry && entry->public_key) {
+                client_key = entry->public_key;
+                printf("Using fallback key for client '%s'\n", entry->client_id);
+                break;
+            }
         }
     }
     
-    if (!first_client_key) {
+    if (!client_key) {
         snprintf(result.response, sizeof(result.response), 
                 "%s No client public keys available", RSA_AUTH_FAILED);
         return result;
     }
     
-    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(first_client_key, NULL);
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(client_key, NULL);
     if (!ctx || EVP_PKEY_encrypt_init(ctx) <= 0 || 
         EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0) {
         if (ctx) EVP_PKEY_CTX_free(ctx);
@@ -770,7 +911,11 @@ rsa_challenge_result_t start_rsa_challenge(int client_socket) {
     }
     
     size_t outlen = MAX_RSA_ENCRYPTED_SIZE;
-    if (EVP_PKEY_encrypt(ctx, result.encrypted_challenge, &outlen, session->challenge, RSA_CHALLENGE_SIZE) <= 0) {
+    //printf("DEBUG: About to encrypt %d bytes of challenge data\n", RSA_CHALLENGE_SIZE);
+    //printf("DEBUG: Expected encrypted output size: %d bytes\n", MAX_RSA_ENCRYPTED_SIZE);
+    
+    if (EVP_PKEY_encrypt(ctx, result.encrypted_challenge, &outlen, session.challenge, RSA_CHALLENGE_SIZE) <= 0) {
+        ERR_print_errors_fp(stdout);
         EVP_PKEY_CTX_free(ctx);
         snprintf(result.response, sizeof(result.response), 
                 "%s Failed to encrypt challenge", RSA_AUTH_FAILED);
@@ -778,10 +923,23 @@ rsa_challenge_result_t start_rsa_challenge(int client_socket) {
     }
     
     result.encrypted_size = outlen;
+    //printf("DEBUG: Actual encrypted size: %zu bytes\n", outlen);
+    
+    if (outlen != MAX_RSA_ENCRYPTED_SIZE) {
+        printf("WARNING: Encrypted size mismatch! Expected %d, got %zu\n", 
+               MAX_RSA_ENCRYPTED_SIZE, outlen);
+    }
     EVP_PKEY_CTX_free(ctx);
     
     // Copy challenge for verification later
-    memcpy(result.challenge, session->challenge, RSA_CHALLENGE_SIZE);
+    memcpy(result.challenge, session.challenge, RSA_CHALLENGE_SIZE);
+    
+    // Update the session with the challenge data
+    if (!update_session(client_socket, &session)) {
+        snprintf(result.response, sizeof(result.response), 
+                "%s Failed to update session", RSA_AUTH_FAILED);
+        return result;
+    }
     
     result.success = 1;
     snprintf(result.response, sizeof(result.response), 
@@ -795,46 +953,72 @@ rsa_challenge_result_t start_rsa_challenge(int client_socket) {
 rsa_challenge_result_t verify_rsa_response(int client_socket, const unsigned char* encrypted_response, int response_size) {
     rsa_challenge_result_t result;
     memset(&result, 0, sizeof(result));
-    
+    printf("\nCurrently verifying challenge in verify_rsa_response.\n");
     if (!rsa_system_initialized || !server_keys.private_key) {
         snprintf(result.response, sizeof(result.response), 
                 "%s RSA system not initialized", RSA_AUTH_FAILED);
         return result;
     }
     
+    printf("RSA system initialized and server private key loaded.\n");
     // Find session
-    session_t* session = get_session(client_socket);
-    if (!session) {
+    session_t session;
+    if (!get_session_copy(client_socket, &session)) {
         snprintf(result.response, sizeof(result.response), 
                 "%s No active session", RSA_AUTH_FAILED);
+        printf("ERROR: No active session found for client socket %d\n", client_socket);
         return result;
     }
+    
+    printf("SUCCESS: Found session for client socket %d (auth=%d, rsa_auth=%d)\n", 
+           client_socket, session.authenticated, session.rsa_authenticated);
     
     // Decrypt the response with server's private key
-    unsigned char decrypted_challenge[RSA_CHALLENGE_SIZE + 1];
+    unsigned char decrypted_challenge[RSA_DECRYPT_BUFFER_SIZE];
     EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(server_keys.private_key, NULL);
-    if (!ctx || EVP_PKEY_decrypt_init(ctx) <= 0 || 
-        EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0) {
+    if (!ctx || EVP_PKEY_decrypt_init(ctx) <= 0 || EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0) {
         if (ctx) EVP_PKEY_CTX_free(ctx);
+        ERR_print_errors_fp(stdout);
         snprintf(result.response, sizeof(result.response), 
                 "%s Failed to setup decryption", RSA_AUTH_FAILED);
+        printf("failed to setup decryption\n");
         return result;
     }
     
-    size_t outlen = RSA_CHALLENGE_SIZE;
-    if (EVP_PKEY_decrypt(ctx, decrypted_challenge, &outlen, encrypted_response, response_size) <= 0 ||
-        outlen != RSA_CHALLENGE_SIZE) {
+    size_t outlen = sizeof(decrypted_challenge);  // Use actual buffer size
+    //printf("DEBUG: About to decrypt client response of %d bytes\n", response_size);
+    //printf("DEBUG: Expected response size: %d bytes\n", MAX_RSA_ENCRYPTED_SIZE);
+    //printf("DEBUG: Decryption buffer size: %zu bytes\n", outlen);
+    
+    int decrypt_result = EVP_PKEY_decrypt(ctx, decrypted_challenge, &outlen, encrypted_response, response_size);
+    /*
+    printf("DEBUG: Decryption result: %d\n", decrypt_result);
+    printf("DEBUG: Actual decrypted size: %zu bytes\n", outlen);
+    printf("DEBUG: Expected decrypted size: %d bytes\n", RSA_CHALLENGE_SIZE);
+    */
+    if (decrypt_result <= 0) {
+        ERR_print_errors_fp(stdout);
         EVP_PKEY_CTX_free(ctx);
         snprintf(result.response, sizeof(result.response), 
                 "%s Failed to decrypt response", RSA_AUTH_FAILED);
+        printf("ERROR: Decryption failed\n");
+        return result;
+    }
+    
+    if (outlen != RSA_CHALLENGE_SIZE) {
+        EVP_PKEY_CTX_free(ctx);
+        snprintf(result.response, sizeof(result.response), 
+                "%s Decrypted size mismatch", RSA_AUTH_FAILED);
+        printf("ERROR: Length mismatch - got %zu bytes, expected %d bytes\n", 
+               outlen, RSA_CHALLENGE_SIZE);
         return result;
     }
     
     EVP_PKEY_CTX_free(ctx);
-    
+   
     // Verify challenge matches
-    if (memcmp(session->challenge, decrypted_challenge, RSA_CHALLENGE_SIZE) == 0) {
-        session->rsa_authenticated = 1;
+    if (memcmp(session.challenge, decrypted_challenge, RSA_CHALLENGE_SIZE) == 0) {
+        session.rsa_authenticated = 1;
         result.success = 1;
         snprintf(result.response, sizeof(result.response), 
                 "%s RSA authentication successful", RSA_AUTH_SUCCESS);
@@ -848,8 +1032,9 @@ rsa_challenge_result_t verify_rsa_response(int client_socket, const unsigned cha
         printf("RSA challenge verification failed for client socket %d\n", client_socket);
     }
     
-    // Clear the challenge from memory
-    memset(session->challenge, 0, RSA_CHALLENGE_SIZE);
+    // Clear the challenge from memory and update session
+    memset(session.challenge, 0, RSA_CHALLENGE_SIZE);
+    update_session(client_socket, &session);
     
     return result;
 }
@@ -865,15 +1050,16 @@ rsa_challenge_result_t process_rsa_command(const char* message, int client_socke
     rsa_challenge_result_t result;
     memset(&result, 0, sizeof(result));
     
+    printf("\n\nProcessing RSA command...\n");
     if (strncmp(message, RSA_AUTH_START, strlen(RSA_AUTH_START)) == 0) {
-        // Start RSA challenge
-        return start_rsa_challenge(client_socket);
+        // Start RSA challenge (no specific client ID available in this context)
+        return start_rsa_challenge_for_client(client_socket, NULL);
         
     } else if (strncmp(message, RSA_AUTH_RESPONSE, strlen(RSA_AUTH_RESPONSE)) == 0) {
         // Process RSA response
         char command[64];
-        char hex_response[MAX_RSA_ENCRYPTED_SIZE * 2 + 1];
-        
+        char hex_response[RSA_HEX_BUFFER_SIZE];
+        printf("Recieved RSA response command\n");
         if (sscanf(message, "%63s %512s", command, hex_response) != 2) {
             snprintf(result.response, sizeof(result.response), 
                     "%s Invalid format. Use: %s <hex_encrypted_response>", 
@@ -895,6 +1081,7 @@ rsa_challenge_result_t process_rsa_command(const char* message, int client_socke
             sscanf(hex_response + (i * 2), "%2hhx", &encrypted_response[i]);
         }
         
+        printf("Verifying RSA response...\n");
         return verify_rsa_response(client_socket, encrypted_response, response_size);
     }
     
@@ -905,8 +1092,11 @@ rsa_challenge_result_t process_rsa_command(const char* message, int client_socke
 
 // Check if client has completed RSA authentication
 int is_rsa_authenticated(int client_socket) {
-    session_t* session = get_session(client_socket);
-    return session ? session->rsa_authenticated : 0;
+    session_t session;
+    if (get_session_copy(client_socket, &session)) {
+        return session.rsa_authenticated;
+    }
+    return 0;
 }
 
 // Check if RSA system is initialized
@@ -947,4 +1137,19 @@ void cleanup_rsa_system(void) {
     
     rsa_system_initialized = 0;
     printf("RSA authentication system cleaned up\n");
+}
+
+// Clean up auth system resources
+void cleanup_auth_system(void) {
+    if (users) {
+        hashmap_free(users);
+        users = NULL;
+    }
+    if (sessions_map) {
+        hashmap_free(sessions_map);
+        sessions_map = NULL;
+    }
+    user_count = 0;
+    session_count = 0;
+    printf("Authentication system cleanup complete\n");
 }

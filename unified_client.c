@@ -9,13 +9,18 @@
 #include <openssl/pem.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
-
+#include <openssl/err.h>
 #define PORT 12345
 #define BUFFER_SIZE 1024
 #define MAX_MESSAGES 100
 #define MAX_USERNAME_LEN 32
 #define MAX_PASSWORD_LEN 64
-#define MAX_RSA_ENCRYPTED_SIZE 256
+#define RSA_KEY_SIZE 2048
+#define RSA_CHALLENGE_SIZE 32
+#define MAX_RSA_ENCRYPTED_SIZE (RSA_KEY_SIZE/8)  // 256 bytes for 2048-bit key
+#define RSA_DECRYPT_BUFFER_SIZE MAX_RSA_ENCRYPTED_SIZE
+#define RSA_HEX_BUFFER_SIZE (MAX_RSA_ENCRYPTED_SIZE * 2 + 64)
+#define MAX_FILE_PATH_LEN 512
 
 volatile int running = 1;
 int authenticated = 0;
@@ -67,13 +72,12 @@ int get_stored_messages(char messages[][BUFFER_SIZE], int max_count) {
 // RSA Authentication Functions
 // Load client's private key
 int load_client_private_key(const char* client_id) {
-    char key_file[256];
-    snprintf(key_file, sizeof(key_file), "client_%s_private.pem", client_id);
+    char key_file[MAX_FILE_PATH_LEN];
+    snprintf(key_file, sizeof(key_file), "RSAkeys/client_%s_private.pem", client_id);
     
     FILE* fp = fopen(key_file, "r");
     if (!fp) {
-        printf("Warning: Could not open client private key: %s\n", key_file);
-        printf("RSA authentication disabled. Server may require RSA authentication.\n");
+        printf("ERROR: Could not open client private key: %s\n", key_file);
         return 0;
     }
     
@@ -81,20 +85,19 @@ int load_client_private_key(const char* client_id) {
     fclose(fp);
     
     if (!client_private_key) {
-        printf("Warning: Could not read client private key from: %s\n", key_file);
+        printf("ERROR: Could not read client private key from: %s\n", key_file);
         return 0;
     }
     
-    printf("Loaded client private key: %s\n", key_file);
+
     return 1;
 }
 
 // Load server's public key
 int load_server_public_key(void) {
-    FILE* fp = fopen("server_public.pem", "r");
+    FILE* fp = fopen("RSAkeys/server_public.pem", "r");
     if (!fp) {
-        printf("Warning: Could not open server public key: server_public.pem\n");
-        printf("RSA authentication disabled. Server may require RSA authentication.\n");
+        printf("ERROR: Could not open server public key: RSAkeys/server_public.pem\n");
         return 0;
     }
     
@@ -102,11 +105,10 @@ int load_server_public_key(void) {
     fclose(fp);
     
     if (!server_public_key) {
-        printf("Warning: Could not read server public key\n");
+        printf("ERROR: Could not read server public key\n");
         return 0;
     }
-    
-    printf("Loaded server public key: server_public.pem\n");
+
     return 1;
 }
 
@@ -117,11 +119,21 @@ int handle_rsa_challenge(int socket, const char* hex_challenge) {
         return 0;
     }
     
-    printf("Handling RSA challenge automatically...\n");
+    printf("Authenticating with server...\n");
     
     // Convert hex challenge back to binary
     size_t challenge_len = strlen(hex_challenge) / 2;
     unsigned char encrypted_challenge[MAX_RSA_ENCRYPTED_SIZE];
+    /*
+    printf("DEBUG: Hex challenge length: %zu chars, Binary length: %zu bytes\n", 
+           strlen(hex_challenge), challenge_len);
+    printf("DEBUG: Expected encrypted size for 2048-bit RSA: %d bytes\n", MAX_RSA_ENCRYPTED_SIZE);
+    */
+    if (challenge_len != MAX_RSA_ENCRYPTED_SIZE) {
+        printf("ERROR: Encrypted challenge length mismatch! Expected %d, got %zu\n", 
+               MAX_RSA_ENCRYPTED_SIZE, challenge_len);
+        return 0;
+    }
     
     for (size_t i = 0; i < challenge_len; i++) {
         sscanf(hex_challenge + (i * 2), "%2hhx", &encrypted_challenge[i]);
@@ -136,15 +148,31 @@ int handle_rsa_challenge(int socket, const char* hex_challenge) {
         return 0;
     }
     
-    unsigned char decrypted_challenge[64];
+    unsigned char decrypted_challenge[RSA_DECRYPT_BUFFER_SIZE];
     size_t decrypted_len = sizeof(decrypted_challenge);
     
+    /*
+    printf("DEBUG: About to decrypt %zu bytes of encrypted data\n", challenge_len);
+    printf("DEBUG: Decryption buffer size: %zu bytes\n", decrypted_len);
+    printf("DEBUG: Expected decrypted size: %d bytes\n", RSA_CHALLENGE_SIZE);
+        */
+    //decrypt the challenge using the client private key
     if (EVP_PKEY_decrypt(decrypt_ctx, decrypted_challenge, &decrypted_len, encrypted_challenge, challenge_len) <= 0) {
+        ERR_print_errors_fp(stdout);
+        PEM_write_PrivateKey(stdout, client_private_key, NULL, NULL, 0, NULL, NULL);
         EVP_PKEY_CTX_free(decrypt_ctx);
         printf("Failed to decrypt RSA challenge\n");
         return 0;
     }
     EVP_PKEY_CTX_free(decrypt_ctx);
+    
+    //printf("DEBUG: Successfully decrypted %zu bytes (expected %d bytes)\n", 
+    //       decrypted_len, RSA_CHALLENGE_SIZE);
+    
+    if (decrypted_len != RSA_CHALLENGE_SIZE) {
+        printf("WARNING: Decrypted length mismatch! Expected %d, got %zu\n", 
+               RSA_CHALLENGE_SIZE, decrypted_len);
+    }
     
     // Encrypt decrypted challenge with server public key
     EVP_PKEY_CTX *encrypt_ctx = EVP_PKEY_CTX_new(server_public_key, NULL);
@@ -158,15 +186,29 @@ int handle_rsa_challenge(int socket, const char* hex_challenge) {
     unsigned char encrypted_response[MAX_RSA_ENCRYPTED_SIZE];
     size_t encrypted_len = sizeof(encrypted_response);
     
-    if (EVP_PKEY_encrypt(encrypt_ctx, encrypted_response, &encrypted_len, decrypted_challenge, decrypted_len) <= 0) {
+    // Use RSA_CHALLENGE_SIZE instead of decrypted_len for consistency
+    size_t input_len = RSA_CHALLENGE_SIZE;
+    //printf("DEBUG: About to re-encrypt %zu bytes with server public key\n", input_len);
+    //printf("DEBUG: Output buffer size: %zu bytes\n", encrypted_len);
+    
+    if (EVP_PKEY_encrypt(encrypt_ctx, encrypted_response, &encrypted_len, decrypted_challenge, input_len) <= 0) {
+        ERR_print_errors_fp(stdout);
         EVP_PKEY_CTX_free(encrypt_ctx);
         printf("Failed to encrypt RSA response\n");
         return 0;
     }
     EVP_PKEY_CTX_free(encrypt_ctx);
     
+    //printf("DEBUG: Successfully re-encrypted to %zu bytes (expected %d bytes)\n", 
+    //      encrypted_len, MAX_RSA_ENCRYPTED_SIZE);
+    
+    if (encrypted_len != MAX_RSA_ENCRYPTED_SIZE) {
+        printf("WARNING: Re-encrypted length mismatch! Expected %d, got %zu\n", 
+               MAX_RSA_ENCRYPTED_SIZE, encrypted_len);
+    }
+    
     // Convert response to hex and send
-    char hex_response[MAX_RSA_ENCRYPTED_SIZE * 2 + 32];
+    char hex_response[RSA_HEX_BUFFER_SIZE];
     snprintf(hex_response, sizeof(hex_response), "/rsa_response ");
     char* hex_ptr = hex_response + strlen(hex_response);
     
@@ -223,21 +265,17 @@ void* receive_messages(void* arg) {
             char* challenge_end = strchr(challenge_start, '\n');
             if (challenge_end) *challenge_end = '\0';
             
-            printf("\nPerforming RSA authentication...\n");
+            printf("\n[RSA] Performing RSA mutual authentication...\n");
             if (handle_rsa_challenge(client_socket, challenge_start)) {
                 rsa_completed = 1;
-                printf("RSA authentication completed!\n");
+                printf("[RSA] SUCCESS: RSA mutual authentication completed!\n");
+                printf("[RSA] Secure encrypted channel established between client and server.\n");
+                printf("[RSA] You may now login with your username and password.\n");
+                printf("\n");
             } else {
-                printf("RSA authentication failed! You may not be able to login.\n");
+                printf("[RSA] FAILED: RSA authentication failed! Connection may be terminated.\n");
             }
             return NULL; // Don't process this message further
-        }
-        
-        // Check for RSA completion confirmation
-        if (strstr(buffer, "RSA_COMPLETE")) {
-            rsa_completed = 1;
-            printf("\nRSA authentication verified by server.\n");
-            return NULL; // Don't display this technical message
         }
         
         // Check for RSA failure
@@ -252,6 +290,17 @@ void* receive_messages(void* arg) {
             printf("\nSECURITY ERROR: RSA authentication is required but failed.\n");
             printf("Make sure you have the correct RSA keys for your client.\n");
             return NULL; // Don't process further
+        }
+        
+        // Check for server shutdown/disconnect messages
+        if (strstr(buffer, "Server is shutting down") || 
+            strstr(buffer, "server disconnected") ||
+            strstr(buffer, "Server disconnected")) {
+            printf("\n%s", buffer);
+            printf("Client shutting down automatically...\n");
+            running = 0;
+            shutdown(client_socket, SHUT_RDWR);  // This will wake up the main thread
+            return NULL;
         }
         
         // Store the message
@@ -287,13 +336,34 @@ void client_mode(int client_socket) {
     char buffer[BUFFER_SIZE];
     pthread_t receive_thread;
     
-    printf("Connected to chat server!\n");
+    printf("Connected to secure MultiFactor Authentication chat server!\n");
+    printf("Starting RSA challenge-response authentication...\n");
     
-    // Display initial server message
+    // Display initial server message (but check for RSA challenge first)
     int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
     if (bytes_received > 0) {
         buffer[bytes_received] = '\0';
-        printf("Server: %s", buffer);
+        
+        // Check if the first message is an RSA challenge
+        if (strstr(buffer, "RSA_CHALLENGE:") && !rsa_completed) {
+            char* challenge_start = strstr(buffer, "RSA_CHALLENGE:") + 14;  // Skip "RSA_CHALLENGE:"
+            char* challenge_end = strchr(challenge_start, '\n');
+            if (challenge_end) *challenge_end = '\0';
+            
+            printf("\n[RSA] Performing RSA mutual authentication...\n");
+            if (handle_rsa_challenge(client_socket, challenge_start)) {
+                rsa_completed = 1;
+                printf("[RSA] SUCCESS: RSA mutual authentication completed!\n");
+                printf("[RSA] Secure encrypted channel established between client and server.\n");
+                printf("[RSA] You may now login with your username and password.\n");
+                printf("\n");
+            } else {
+                printf("[RSA] FAILED: RSA authentication failed! Connection may be terminated.\n");
+            }
+        } else {
+            // Regular server message - display normally
+            printf("Server: %s", buffer);
+        }
     }
     
     
@@ -304,10 +374,18 @@ void client_mode(int client_socket) {
         return;
     }
     
+    // RSA authentication and prompts are now handled automatically
+    // The server will send the login prompt after RSA completes
+    
     // Main loop to send messages
     printf("auth> ");
-    while (fgets(buffer, BUFFER_SIZE, stdin)) {
+    while (running && fgets(buffer, BUFFER_SIZE, stdin)) {
         buffer[strcspn(buffer, "\r\n")] = 0;
+        
+        // Check if we should exit due to server disconnection
+        if (!running) {
+            break;
+        }
         
         if (strcmp(buffer, "/quit") == 0) {
             running = 0;
@@ -416,6 +494,16 @@ int main(int argc, char *argv[]) {
     printf("Connecting to secure chat server...\n");
     if (connect(client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         printf("Connection failed\n");
+        close(client_socket);
+        return 1;
+    }
+    
+    // Send client ID to server immediately for RSA key selection
+    printf("Identifying client to server...\n");
+    char client_id_msg[128];
+    snprintf(client_id_msg, sizeof(client_id_msg), "CLIENT_ID:%s\n", client_id);
+    if (send(client_socket, client_id_msg, strlen(client_id_msg), 0) < 0) {
+        printf("Failed to send client ID\n");
         close(client_socket);
         return 1;
     }
