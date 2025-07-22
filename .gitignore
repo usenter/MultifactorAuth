@@ -30,6 +30,7 @@ decrypted_users.txt
 # IDE and editor files
 .vscode/
 .idea/
+olderVersion/
 *.swp
 *.swo
 *~
