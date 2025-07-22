@@ -9,7 +9,6 @@
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/err.h>
-#include "hashmap/hashmap.h"
 #include "hashmap/uthash.h"
 #include "encryptionTools.h"
 
@@ -38,6 +37,13 @@
 #error "RSA_CHALLENGE_SIZE too large for OAEP padding! Max size is RSA_MAX_ENCRYPT_SIZE bytes"
 #endif
 
+
+enum authorityLevel {
+    OWNER,
+    ADMIN,
+    USER
+};
+
 // User structure
 typedef struct {
     unsigned int account_id;
@@ -48,6 +54,7 @@ typedef struct {
     char* email;
     char* address;
     char* phone_number;
+    int authorityLevel;
     UT_hash_handle hh;
 } user_t;
 

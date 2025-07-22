@@ -31,7 +31,7 @@ make all
 ```
 
 ### 2. Create User Database
-Create `users.txt` with format `username:password` (one per line):
+Create `users.txt` with format `accountID:username:password:email:address:phone number` (one per line):
 ```
 alice:password123
 bob:secretpass
@@ -54,7 +54,7 @@ Replace names as you wish, but the encrypted file name must be changed in unifie
 ./generate_rsa_keys client <name2>
 ```
 
-### 4. Run
+### 4. Run. The example encrypted_users.txt in the repository uses the password '''rabbit'''
 ```bash
 # Start server
 ./unified_server myDatabasePassword
