@@ -7,8 +7,8 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <signal.h>
-
 #include "auth_system.h"
+#include "hashmap/uthash.h"
 
 #define PORT 12345
 #define BUFFER_SIZE 1024
@@ -18,18 +18,25 @@
 // Program information
 #define PROGRAM_NAME "AuthenticatedChatServer"
 
+// Add a list to track client handler threads
+#define MAX_CLIENT_THREADS 1024
+pthread_t client_threads[MAX_CLIENT_THREADS];
+int client_thread_count = 0;
+
 // Structure to hold authenticated client information
-typedef struct {
+typedef struct client {
     int socket;
     struct sockaddr_in addr;
     char nickname[32];
     char username[MAX_USERNAME_LEN];
+    unsigned int account_id;
     int active;
     time_t connect_time;
+    UT_hash_handle hh; // For uthash
 } client_t;
 
 // Global variables
-client_t clients[MAX_CLIENTS];
+client_t *clients_map = NULL; // Hashmap root
 int client_count = 0;
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 volatile int server_running = 1;
@@ -42,128 +49,103 @@ void signal_handler(int sig) {
     server_running = 0;
 }
 
-// Function to find client index by socket
-int find_client_by_socket(int client_socket) {
+// Function to add a new authenticated client
+void add_authenticated_client(client_t *new_client) {
     pthread_mutex_lock(&clients_mutex);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].active && clients[i].socket == client_socket) {
-            pthread_mutex_unlock(&clients_mutex);
-            return i;
-        }
-    }
+    HASH_ADD_INT(clients_map, socket, new_client);
+    client_count++;
     pthread_mutex_unlock(&clients_mutex);
-    return -1;
+}
+
+// Function to find client by socket
+client_t* find_client_by_socket(int client_socket) {
+    client_t *c = NULL;
+    pthread_mutex_lock(&clients_mutex);
+    HASH_FIND_INT(clients_map, &client_socket, c);
+    pthread_mutex_unlock(&clients_mutex);
+    return c;
 }
 
 // Function to find client by nickname
-int find_client_by_nickname(const char* nickname) {
+client_t* find_client_by_nickname(const char* nickname) {
+    client_t *c, *result = NULL;
     pthread_mutex_lock(&clients_mutex);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].active && strcmp(clients[i].nickname, nickname) == 0) {
-            pthread_mutex_unlock(&clients_mutex);
-            return i;
+    HASH_ITER(hh, clients_map, c, result) {
+        if (c->active && strcmp(c->nickname, nickname) == 0) {
+            result = c;
+            break;
         }
     }
     pthread_mutex_unlock(&clients_mutex);
-    return -1;
+    return result;
 }
 
 // Function to broadcast message to all authenticated clients except sender
 void broadcast_message(const char* message, int sender_socket) {
+    char* message_with_newline = malloc(strlen(message) + 2);
+    strncpy(message_with_newline, message, strlen(message));
+    strncat(message_with_newline, "\n", 1);
     pthread_mutex_lock(&clients_mutex);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].active && clients[i].socket != sender_socket) {
-            if (send(clients[i].socket, message, strlen(message), 0) < 0) {
-                printf("WARNING: Failed to send message to client %s\n", clients[i].nickname);
+    client_t *c, *tmp;
+    HASH_ITER(hh, clients_map, c, tmp) {
+        if (c->active && c->socket != sender_socket) {
+            if (send(c->socket, message_with_newline, strlen(message_with_newline), 0) < 0) {
+                printf("WARNING: Failed to send message to client %s\n", c->nickname);
             }
         }
     }
     pthread_mutex_unlock(&clients_mutex);
 }
 
-// Function to add a new authenticated client
-int add_authenticated_client(int client_socket, struct sockaddr_in client_addr, const char* username) {
-    pthread_mutex_lock(&clients_mutex);
-    
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (!clients[i].active) {
-            clients[i].socket = client_socket;
-            clients[i].addr = client_addr;
-            clients[i].active = 1;
-            clients[i].connect_time = time(NULL);
-            
-            // Set username and initial nickname
-            strncpy(clients[i].username, username, MAX_USERNAME_LEN - 1);
-            clients[i].username[MAX_USERNAME_LEN - 1] = '\0';
-            snprintf(clients[i].nickname, sizeof(clients[i].nickname), "%s", username);
-            
-            client_count++;
-            printf("User '%s' joined the chat from %s:%d (Total clients: %d)\n", 
-                   username, inet_ntoa(client_addr.sin_addr), 
-                   ntohs(client_addr.sin_port), client_count);
-            
-            pthread_mutex_unlock(&clients_mutex);
-            return i;
-        }
-    }
-    
-    pthread_mutex_unlock(&clients_mutex);
-    return -1; // Server full
-}
-
 // Function to remove a client
-void remove_client(int client_index) {
-    if (client_index >= 0 && client_index < MAX_CLIENTS && clients[client_index].active) {
-        pthread_mutex_lock(&clients_mutex);
-        
+void remove_client(int client_socket) {
+    pthread_mutex_lock(&clients_mutex);
+    client_t *c = NULL;
+    HASH_FIND_INT(clients_map, &client_socket, c);
+    if (c) {
         printf("User '%s' (%s) left the chat (Total clients: %d)\n", 
-               clients[client_index].username, clients[client_index].nickname, client_count - 1);
-        
+               c->username, c->nickname, client_count - 1);
         // Notify other clients about the departure
         char departure_msg[BUFFER_SIZE];
         snprintf(departure_msg, sizeof(departure_msg), 
-                 "%s has left the chat", clients[client_index].nickname);
-        
+                 "%s has left the chat", c->nickname);
         // Broadcast departure message (before removing the client)
-        int departing_socket = clients[client_index].socket;
-        clients[client_index].active = 0; // Mark as inactive to exclude from broadcast
+        int departing_socket = c->socket;
+        c->active = 0; // Mark as inactive to exclude from broadcast
         broadcast_message(departure_msg, departing_socket);
-        
         close(departing_socket);
-        memset(&clients[client_index], 0, sizeof(client_t)); // Clear the slot
+        HASH_DEL(clients_map, c);
+        free(c);
         client_count--;
-        
-        pthread_mutex_unlock(&clients_mutex);
     }
+    pthread_mutex_unlock(&clients_mutex);
 }
 
 // Function to get list of connected clients
 void get_client_list(char* list_buffer, size_t buffer_size) {
     pthread_mutex_lock(&clients_mutex);
-    
     snprintf(list_buffer, buffer_size, "Connected users (%d): ", client_count);
-    
     int first = 1;
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].active) {
+    client_t *c, *tmp;
+    HASH_ITER(hh, clients_map, c, tmp) {
+        if (c->active) {
             if (!first) {
                 strncat(list_buffer, ", ", buffer_size - strlen(list_buffer) - 1);
             }
-            strncat(list_buffer, clients[i].nickname, buffer_size - strlen(list_buffer) - 1);
+            strncat(list_buffer, c->nickname, buffer_size - strlen(list_buffer) - 1);
             first = 0;
         }
     }
-    
     strncat(list_buffer, "\n", buffer_size - strlen(list_buffer) - 1);
     pthread_mutex_unlock(&clients_mutex);
 }
 
 // Function to handle individual authenticated client
 void* handle_authenticated_client(void* arg) {
-    int client_index = *(int*)arg;
+    int client_socket = *(int*)arg;
     free(arg); // Free the allocated memory for the index
     
-    int client_socket = clients[client_index].socket;
+    //client_t *c = find_client_by_socket(client_socket);
     
     char buffer[BUFFER_SIZE];
     char broadcast_msg[BUFFER_SIZE];
@@ -181,15 +163,17 @@ void* handle_authenticated_client(void* arg) {
     send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
     
     // Announce new user to everyone
+    client_t *c = find_client_by_socket(client_socket);
     snprintf(broadcast_msg, sizeof(broadcast_msg), 
-             "%s joined the chat", clients[client_index].nickname);
+             "%s joined the chat", c->nickname);
     broadcast_message(broadcast_msg, client_socket);
     
     // Main message handling loop
     while (server_running) {
         int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
         if (bytes_received <= 0) {
-            printf("Client %s disconnected\n", clients[client_index].nickname);
+            client_t *c = find_client_by_socket(client_socket);
+            printf("Client %s disconnected\n", c->nickname);
             break;
         }
         
@@ -202,7 +186,8 @@ void* handle_authenticated_client(void* arg) {
         }
         
         // Check if session is still valid
-        if (!is_authenticated(client_socket)) {
+        c = find_client_by_socket(client_socket);
+        if (!is_authenticated(c->account_id)) {
             snprintf(broadcast_msg, sizeof(broadcast_msg), 
                      "Session expired. Please reconnect and authenticate again.\n");
             send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
@@ -231,7 +216,7 @@ void* handle_authenticated_client(void* arg) {
             }
             
             // Check if nickname is already taken
-            if (find_client_by_nickname(new_nick) != -1) {
+            if (find_client_by_nickname(new_nick)) {
                 snprintf(broadcast_msg, sizeof(broadcast_msg), 
                          "Nickname '%s' is already taken. Choose a different one.\n", new_nick);
                 send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
@@ -240,9 +225,9 @@ void* handle_authenticated_client(void* arg) {
             
             char old_nick[32];
             pthread_mutex_lock(&clients_mutex);
-            strncpy(old_nick, clients[client_index].nickname, sizeof(old_nick) - 1);
-            strncpy(clients[client_index].nickname, new_nick, sizeof(clients[client_index].nickname) - 1);
-            clients[client_index].nickname[sizeof(clients[client_index].nickname) - 1] = '\0';
+            strncpy(old_nick, c->nickname, sizeof(old_nick) - 1);
+            strncpy(c->nickname, new_nick, sizeof(c->nickname) - 1);
+            c->nickname[sizeof(c->nickname) - 1] = '\0';
             pthread_mutex_unlock(&clients_mutex);
             
             snprintf(broadcast_msg, sizeof(broadcast_msg), 
@@ -286,18 +271,17 @@ void* handle_authenticated_client(void* arg) {
         // Regular chat message - broadcast to everyone
         if (strlen(buffer) > 0) {
             snprintf(broadcast_msg, sizeof(broadcast_msg), 
-                     "%s: %s", clients[client_index].nickname, buffer);
+                     "%s: %s", c->nickname, buffer);
             broadcast_message(broadcast_msg, client_socket);
             
             // Log the message
-            printf("CHAT [%s] %s: %s\n", clients[client_index].username, 
-                   clients[client_index].nickname, buffer);
+            printf("CHAT [%s] %s: %s\n", c->username, c->nickname, buffer);
         }
     }
     
     // Clean up session and remove client
     remove_session(client_socket);
-    remove_client(client_index);
+    remove_client(client_socket);
     return NULL;
 }
 
@@ -316,32 +300,51 @@ void* handle_new_connection(void* arg) {
     printf("New connection from %s:%d (authentication required)\n", 
            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
     
-    // Wait for client ID first (for RSA key selection)
-    char client_id_buffer[BUFFER_SIZE];
-    int id_bytes = recv(client_socket, client_id_buffer, BUFFER_SIZE - 1, 0);
-    char client_id[64] = "";
-    
-    if (id_bytes > 0) {
-        client_id_buffer[id_bytes] = '\0';
-        
-        // Parse CLIENT_ID:name format
-        if (strncmp(client_id_buffer, "CLIENT_ID:", 10) == 0) {
-            char* id_start = client_id_buffer + 10;  // Skip "CLIENT_ID:"
-            char* id_end = strchr(id_start, '\n');
-            if (id_end) *id_end = '\0';
-            
-            strncpy(client_id, id_start, sizeof(client_id) - 1);
-            client_id[sizeof(client_id) - 1] = '\0';
+    // Wait for username first
+    char username_buffer[BUFFER_SIZE];
+    int name_bytes = recv(client_socket, username_buffer, BUFFER_SIZE - 1, 0);
+    char username[MAX_USERNAME_LEN] = "";
+    unsigned int account_id = 0;
+
+    if (name_bytes <= 0) {
+        printf("Client disconnected before sending username\n");
+        close(client_socket);
+        return NULL;
+    }
+
+    username_buffer[name_bytes] = '\0';
+    username_buffer[strcspn(username_buffer, "\r\n")] = 0; // Remove newlines
+
+    // Parse USERNAME:name format
+    if (strncmp(username_buffer, "USERNAME:", 9) == 0) {
+        strncpy(username, username_buffer + 9, MAX_USERNAME_LEN - 1);
+        username[MAX_USERNAME_LEN - 1] = '\0';
+
+        username_t *uname_entry = find_username(username);
+        if (!uname_entry) {
+            printf("Invalid username received: %s\n", username);
+            snprintf(response, sizeof(response), "ERROR: Invalid username\n");
+            send(client_socket, response, strlen(response), 0);
+            close(client_socket);
+            return NULL;
         }
+        account_id = uname_entry->account_id;
+        printf("Valid username received: %s (account_id: %u)\n", username, account_id);
+    } else {
+        printf("Invalid username format received\n");
+        snprintf(response, sizeof(response), "ERROR: Invalid username format\n");
+        send(client_socket, response, strlen(response), 0);
+        close(client_socket);
+        return NULL;
     }
     
     // Automatically initiate RSA challenge if RSA system is initialized
     if (is_rsa_system_initialized()) {
-        printf("Initiating automatic RSA challenge for %s:%d\n", 
-               inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+        printf("Initiating automatic RSA challenge for %s:%d (Account ID: %u)\n", 
+               inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), account_id);
         
-        // Automatically start RSA challenge for specific client
-        rsa_challenge_result_t rsa_result = start_rsa_challenge_for_client(client_socket, client_id);
+        // Start RSA challenge with account_id
+        rsa_challenge_result_t rsa_result = start_rsa_challenge_for_client(account_id);
         
         if (rsa_result.success && rsa_result.encrypted_size > 0) {
             // Send RSA challenge automatically
@@ -356,13 +359,11 @@ void* handle_new_connection(void* arg) {
             strcat(hex_output, "\n");
             send(client_socket, hex_output, strlen(hex_output), 0);
             
-            printf("RSA challenge sent automatically to %s:%d\n", 
-                   inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+            printf("RSA challenge sent to account %u\n", account_id);
         }
     }
     
-    // Authentication prompt will be sent after RSA completion
-    // or immediately if RSA is not initialized
+    // Authentication prompt
     if (!is_rsa_system_initialized()) {
         snprintf(response, sizeof(response),
                  "%s - Authentication Required\n"
@@ -396,110 +397,79 @@ void* handle_new_connection(void* arg) {
         if (is_auth_command(buffer)) {
             // Handle RSA response automatically (transparent to user)
             if (is_rsa_command(buffer)) {
-                rsa_challenge_result_t rsa_result = process_rsa_command(buffer, client_socket);
+                rsa_challenge_result_t rsa_result = process_rsa_command(buffer, account_id);
                 
                 if (rsa_result.success && strstr(rsa_result.response, "RSA authentication successful")) {
-                    printf("✓ RSA authentication completed for %s:%d\n", 
-                           inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+                    printf("RSA authentication successful for account %u\n", account_id);
                     // Send authentication prompt NOW that RSA is complete
                     snprintf(response, sizeof(response),
-                             "%s - Secure Authentication Required\n"
-                             "========================================\n"
-                             "SECURITY: RSA cryptographic authentication COMPLETED.\n\n"
                              "Please authenticate to access the secure chat:\n"
                              "  /login <username> <password> - Login with existing account\n"
                              "  /register <username> <password> - Create new account\n\n"
-                             "Ready for secure login.\n", PROGRAM_NAME);
+                             "Ready for secure login.\n");
                     send(client_socket, response, strlen(response), 0);
                 } else if (!rsa_result.success) {
-                    printf("✗ RSA authentication FAILED for %s:%d - connection will be terminated\n", 
-                           inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-                           
+                    printf("RSA authentication FAILED for account %u - connection will be terminated\n", 
+                           account_id);
                     snprintf(response, sizeof(response), 
                              "RSA_FAILED - RSA authentication failed. Connection terminated.\n");
                     send(client_socket, response, strlen(response), 0);
-                    break; // Terminate connection on RSA failure
+                    break;
                 }
-            } else {
+            } 
+            else {
+                
                 // Handle regular auth commands (login/register/logout)
-                // SECURITY CHECK: Block login attempts if RSA is required but not completed
-                if (is_rsa_system_initialized() && 
-                    (strncmp(buffer, AUTH_LOGIN, strlen(AUTH_LOGIN)) == 0 || 
-                     strncmp(buffer, AUTH_REGISTER, strlen(AUTH_REGISTER)) == 0)) {
-                    
-                    if (!is_rsa_authenticated(client_socket)) {
-                        printf("SECURITY BLOCK: Login attempt without RSA authentication from %s:%d\n", 
-                               inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-                        snprintf(response, sizeof(response), 
-                                 "SECURITY_ERROR - RSA authentication required but not completed. Please ensure your client supports RSA authentication.\n");
-                        send(client_socket, response, strlen(response), 0);
-                        continue; // Block this attempt but don't terminate connection
-                    }
-                }
-                
-                auth_result_t auth_result = process_auth_command(buffer, client_socket);
-                
-                // Send response to client
+                auth_result_t auth_result = process_auth_command(buffer, account_id);
                 send(client_socket, auth_result.response, strlen(auth_result.response), 0);
                 
                 if (auth_result.success && auth_result.authenticated) {
-                    // Authentication successful - add to chat
-                    printf("✓ Full authentication successful for user '%s' from %s:%d\n", 
-                           auth_result.username, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-                    
-                    int client_index = add_authenticated_client(client_socket, client_addr, auth_result.username);
-                    if (client_index == -1) {
-                        snprintf(response, sizeof(response), "Server is full. Please try again later.\n");
-                        send(client_socket, response, strlen(response), 0);
-                        break;
-                    }
-                    
-                    // Create thread to handle this authenticated client
-                    pthread_t client_thread;
-                    int* index_ptr = malloc(sizeof(int));
-                    if (index_ptr) {
-                        *index_ptr = client_index;
-                        if (pthread_create(&client_thread, NULL, handle_authenticated_client, index_ptr) == 0) {
-                            pthread_detach(client_thread);
-                            return NULL; // Successfully handed off to client handler
-                        } else {
-                            printf("Failed to create client thread\n");
-                            free(index_ptr);
-                            remove_client(client_index);
+                    // Add to authenticated clients list and start chat handler
+                    client_t *new_client = malloc(sizeof(client_t));
+                    if (new_client) {
+                        new_client->socket = client_socket;
+                        new_client->addr = client_addr;
+                        new_client->active = 1;
+                        new_client->connect_time = time(NULL);
+                        new_client->account_id = account_id;
+                        
+                        // Set username and initial nickname
+                        strncpy(new_client->username, username, MAX_USERNAME_LEN - 1);
+                        new_client->username[MAX_USERNAME_LEN - 1] = '\0';
+                        snprintf(new_client->nickname, sizeof(new_client->nickname), "%s", username);
+                        
+                        add_authenticated_client(new_client);
+                        
+                        // Start chat handler thread
+                        int* arg = malloc(sizeof(int));
+                        if (arg) {
+                            *arg = client_socket; // Pass socket for remove_client
+                            pthread_t chat_thread;
+                            if (pthread_create(&chat_thread, NULL, handle_authenticated_client, arg) == 0) {
+                                pthread_mutex_lock(&clients_mutex);
+                                if (client_thread_count < MAX_CLIENT_THREADS) {
+                                    client_threads[client_thread_count++] = chat_thread;
+                                }
+                                pthread_mutex_unlock(&clients_mutex);
+                                // Do not detach here; join in cleanup
+                                return NULL;
+                            } else {
+                                printf("Failed to create chat handler thread\n");
+                                free(arg);
+                                remove_client(client_socket);
+                            }
                         }
-                    } else {
-                        printf("Memory allocation failed\n");
-                        remove_client(client_index);
                     }
                     break;
-                } else if (auth_result.success && !auth_result.authenticated) {
-                    // Registration successful
-                    printf("User '%s' registered from %s:%d\n", 
-                           auth_result.username, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-                    snprintf(response, sizeof(response), 
-                             "Registration successful! Please login with your new credentials.\n");
-                    send(client_socket, response, strlen(response), 0);
-                } else {
-                    // Authentication failed
-                    printf("Authentication failed for %s:%d - reason: %s\n", 
-                           inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port),
-                           auth_result.response);
                 }
             }
         } else {
-            // Check if RSA is required and not completed
-            if (is_rsa_system_initialized() && !is_rsa_authenticated(client_socket)) {
-                snprintf(response, sizeof(response), 
-                         "Please complete RSA authentication first. Your client should handle this automatically.\n");
-            } else {
-                snprintf(response, sizeof(response), 
-                         "Please use /login <username> <password> or /register <username> <password>\n");
-            }
+            snprintf(response, sizeof(response), 
+                     "Please authenticate first using /login or /register\n");
             send(client_socket, response, strlen(response), 0);
         }
     }
     
-    // Close connection if authentication failed or attempts exceeded
     close(client_socket);
     return NULL;
 }
@@ -549,13 +519,14 @@ void cleanup_server(void) {
     
     // Close all client connections
     pthread_mutex_lock(&clients_mutex);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].active) {
-            char goodbye_msg[] = "Server is shutting down. Goodbye!\n";
-            send(clients[i].socket, goodbye_msg, strlen(goodbye_msg), 0);
-            close(clients[i].socket);
-            clients[i].active = 0;
-        }
+    client_t *c, *tmp;
+    HASH_ITER(hh, clients_map, c, tmp) {
+        char goodbye_msg[] = "Server is shutting down. Goodbye!\n";
+        send(c->socket, goodbye_msg, strlen(goodbye_msg), 0);
+        close(c->socket);
+        HASH_DEL(clients_map, c);
+        free(c);
+        printf("Client %s disconnected\n", c->nickname);
     }
     pthread_mutex_unlock(&clients_mutex);
     
@@ -603,7 +574,7 @@ int main(int argc, char *argv[]) {
         printf("This server requires RSA two-factor authentication.\n");
         printf("\nTo generate required keys:\n");
         printf("  1. Run: ./generate_rsa_keys server\n");
-        printf("  2. Run: ./generate_rsa_keys client [client_id]  # e.g., alice, bob, etc.\n");
+        printf("  2. Run: ./generate_rsa_keys client [username]  # e.g., alice, bob, etc.\n");
         printf("\nServer cannot start without RSA keys.\n");
         return 1;
     }
@@ -685,6 +656,27 @@ int main(int argc, char *argv[]) {
         }
     }
     
+    // Close all client sockets to unblock handler threads
+    pthread_mutex_lock(&clients_mutex);
+    client_t *c, *tmp;
+    HASH_ITER(hh, clients_map, c, tmp) {
+        close(c->socket); // This will unblock recv() in handler threads
+    }
+    pthread_mutex_unlock(&clients_mutex);
+
+    // Now join all client handler threads
+    for (int i = 0; i < client_thread_count; i++) {
+        pthread_join(client_threads[i], NULL);
+    }
+
+    // Now, safely free all remaining clients
+    pthread_mutex_lock(&clients_mutex);
+    HASH_ITER(hh, clients_map, c, tmp) {
+        HASH_DEL(clients_map, c);
+        free(c);
+    }
+    pthread_mutex_unlock(&clients_mutex);
+
     // Cleanup and shutdown
     close(server_socket);
     cleanup_server();

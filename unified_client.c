@@ -21,6 +21,7 @@
 #define RSA_DECRYPT_BUFFER_SIZE MAX_RSA_ENCRYPTED_SIZE
 #define RSA_HEX_BUFFER_SIZE (MAX_RSA_ENCRYPTED_SIZE * 2 + 64)
 #define MAX_FILE_PATH_LEN 512
+#define PROGRAM_NAME "AuthenticatedChatClient"
 
 volatile int running = 1;
 int authenticated = 0;
@@ -30,6 +31,7 @@ int rsa_completed = 0;
 EVP_PKEY* client_private_key = NULL;
 EVP_PKEY* server_public_key = NULL;
 char client_id[64] = "";  // Must be specified by user
+unsigned int account_id = 0;  // Add account_id
 
 // Authentication response checking
 #define AUTH_SUCCESS "AUTH_SUCCESS"
@@ -71,9 +73,9 @@ int get_stored_messages(char messages[][BUFFER_SIZE], int max_count) {
 
 // RSA Authentication Functions
 // Load client's private key
-int load_client_private_key(const char* client_id) {
+int load_client_private_key(const char* username) {
     char key_file[MAX_FILE_PATH_LEN];
-    snprintf(key_file, sizeof(key_file), "RSAkeys/client_%s_private.pem", client_id);
+    snprintf(key_file, sizeof(key_file), "RSAkeys/client_%s_private.pem", username);
     
     FILE* fp = fopen(key_file, "r");
     if (!fp) {
@@ -310,9 +312,7 @@ void* receive_messages(void* arg) {
         if (strncmp(buffer, "AUTH_SUCCESS", 12) == 0) {
             authenticated = 1;
             printf("\n%s", buffer);
-            printf("You are now authenticated!\n");
-            printf("Chat commands: /nick <name>, /list, /quit\n");
-            printf("Type your messages below:\n");
+            printf("You are now authenticated\n");
         } else {
             printf("\n%s", buffer);
         }
@@ -350,13 +350,12 @@ void client_mode(int client_socket) {
             char* challenge_end = strchr(challenge_start, '\n');
             if (challenge_end) *challenge_end = '\0';
             
-            printf("\n[RSA] Performing RSA mutual authentication...\n");
+            printf("[RSA] Performing RSA mutual authentication...\n");
             if (handle_rsa_challenge(client_socket, challenge_start)) {
                 rsa_completed = 1;
                 printf("[RSA] SUCCESS: RSA mutual authentication completed!\n");
-                printf("[RSA] Secure encrypted channel established between client and server.\n");
-                printf("[RSA] You may now login with your username and password.\n");
-                printf("\n");
+                printf("[RSA] You may now login with your username and password.");
+             
             } else {
                 printf("[RSA] FAILED: RSA authentication failed! Connection may be terminated.\n");
             }
@@ -378,7 +377,6 @@ void client_mode(int client_socket) {
     // The server will send the login prompt after RSA completes
     
     // Main loop to send messages
-    printf("auth> ");
     while (running && fgets(buffer, BUFFER_SIZE, stdin)) {
         buffer[strcspn(buffer, "\r\n")] = 0;
         
@@ -442,77 +440,56 @@ int main(int argc, char *argv[]) {
     
     // Parse command line arguments - client_id is REQUIRED
     if (argc != 2) {
-        printf("Usage: %s <client_id>\n", argv[0]);
-        printf("  client_id: Your unique client identifier (REQUIRED)\n");
-        printf("\nNote: You must have generated RSA keys for your client_id first:\n");
-        printf("  ./generate_rsa_keys client <client_id>\n");
-        printf("\nExample:\n");
-        printf("  %s alice    # Connect as client 'alice'\n", argv[0]);
+        printf("Usage: %s <username>\n", argv[0]);
+        printf("Example: %s alice\n", argv[0]);
         return 1;
     }
     
-    // First argument is always client_id
-    strncpy(client_id, argv[1], sizeof(client_id) - 1);
-    client_id[sizeof(client_id) - 1] = '\0';
+    const char* username = argv[1];
     
-    printf("Client ID: %s\n", client_id);
+    // Initialize OpenSSL
+    OpenSSL_add_all_algorithms();
+    ERR_load_crypto_strings();
     
-    // Load RSA keys for automatic authentication
-    printf("\nLoading RSA authentication keys...\n");
-    if (load_client_private_key(client_id) && load_server_public_key()) {
-        printf("RSA authentication enabled.\n");
-    } else {
-        printf("ERROR: RSA keys not found for client '%s'!\n", client_id);
-        printf("You must generate RSA keys first:\n");
-        printf("  ./generate_rsa_keys client %s\n", client_id);
-        printf("  ./generate_rsa_keys server  # (if server keys don't exist)\n");
-        printf("\nConnection will likely fail - server requires RSA authentication.\n");
-        return 1;
-    }
-    
-    // No need to prompt for username/password - users will type /login commands
-    
-    // Create socket
-    client_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (client_socket < 0) {
-        printf("Socket creation failed\n");
-        return 1;
-    }
-    
-    // Configure server address
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
-    
-    if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) <= 0) {
-        printf("Invalid address\n");
-        close(client_socket);
+    // Load RSA keys
+    if (!load_client_private_key(username) || !load_server_public_key()) {
+        printf("Failed to load RSA keys\n");
         return 1;
     }
     
     // Connect to server
-    printf("Connecting to secure chat server...\n");
-    if (connect(client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        printf("Connection failed\n");
-        close(client_socket);
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("Socket creation failed");
         return 1;
     }
     
-    // Send client ID to server immediately for RSA key selection
-    printf("Identifying client to server...\n");
-    char client_id_msg[128];
-    snprintf(client_id_msg, sizeof(client_id_msg), "CLIENT_ID:%s\n", client_id);
-    if (send(client_socket, client_id_msg, strlen(client_id_msg), 0) < 0) {
-        printf("Failed to send client ID\n");
-        close(client_socket);
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Connection failed");
+        return 1;
+    }
+    
+    printf("Connected to server. Starting authentication...\n");
+    
+    // Send username first
+    char id_msg[BUFFER_SIZE];
+    snprintf(id_msg, sizeof(id_msg), "USERNAME:%s\n", username);
+    if (send(sock, id_msg, strlen(id_msg), 0) < 0) {
+        perror("Failed to send username");
+        close(sock);
         return 1;
     }
     
     // Run secure chat client
-    client_mode(client_socket);
+    client_mode(sock);
     
     // Cleanup
-    close(client_socket);
+    close(sock);
     pthread_mutex_destroy(&message_mutex);
     cleanup_rsa_keys();
     return 0;

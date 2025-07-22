@@ -10,6 +10,7 @@
 #include <openssl/rand.h>
 #include <openssl/err.h>
 #include "hashmap/hashmap.h"
+#include "hashmap/uthash.h"
 #include "encryptionTools.h"
 
 #define MAX_USERNAME_LEN 32
@@ -17,6 +18,9 @@
 #define MAX_HASH_LEN 65  // SHA-256 hash is 64 chars + null terminator
 #define MAX_USERS 100
 #define AUTH_TIMEOUT 300  // 5 minutes in seconds
+#define MAX_EMAIL_LEN 64
+#define MAX_ADDRESS_LEN 64
+#define MAX_PHONE_NUMBER_LEN 12
 
 // RSA Authentication constants
 #define RSA_KEY_SIZE 2048
@@ -36,26 +40,41 @@
 
 // User structure
 typedef struct {
+    unsigned int account_id;
     char username[MAX_USERNAME_LEN];
     char password_hash[MAX_HASH_LEN];
     int active;
+    EVP_PKEY *public_key;  // Client's public key for RSA auth
+    char* email;
+    char* address;
+    char* phone_number;
+    UT_hash_handle hh;
 } user_t;
-
-// Session structure
-typedef struct {
-    char username[MAX_USERNAME_LEN];
-    int client_socket;
-    time_t login_time;
-    int authenticated;
-    int rsa_authenticated;  // RSA challenge-response completed
-    unsigned char challenge[RSA_CHALLENGE_SIZE];  // Current challenge
-} session_t;
 
 // RSA Key pair structure
 typedef struct {
     EVP_PKEY *private_key;
     EVP_PKEY *public_key;
 } rsa_keypair_t;
+
+// Session structure
+typedef struct {
+    unsigned int account_id;  // Key for lookup
+    user_t *user;            // Pointer to the authenticated user
+    time_t login_time;
+    int authenticated;
+    int rsa_authenticated;   // RSA challenge-response completed
+    unsigned char challenge[RSA_CHALLENGE_SIZE];  // Current challenge
+    UT_hash_handle hh;
+} session_t;
+
+typedef struct{
+    char* username;
+    unsigned int account_id;
+    UT_hash_handle hh;
+} username_t;
+
+
 
 // RSA challenge result structure
 typedef struct {
@@ -66,11 +85,7 @@ typedef struct {
     int encrypted_size;
 } rsa_challenge_result_t;
 
-// Client key mapping structure for hashmap storage
-typedef struct {
-    char client_id[MAX_USERNAME_LEN];  // Client identifier (e.g., "alice", "bob", "default")
-    EVP_PKEY *public_key;              // Client's public key
-} client_key_entry_t;
+
 
 // Authentication commands
 #define AUTH_LOGIN "/login"
@@ -97,13 +112,14 @@ typedef struct {
 // Function declarations
 void init_auth_system(void);
 int init_encrypted_auth_system(char* userFile, char* key);
-int add_user(const char* username, const char* password);
-int authenticate_user(const char* username, const char* password, int client_socket);
-int create_session(const char* username, int client_socket);
-void remove_session(int client_socket);
-int get_session_copy(int client_socket, session_t* out_session);
-int update_session(int client_socket, const session_t* updated_session);
-int is_authenticated(int client_socket);
+int add_user(int account_id, const char* username, const char* password);
+user_t* find_user(int account_id);
+username_t* find_username(const char* username);
+int authenticate_user(const char* username, const char* password, int account_id);
+int create_session( int account_id);
+void remove_session(int account_id);
+int update_session(int account_id, const session_t* updated_session);
+int is_authenticated(int account_id);
 void cleanup_expired_sessions(void);
 void hash_password(const char* password, char* hash);
 int verify_password(const char* password, const char* hash);
@@ -112,28 +128,24 @@ void load_users_from_file(const char* filename);
 int load_users_from_encrypted_file(const char* encrypted_filename, const char* key);
 
 // New authentication processing functions
-auth_result_t process_auth_command(const char* message, int client_socket);
+auth_result_t process_auth_command(const char* message, int account_id);
 int is_auth_command(const char* message);
 
 // RSA Authentication functions
 int init_rsa_system(const char* server_private_key_file, const char* server_public_key_file);
 int generate_rsa_keypair(const char* private_key_file, const char* public_key_file);
+int is_rsa_authenticated(int account_id);
 rsa_keypair_t* load_rsa_keys(const char* private_key_file, const char* public_key_file);
 EVP_PKEY* load_public_key(const char* public_key_file);
-
-// Client key management functions
-int load_all_client_keys_dynamic(void);
-EVP_PKEY* find_client_public_key(const char* client_id);
-int get_loaded_client_count(void);
+EVP_PKEY* get_client_public_key(int account_id);
 
 void cleanup_rsa_system(void);
 void cleanup_auth_system(void);
-rsa_challenge_result_t start_rsa_challenge_for_client(int client_socket, const char* client_id);
-EVP_PKEY* get_client_public_key(const char* client_id);
-rsa_challenge_result_t verify_rsa_response(int client_socket, const unsigned char* encrypted_response, int response_size);
+rsa_challenge_result_t start_rsa_challenge_for_client(int account_id);
+rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* encrypted_response, int response_size);
 int is_rsa_command(const char* message);
-rsa_challenge_result_t process_rsa_command(const char* message, int client_socket);
-int is_rsa_authenticated(int client_socket);
+rsa_challenge_result_t process_rsa_command(const char* message, int account_id);
+int is_rsa_authenticated(int account_id);
 int is_rsa_system_initialized(void);
 
 #endif // AUTH_SYSTEM_H 
