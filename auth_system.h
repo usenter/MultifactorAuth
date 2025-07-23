@@ -10,7 +10,7 @@
 #include <openssl/rand.h>
 #include <openssl/err.h>
 #include "hashmap/uthash.h"
-#include "encryptionTools.h"
+#include "decryptionFunctions/encryptionTools.h"
 
 #define MAX_USERNAME_LEN 32
 #define MAX_PASSWORD_LEN 64
@@ -53,8 +53,8 @@ typedef struct {
     EVP_PKEY *public_key;  // Client's public key for RSA auth
     char* email;
     char* address;
-    char* phone_number;
-    int authorityLevel;
+    char* phone_number ;
+    enum authorityLevel authorityLevel;
     UT_hash_handle hh;
 } user_t;
 

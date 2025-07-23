@@ -4,23 +4,22 @@ CFLAGS = -Wall -Wextra -std=c17 -pthread -D_POSIX_C_SOURCE=200809L
 LIBS = -lssl -lcrypto
 
 # Object files
-OBJS = encryptionTools.o auth_system.o hashmap/hashmap.o
+OBJS = encryptionTools.o auth_system.o 
 
 # Targets
 all: unified_server unified_client encryptionTools_test user_encryptor generate_rsa_keys
 
 # Object file rules with header dependencies
-encryptionTools.o: encryptionTools.c encryptionTools.h
+encryptionTools.o: decryptionFunctions/encryptionTools.c decryptionFunctions/encryptionTools.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 auth_system.o: auth_system.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-hashmap/hashmap.o: hashmap/hashmap.c
-	$(CC) $(CFLAGS) -c $< -o $@
+
 
 # Standalone encryption tools test executable
-encryptionTools_test: encryptionTools.c encryptionTools.h
+encryptionTools_test: decryptionFunctions/encryptionTools.c decryptionFunctions/encryptionTools.h
 	$(CC) $(CFLAGS) -DTEST_MAIN -o $@ $< $(LIBS)
 
 # Standalone file encryption/decryption tool

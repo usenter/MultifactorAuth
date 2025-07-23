@@ -389,6 +389,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
     char email[MAX_EMAIL_LEN];
     char address[MAX_ADDRESS_LEN];
     char phone_number[MAX_PHONE_NUMBER_LEN];
+    enum authorityLevel authorityLevel;
     int loaded_count = 0;
     
     // Parse decrypted data line by line
@@ -406,9 +407,8 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
         
         // Parse id:username:password:pubkey_path:email:address:phone_number format
         char email[128], address[128], phone_number[12];
-        if (sscanf(line_start, "%u:%31[^:]:%63[^:]:%511[^:]:%127[^:]:%127[^:]:%11[^:]",
-                   &account_id, username, password, pubkey_path, email, address, phone_number) == 7) {
-            printf("Parsed line: %s\n", line_start);
+        if (sscanf(line_start, "%u:%31[^:]:%63[^:]:%511[^:]:%127[^:]:%127[^:]:%11[^:]:%u[^:]",
+                   &account_id, username, password, pubkey_path, email, address, phone_number, &authorityLevel) == 8) {
             user_t *new_user = malloc(sizeof(user_t));
             username_t *new_username = malloc(sizeof(username_t));
             if (!new_user) {
@@ -445,14 +445,13 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
             new_user->address = strdup(address);
             new_user->phone_number = strdup(phone_number);
             new_user->active = 1;
-
+            new_user->authorityLevel = authorityLevel;
             // Check if user already exists
             if (find_user(account_id) == NULL && find_username(username) == NULL) {
                 HASH_ADD_INT(user_map, account_id, new_user);
                 HASH_ADD_STR(username_map, username, new_username);
                 loaded_count++;
                 user_count++;
-                printf("Loaded user: %u:%s (with public key from %s)\n", account_id, username, pubkey_path);
             } else {
                 printf("Skipping duplicate account ID: %u\n", account_id);
                 EVP_PKEY_free(new_user->public_key);
@@ -477,10 +476,9 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
     
     // Handle last line if it doesn't end with newline
     if (line_start < data + decrypt_result.size && user_count < MAX_USERS) {
-        printf("Parsing last line: %s\n", line_start);
         char email[128], address[128], phone_number[12];
-        if (sscanf(line_start, "%u:%31[^:]:%63[^:]:%511[^:]:%127[^:]:%127[^:]:%11[^:]",
-                   &account_id, username, password, pubkey_path, email, address, phone_number) == 7) {
+        if (sscanf(line_start, "%u:%31[^:]:%63[^:]:%511[^:]:%127[^:]:%127[^:]:%11[^:]:%u[^:]",
+                   &account_id, username, password, pubkey_path, email, address, phone_number, &authorityLevel) == 8) {
             user_t *new_user = malloc(sizeof(user_t));
             username_t *new_username = malloc(sizeof(username_t));
             if (new_user && new_username) {
@@ -502,13 +500,12 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
                     new_user->address = strdup(address);
                     new_user->phone_number = strdup(phone_number);
                     new_user->active = 1;
-
+                    new_user->authorityLevel = authorityLevel;  
                     if (find_user(account_id) == NULL && find_username(username) == NULL) {
                         HASH_ADD_INT(user_map, account_id, new_user);
                         HASH_ADD_STR(username_map, username, new_username);
                         loaded_count++;
                         user_count++;
-                        printf("Loaded user: %u:%s (with public key from %s)\n", account_id, username, pubkey_path);
                     } else {
                         printf("Skipping duplicate user ID: %u\n", account_id);
                         EVP_PKEY_free(new_user->public_key);
