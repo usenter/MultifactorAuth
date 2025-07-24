@@ -5,6 +5,7 @@
 #include <string.h>
 #include <dirent.h>
 #include "hashmap/uthash.h"
+#include <openssl/evp.h>
 
 
 // Global variables
@@ -176,6 +177,12 @@ int authenticate_user(const char* username, const char* password, int account_id
     HASH_FIND_INT(user_map, &account_id, found_ptr);
     if (found_ptr != NULL) {
         if (found_ptr->active) {
+            // Check that the username matches the account_id's username
+            if (strncmp(username, found_ptr->username, MAX_USERNAME_LEN) != 0) {
+                // Username mismatch
+                printf("Username mismatch: provided '%s', expected '%s' for account_id %d\n", username, found_ptr->username, account_id);
+                return 0;
+            }
             return verify_password(password, found_ptr->password_hash);
         }
     }
@@ -423,13 +430,13 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
             }
 
             // Load public key
-            new_user->public_key = load_public_key(pubkey_path);
-            if (!new_user->public_key) {
+            //new_user->public_key = load_public_key(pubkey_path);
+            /*if (!new_user->public_key) {
                 printf("Failed to load public key for user %s from %s\n", username, pubkey_path);
                 free(new_user);
                 free(new_username);
                 continue;
-            }
+            }*/
 
             //stores the username as a tie to the account_id
             new_username->account_id = account_id;
@@ -437,7 +444,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
             strncpy(new_user->username, username, MAX_USERNAME_LEN - 1);
             new_user->username[MAX_USERNAME_LEN - 1] = '\0';
             new_username->username = strdup(username);
-
+            new_user->public_key = NULL;
             // Hash the plaintext password immediately
             hash_password(password, new_user->password_hash);
             new_user->password_hash[MAX_HASH_LEN - 1] = '\0';
@@ -454,7 +461,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
                 user_count++;
             } else {
                 printf("Skipping duplicate account ID: %u\n", account_id);
-                EVP_PKEY_free(new_user->public_key);
+                //EVP_PKEY_free(new_user->public_key);
                 free(new_user->email);
                 free(new_user->address);
                 free(new_user->phone_number);
@@ -482,7 +489,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
             user_t *new_user = malloc(sizeof(user_t));
             username_t *new_username = malloc(sizeof(username_t));
             if (new_user && new_username) {
-                new_user->public_key = load_public_key(pubkey_path);
+                //new_user->public_key = load_public_key(pubkey_path);
                 if (!new_user->public_key) {
                     printf("Failed to load public key for user %s from %s\n", username, pubkey_path);
                     free(new_user);
@@ -493,7 +500,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
                     new_user->username[MAX_USERNAME_LEN - 1] = '\0';
                     new_username->username = strdup(username);
                     new_username->account_id = account_id;
-                    
+                    new_user->public_key = NULL;
                     hash_password(password, new_user->password_hash);
                     new_user->password_hash[MAX_HASH_LEN - 1] = '\0';
                     new_user->email = strdup(email);
@@ -508,7 +515,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
                         user_count++;
                     } else {
                         printf("Skipping duplicate user ID: %u\n", account_id);
-                        EVP_PKEY_free(new_user->public_key);
+                        //EVP_PKEY_free(new_user->public_key);
                         free(new_user->email);
                         free(new_user->address);
                         free(new_user->phone_number);
@@ -529,6 +536,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
     
     printf("Loaded %d users from encrypted database\n", loaded_count);
     rsa_system_initialized = (loaded_count > 0);  // RSA system is initialized if we loaded any users with keys
+    
     return loaded_count > 0;
 }
 
@@ -784,99 +792,66 @@ EVP_PKEY* load_public_key(const char* public_key_file) {
 }
 
 // Start RSA challenge for a client
-rsa_challenge_result_t start_rsa_challenge_for_client(int account_id) {
+rsa_challenge_result_t start_rsa_challenge_for_client(int account_id, EVP_PKEY* client_pubkey) {
     rsa_challenge_result_t result;
     memset(&result, 0, sizeof(result));
-    
     if (!rsa_system_initialized) {
-        snprintf(result.response, sizeof(result.response), 
-                "%s RSA system not initialized", RSA_AUTH_FAILED);
+        snprintf(result.response, sizeof(result.response), "%s RSA system not initialized", RSA_AUTH_FAILED);
         return result;
     }
-    
     // Find the user
     user_t *user = find_user(account_id);
-    if (!user || !user->public_key) {
-        snprintf(result.response, sizeof(result.response), 
-                "%s No public key found for user", RSA_AUTH_FAILED);
+    if (!user) {
+        snprintf(result.response, sizeof(result.response), "%s No user found for account", RSA_AUTH_FAILED);
         return result;
     }
-    
-    // Find or create session
-    session_t *session = malloc(sizeof(session_t));
+    if(create_session(account_id)){
+        printf("SUCCESS: Created session for account %d\n", account_id);
+    }
+    else{
+        printf("ERROR: Failed to create session for account %d\n", account_id);
+        snprintf(result.response, sizeof(result.response), "%s Failed to create session", RSA_AUTH_FAILED);
+        return result;
+    }
+    session_t *session = NULL;
+    HASH_FIND_INT(session_map, &account_id, session);
     if (!session) {
-        snprintf(result.response, sizeof(result.response), 
-                "%s Failed to allocate session", RSA_AUTH_FAILED);
-        return result;
-    }
-    memset(session, 0, sizeof(session_t));
-    
-    session_t *existing = NULL;
-    HASH_FIND_INT(session_map, &account_id, existing);
-    
-    if (existing) {
-        // Update existing session
-        *session = *existing;
-    } else {
-        // Create temporary session for RSA auth
-        if (session_count >= MAX_USERS) {
-            free(session);
-            snprintf(result.response, sizeof(result.response), 
-                    "%s Server full", RSA_AUTH_FAILED);
-            return result;
-        }
-        
+        session = malloc(sizeof(session_t));
+        memset(session, 0, sizeof(session_t));
         session->account_id = account_id;
         session->user = user;
         session->login_time = time(NULL);
         session->authenticated = 0;
         session->rsa_authenticated = 0;
-        
+        // Store the client's public key in the session
+        session->user->public_key = EVP_PKEY_dup(client_pubkey);
         HASH_ADD_INT(session_map, account_id, session);
         session_count++;
-        printf("Created new RSA session for account %d\n", account_id);
+        printf("[DEBUG] Created session for account %d and stored client_pubkey.\n", account_id);
     }
-    
     // Generate random challenge
     if (RAND_bytes(session->challenge, RSA_CHALLENGE_SIZE) != 1) {
-        if (!existing) {
-            HASH_DEL(session_map, session);
-            free(session);
-            session_count--;
-        }
-        snprintf(result.response, sizeof(result.response), 
-                "%s Failed to generate challenge", RSA_AUTH_FAILED);
+        snprintf(result.response, sizeof(result.response), "%s Failed to generate challenge", RSA_AUTH_FAILED);
         return result;
     }
-    
-    // Use the user's public key for encryption
-    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(user->public_key, NULL);
-    if (!ctx || EVP_PKEY_encrypt_init(ctx) <= 0 || 
-        EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0) {
+    // Use the provided public key for encryption
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(session->user->public_key, NULL);
+    if (!ctx || EVP_PKEY_encrypt_init(ctx) <= 0 || EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0) {
         if (ctx) EVP_PKEY_CTX_free(ctx);
-        snprintf(result.response, sizeof(result.response), 
-                "%s Failed to setup encryption", RSA_AUTH_FAILED);
+        snprintf(result.response, sizeof(result.response), "%s Failed to setup encryption", RSA_AUTH_FAILED);
         return result;
     }
-    
     size_t outlen = MAX_RSA_ENCRYPTED_SIZE;
     if (EVP_PKEY_encrypt(ctx, result.encrypted_challenge, &outlen, session->challenge, RSA_CHALLENGE_SIZE) <= 0) {
         EVP_PKEY_CTX_free(ctx);
-        snprintf(result.response, sizeof(result.response), 
-                "%s Failed to encrypt challenge", RSA_AUTH_FAILED);
+        snprintf(result.response, sizeof(result.response), "%s Failed to encrypt challenge", RSA_AUTH_FAILED);
         return result;
     }
-    
     result.encrypted_size = outlen;
     EVP_PKEY_CTX_free(ctx);
-    
-    // Copy challenge for verification later
     memcpy(result.challenge, session->challenge, RSA_CHALLENGE_SIZE);
-    
     result.success = 1;
-    snprintf(result.response, sizeof(result.response), 
-            "%s Challenge generated", RSA_AUTH_SUCCESS);
-    
+    snprintf(result.response, sizeof(result.response), "%s Challenge generated", RSA_AUTH_SUCCESS);
     return result;
 }
 
@@ -896,8 +871,8 @@ rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* 
     user_t *user = find_user(account_id);
     if (!user) {
         snprintf(result.response, sizeof(result.response), 
-                "%s No active session", RSA_AUTH_FAILED);
-        printf("ERROR: No active session found for account %d\n", account_id);
+                "%s No user for account %d", RSA_AUTH_FAILED, account_id);
+        printf("ERROR: No user found for account %d\n", account_id);
         return result;
     }
     
@@ -991,11 +966,7 @@ rsa_challenge_result_t process_rsa_command(const char* message, int account_id) 
     memset(&result, 0, sizeof(result));
     
     printf("\n\nProcessing RSA command...\n");
-    if (strncmp(message, RSA_AUTH_START, strlen(RSA_AUTH_START)) == 0) {
-        // Start RSA challenge (no specific client ID available in this context)
-        return start_rsa_challenge_for_client(account_id);
-        
-    } else if (strncmp(message, RSA_AUTH_RESPONSE, strlen(RSA_AUTH_RESPONSE)) == 0) {
+   if (strncmp(message, RSA_AUTH_RESPONSE, strlen(RSA_AUTH_RESPONSE)) == 0) {
         // Process RSA response
         char command[64];
         char hex_response[RSA_HEX_BUFFER_SIZE];
@@ -1053,16 +1024,19 @@ void cleanup_rsa_system(void) {
 
 // Clean up auth system resources
 void cleanup_auth_system(void) {
+    printf("Cleaning up user map\n");
     if (user_map) {
         user_t *current, *temp;
         HASH_ITER(hh, user_map, current, temp) {
             HASH_DEL(user_map, current);
             if (current->public_key) {
                 EVP_PKEY_free(current->public_key);
+                current->public_key = NULL;
             }
             free(current);
         }
     }
+    printf("Cleaning up username map\n");
     if (username_map) {
         username_t *current, *temp;
         HASH_ITER(hh, username_map, current, temp) {
@@ -1071,6 +1045,7 @@ void cleanup_auth_system(void) {
             free(current);
         }
     }
+    printf("Cleaning up session map\n");
     if (session_map) {
         session_t *current, *temp;
         HASH_ITER(hh, session_map, current, temp) {
@@ -1081,4 +1056,38 @@ void cleanup_auth_system(void) {
     user_count = 0;
     session_count = 0;
     printf("Authentication system cleanup complete\n");
+}
+
+rsa_challenge_result_t start_rsa_challenge_with_pubkey(EVP_PKEY* pubkey) {
+    rsa_challenge_result_t result;
+    memset(&result, 0, sizeof(result));
+    if (!rsa_system_initialized) {
+        snprintf(result.response, sizeof(result.response), "%s RSA system not initialized", RSA_AUTH_FAILED);
+        return result;
+    }
+    // Generate random challenge
+    unsigned char challenge[RSA_CHALLENGE_SIZE];
+    if (RAND_bytes(challenge, RSA_CHALLENGE_SIZE) != 1) {
+        snprintf(result.response, sizeof(result.response), "%s Failed to generate challenge", RSA_AUTH_FAILED);
+        return result;
+    }
+    // Use the provided public key for encryption
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pubkey, NULL);
+    if (!ctx || EVP_PKEY_encrypt_init(ctx) <= 0 || EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0) {
+        if (ctx) EVP_PKEY_CTX_free(ctx);
+        snprintf(result.response, sizeof(result.response), "%s Failed to setup encryption", RSA_AUTH_FAILED);
+        return result;
+    }
+    size_t outlen = MAX_RSA_ENCRYPTED_SIZE;
+    if (EVP_PKEY_encrypt(ctx, result.encrypted_challenge, &outlen, challenge, RSA_CHALLENGE_SIZE) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        snprintf(result.response, sizeof(result.response), "%s Failed to encrypt challenge", RSA_AUTH_FAILED);
+        return result;
+    }
+    result.encrypted_size = outlen;
+    EVP_PKEY_CTX_free(ctx);
+    memcpy(result.challenge, challenge, RSA_CHALLENGE_SIZE);
+    result.success = 1;
+    snprintf(result.response, sizeof(result.response), "%s Challenge generated", RSA_AUTH_SUCCESS);
+    return result;
 }

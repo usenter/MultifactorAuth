@@ -9,6 +9,8 @@
 #include <signal.h>
 #include "auth_system.h"
 #include "hashmap/uthash.h"
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #define PORT 12345
 #define BUFFER_SIZE 1024
@@ -42,11 +44,19 @@ pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 volatile int server_running = 1;
 char* user_file = DEFAULT_USER_FILE;
 
+// Make server_socket global for signal handler access
+int server_socket = -1;
+
 // Signal handler for graceful shutdown
 void signal_handler(int sig) {
     (void)sig; // Suppress unused parameter warning
     printf("\nServer shutdown requested...\n");
     server_running = 0;
+    // Close server socket to unblock accept()
+    if (server_socket != -1) {
+        close(server_socket);
+        server_socket = -1;
+    }
 }
 
 // Function to add a new authenticated client
@@ -204,9 +214,12 @@ void* handle_authenticated_client(void* arg) {
         // Handle nickname change
         if (strncmp(buffer, "/nick ", 6) == 0) {
             char new_nick[32];
+            memset(new_nick, 0, sizeof(new_nick)); // Clear buffer
             strncpy(new_nick, buffer + 6, sizeof(new_nick) - 1);
-            new_nick[sizeof(new_nick) - 1] = '\0';
-            
+            new_nick[sizeof(new_nick) - 1] = '\0'; // Ensure null-termination
+            // Remove trailing whitespace/newlines
+            new_nick[strcspn(new_nick, "\r\n ")] = 0;
+
             // Validate nickname
             if (strlen(new_nick) == 0) {
                 snprintf(broadcast_msg, sizeof(broadcast_msg), 
@@ -280,9 +293,101 @@ void* handle_authenticated_client(void* arg) {
     }
     
     // Clean up session and remove client
-    remove_session(client_socket);
+    client_t *final_c = find_client_by_socket(client_socket);
+    if (final_c) {
+        remove_session(final_c->account_id);
+    }
     remove_client(client_socket);
     return NULL;
+}
+
+EVP_PKEY* extract_public_key(X509* client_cert, int client_socket){
+    uint32_t net_cert_len;
+    int recvd = recv(client_socket, &net_cert_len, sizeof(net_cert_len), MSG_WAITALL);
+    if (recvd != sizeof(net_cert_len)) {
+        printf("Failed to receive certificate length from client.\n");
+        close(client_socket);
+        return NULL;
+    }
+    uint32_t cert_len = ntohl(net_cert_len);
+    if (cert_len == 0 || cert_len > 8192) {
+        printf("Invalid certificate length received: %u\n", cert_len);
+        close(client_socket);
+        return NULL;
+    }
+    char* cert_buf = malloc(cert_len + 1);
+    if (!cert_buf) {
+        printf("Memory allocation failed for certificate buffer.\n");
+        close(client_socket);
+        return NULL;
+    }
+    recvd = recv(client_socket, cert_buf, cert_len, MSG_WAITALL);
+    if (recvd != (int)cert_len) {
+        printf("Failed to receive certificate data from client.\n");
+        free(cert_buf);
+        close(client_socket);
+        return NULL;
+    }
+    cert_buf[cert_len] = '\0';
+    BIO* cert_bio = BIO_new_mem_buf(cert_buf, cert_len);
+    client_cert = PEM_read_bio_X509(cert_bio, NULL, 0, NULL);
+    
+    BIO_free(cert_bio);
+    free(cert_buf);
+    if (!client_cert) {
+        printf("Failed to parse client certificate.\n");
+        close(client_socket);
+        return NULL;
+    }
+    
+    EVP_PKEY* client_pubkey = X509_get_pubkey(client_cert);
+    if (!client_pubkey) {
+        printf("Failed to extract public key from client certificate.\n");
+        X509_free(client_cert);
+        return NULL;
+    }
+    return client_pubkey;
+}
+
+// New function to extract client certificate from socket
+X509* extract_client_cert(int client_socket) {
+    uint32_t net_cert_len;
+    int recvd = recv(client_socket, &net_cert_len, sizeof(net_cert_len), MSG_WAITALL);
+    if (recvd != sizeof(net_cert_len)) {
+        printf("Failed to receive certificate length from client.\n");
+        close(client_socket);
+        return NULL;
+    }
+    uint32_t cert_len = ntohl(net_cert_len);
+    if (cert_len == 0 || cert_len > 8192) {
+        printf("Invalid certificate length received: %u\n", cert_len);
+        close(client_socket);
+        return NULL;
+    }
+    char* cert_buf = malloc(cert_len + 1);
+    if (!cert_buf) {
+        printf("Memory allocation failed for certificate buffer.\n");
+        close(client_socket);
+        return NULL;
+    }
+    recvd = recv(client_socket, cert_buf, cert_len, MSG_WAITALL);
+    if (recvd != (int)cert_len) {
+        printf("Failed to receive certificate data from client.\n");
+        free(cert_buf);
+        close(client_socket);
+        return NULL;
+    }
+    cert_buf[cert_len] = '\0';
+    BIO* cert_bio = BIO_new_mem_buf(cert_buf, cert_len);
+    X509* client_cert = PEM_read_bio_X509(cert_bio, NULL, 0, NULL);
+    BIO_free(cert_bio);
+    free(cert_buf);
+    if (!client_cert) {
+        printf("Failed to parse client certificate.\n");
+        close(client_socket);
+        return NULL;
+    }
+    return client_cert;
 }
 
 // Function to handle new client connections (authentication phase)
@@ -299,69 +404,106 @@ void* handle_new_connection(void* arg) {
     
     printf("New connection from %s:%d (authentication required)\n", 
            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-    
-    // Wait for username first
+
+    // --- Receive certificate as first message ---
+    X509* client_cert = extract_client_cert(client_socket);
+    if (!client_cert) {
+        printf("Client certificate extraction failed. Closing connection.\n");
+        close(client_socket);
+        return NULL;
+    }
+    EVP_PKEY* client_pubkey = X509_get_pubkey(client_cert);
+    if (!client_pubkey) {
+        printf("Failed to extract public key from client certificate.\n");
+        X509_free(client_cert);
+        close(client_socket);
+        return NULL;
+    }
+    // Print subject CN for debug
+    X509_NAME* subj = X509_get_subject_name(client_cert);
+    char cn[256];
+    X509_NAME_get_text_by_NID(subj, NID_commonName, cn, sizeof(cn));
+    printf("Received client certificate. Subject CN: %s\n", cn);
+
+    // --- Receive username as next message ---
     char username_buffer[BUFFER_SIZE];
     int name_bytes = recv(client_socket, username_buffer, BUFFER_SIZE - 1, 0);
     char username[MAX_USERNAME_LEN] = "";
     unsigned int account_id = 0;
-
     if (name_bytes <= 0) {
         printf("Client disconnected before sending username\n");
+        EVP_PKEY_free(client_pubkey);
+        X509_free(client_cert);
         close(client_socket);
         return NULL;
     }
-
     username_buffer[name_bytes] = '\0';
     username_buffer[strcspn(username_buffer, "\r\n")] = 0; // Remove newlines
 
-    // Parse USERNAME:name format
+
     if (strncmp(username_buffer, "USERNAME:", 9) == 0) {
         strncpy(username, username_buffer + 9, MAX_USERNAME_LEN - 1);
         username[MAX_USERNAME_LEN - 1] = '\0';
-
         username_t *uname_entry = find_username(username);
         if (!uname_entry) {
             printf("Invalid username received: %s\n", username);
             snprintf(response, sizeof(response), "ERROR: Invalid username\n");
             send(client_socket, response, strlen(response), 0);
+            EVP_PKEY_free(client_pubkey);
+            X509_free(client_cert);
             close(client_socket);
             return NULL;
         }
         account_id = uname_entry->account_id;
+        user_t *user = find_user(account_id);
+        if (!user) {
+            printf("Invalid account_id received: %u\n", account_id);
+            snprintf(response, sizeof(response), "ERROR: Invalid account_id\n");
+            send(client_socket, response, strlen(response), 0);
+            EVP_PKEY_free(client_pubkey);
+            X509_free(client_cert);
+            close(client_socket);
+            return NULL;
+        }
+        user->public_key = client_pubkey;
+        client_pubkey = NULL; // Ownership transferred, don't free here
         printf("Valid username received: %s (account_id: %u)\n", username, account_id);
+        
+        // Now generate and send the RSA challenge using the auth_system
+        if (is_rsa_system_initialized()) {
+            printf("Initiating automatic RSA challenge for %s%s:%d\n", username, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+            rsa_challenge_result_t rsa_result = start_rsa_challenge_for_client(account_id, user->public_key);
+            if (rsa_result.success && rsa_result.encrypted_size > 0) {
+                char hex_output[RSA_HEX_BUFFER_SIZE];
+                snprintf(hex_output, sizeof(hex_output), "RSA_CHALLENGE:");
+                char *hex_ptr = hex_output + strlen(hex_output);
+                for (int i = 0; i < rsa_result.encrypted_size; i++) {
+                    sprintf(hex_ptr + (i * 2), "%02x", rsa_result.encrypted_challenge[i]);
+                }
+                strcat(hex_output, "\n");
+                send(client_socket, hex_output, strlen(hex_output), 0);
+                printf("RSA challenge sent to %s\n", username);
+            } else {
+                printf("Failed to generate/send RSA challenge for %s\n", username);
+                EVP_PKEY_free(client_pubkey);
+                X509_free(client_cert);
+                close(client_socket);
+                return NULL;
+            }
+        }
     } else {
         printf("Invalid username format received\n");
         snprintf(response, sizeof(response), "ERROR: Invalid username format\n");
         send(client_socket, response, strlen(response), 0);
+        EVP_PKEY_free(client_pubkey);
+        X509_free(client_cert);
         close(client_socket);
         return NULL;
     }
-    
-    // Automatically initiate RSA challenge if RSA system is initialized
-    if (is_rsa_system_initialized()) {
-        printf("Initiating automatic RSA challenge for %s:%d (Account ID: %u)\n", 
-               inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), account_id);
-        
-        // Start RSA challenge with account_id
-        rsa_challenge_result_t rsa_result = start_rsa_challenge_for_client(account_id);
-        
-        if (rsa_result.success && rsa_result.encrypted_size > 0) {
-            // Send RSA challenge automatically
-            char hex_output[RSA_HEX_BUFFER_SIZE];
-            snprintf(hex_output, sizeof(hex_output), "RSA_CHALLENGE:");
-            char *hex_ptr = hex_output + strlen(hex_output);
-            
-            // Convert binary challenge to hex string
-            for (int i = 0; i < rsa_result.encrypted_size; i++) {
-                sprintf(hex_ptr + (i * 2), "%02x", rsa_result.encrypted_challenge[i]);
-            }
-            strcat(hex_output, "\n");
-            send(client_socket, hex_output, strlen(hex_output), 0);
-            
-            printf("RSA challenge sent to account %u\n", account_id);
-        }
+    if (client_pubkey) {
+        EVP_PKEY_free(client_pubkey); // Only free if not stored in user
     }
+    X509_free(client_cert);
     
     // Authentication prompt
     if (!is_rsa_system_initialized()) {
@@ -400,7 +542,7 @@ void* handle_new_connection(void* arg) {
                 rsa_challenge_result_t rsa_result = process_rsa_command(buffer, account_id);
                 
                 if (rsa_result.success && strstr(rsa_result.response, "RSA authentication successful")) {
-                    printf("RSA authentication successful for account %u\n", account_id);
+                    
                     // Send authentication prompt NOW that RSA is complete
                     snprintf(response, sizeof(response),
                              "Please authenticate to access the secure chat:\n"
@@ -474,6 +616,22 @@ void* handle_new_connection(void* arg) {
     return NULL;
 }
 
+// Function to broadcast shutdown message to all authenticated clients
+void broadcast_shutdown_message(void) {
+    char shutdown_msg[BUFFER_SIZE];
+    snprintf(shutdown_msg, sizeof(shutdown_msg), 
+             "Server is shutting down. Goodbye!\n");
+    
+    pthread_mutex_lock(&clients_mutex);
+    client_t *c, *tmp;
+    HASH_ITER(hh, clients_map, c, tmp) {
+        if (c->active) {
+            send(c->socket, shutdown_msg, strlen(shutdown_msg), 0);
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+}
+
 // Print usage information
 void print_usage(const char *program_name) {
     printf("%s - Secure Authenticated Chat Server\n", PROGRAM_NAME);
@@ -526,7 +684,6 @@ void cleanup_server(void) {
         close(c->socket);
         HASH_DEL(clients_map, c);
         free(c);
-        printf("Client %s disconnected\n", c->nickname);
     }
     pthread_mutex_unlock(&clients_mutex);
     
@@ -585,7 +742,7 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     
     // Create server socket
-    int server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0) {
         fprintf(stderr, "Socket creation failed\n");
         return 1;
@@ -656,19 +813,30 @@ int main(int argc, char *argv[]) {
         }
     }
     
+    printf("Broadcasting shutdown message to all clients\n");
+    broadcast_shutdown_message();
+    
+    // Give clients a moment to receive the shutdown message
+    sleep(1); // 100ms delay
+    
+    printf("Closing all client sockets\n");
     // Close all client sockets to unblock handler threads
     pthread_mutex_lock(&clients_mutex);
     client_t *c, *tmp;
     HASH_ITER(hh, clients_map, c, tmp) {
+        printf("Closing client socket %s\n", c->nickname);
         close(c->socket); // This will unblock recv() in handler threads
     }
     pthread_mutex_unlock(&clients_mutex);
 
+    printf("Joining all client handler threads\n");
     // Now join all client handler threads
-    for (int i = 0; i < client_thread_count; i++) {
+    for (int i = client_thread_count-1; i >= 0; i--) {
+        printf("Joining client handler thread %d\n", i);
         pthread_join(client_threads[i], NULL);
     }
 
+    printf("Safely freeing all remaining clients\n");
     // Now, safely free all remaining clients
     pthread_mutex_lock(&clients_mutex);
     HASH_ITER(hh, clients_map, c, tmp) {
@@ -676,10 +844,12 @@ int main(int argc, char *argv[]) {
         free(c);
     }
     pthread_mutex_unlock(&clients_mutex);
-
+    printf("Cleaning up RSA system\n");
     // Cleanup and shutdown
     close(server_socket);
+    printf("Server socket closed\n");
     cleanup_server();
+    printf("Cleaning up authentication system\n");
     cleanup_auth_system(); // Clean up authentication system hashmaps
     
     printf("%s shutdown complete\n", PROGRAM_NAME);

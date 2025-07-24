@@ -10,6 +10,8 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/err.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #define PORT 12345
 #define BUFFER_SIZE 1024
 #define MAX_MESSAGES 100
@@ -35,6 +37,9 @@ unsigned int account_id = 0;  // Add account_id
 
 // Authentication response checking
 #define AUTH_SUCCESS "AUTH_SUCCESS"
+
+// Function to cleanup client resources
+void cleanup_client_resources(int client_socket);
 
 // Global message storage
 typedef struct {
@@ -282,7 +287,7 @@ void* receive_messages(void* arg) {
         
         // Check for RSA failure
         if (strstr(buffer, "RSA_FAILED")) {
-            printf("\nRSA authentication failed - connection may be terminated by server.\n");
+            printf("\nRSA authentication failed - :connection may be terminated by server.\n");
             running = 0;
             return NULL;
         }
@@ -299,10 +304,10 @@ void* receive_messages(void* arg) {
             strstr(buffer, "server disconnected") ||
             strstr(buffer, "Server disconnected")) {
             printf("\n%s", buffer);
-            printf("Client shutting down automatically...\n");
+            printf("Server is shutting down. Client exiting immediately...\n");
             running = 0;
-            shutdown(client_socket, SHUT_RDWR);  // This will wake up the main thread
-            return NULL;
+            cleanup_client_resources(client_socket);
+            exit(0); // Exit immediately
         }
         
         // Store the message
@@ -329,80 +334,104 @@ void* receive_messages(void* arg) {
     return NULL;
 }
 
-
+// Function to cleanup client resources
+void cleanup_client_resources(int client_socket) {
+    printf("Cleaning up client resources...\n");
+    
+    // Close socket
+    if (client_socket >= 0) {
+        shutdown(client_socket, SHUT_RDWR);
+        close(client_socket);
+    }
+    
+    // Cleanup RSA keys
+    cleanup_rsa_keys();
+    
+    // Cleanup message mutex
+    pthread_mutex_destroy(&message_mutex);
+    
+    // Clear message buffer
+    pthread_mutex_lock(&message_mutex);
+    for (int i = 0; i < message_count; i++) {
+        message_buffer[i].valid = 0;
+        memset(message_buffer[i].message, 0, BUFFER_SIZE);
+    }
+    message_count = 0;
+    pthread_mutex_unlock(&message_mutex);
+    
+    printf("Client cleanup complete\n");
+}
 
 // Function to handle secure chat client
-void client_mode(int client_socket) {
+int client_mode(int client_socket) {
     char buffer[BUFFER_SIZE];
     pthread_t receive_thread;
-    
+
     printf("Connected to secure MultiFactor Authentication chat server!\n");
     printf("Starting RSA challenge-response authentication...\n");
-    
-    // Display initial server message (but check for RSA challenge first)
-    int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
-    if (bytes_received > 0) {
+
+    // Synchronously wait for and handle RSA challenge before starting receive thread
+    int rsa_ok = 0;
+    while (!rsa_ok && running) {
+        int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
+        if (bytes_received <= 0) {
+            printf("\nServer disconnected\n");
+            running = 0;
+            return 0;
+        }
         buffer[bytes_received] = '\0';
-        
-        // Check if the first message is an RSA challenge
         if (strstr(buffer, "RSA_CHALLENGE:") && !rsa_completed) {
-            char* challenge_start = strstr(buffer, "RSA_CHALLENGE:") + 14;  // Skip "RSA_CHALLENGE:"
+            char* challenge_start = strstr(buffer, "RSA_CHALLENGE:") + 14;
             char* challenge_end = strchr(challenge_start, '\n');
             if (challenge_end) *challenge_end = '\0';
-            
             printf("[RSA] Performing RSA mutual authentication...\n");
             if (handle_rsa_challenge(client_socket, challenge_start)) {
                 rsa_completed = 1;
+                rsa_ok = 1;
                 printf("[RSA] SUCCESS: RSA mutual authentication completed!\n");
-                printf("[RSA] You may now login with your username and password.");
-             
+                printf("[RSA] You may now login with your username and password.\n");
             } else {
                 printf("[RSA] FAILED: RSA authentication failed! Connection may be terminated.\n");
+                running = 0;
+                return 0;
             }
+        } else if (strstr(buffer, "RSA_FAILED")) {
+            printf("\nRSA authentication failed - connection may be terminated by server.\n");
+            running = 0;
+            return 0;
+        } else if (strstr(buffer, "SECURITY_ERROR")) {
+            printf("\nSECURITY ERROR: RSA authentication is required but failed.\n");
+            printf("Make sure you have the correct RSA keys for your client.\n");
+            running = 0;
+            return 0;
         } else {
-            // Regular server message - display normally
-            printf("Server: %s", buffer);
+            // Print any other server message (e.g., banner, info)
+            printf("%s", buffer);
         }
     }
-    
-    
-    
-    // Create thread to receive messages
+
+    // Now start the receive thread for chat and further messages
     if (pthread_create(&receive_thread, NULL, receive_messages, &client_socket) != 0) {
         printf("Failed to create receive thread\n");
-        return;
+        return 0;
     }
-    
-    // RSA authentication and prompts are now handled automatically
-    // The server will send the login prompt after RSA completes
-    
+
     // Main loop to send messages
     while (running && fgets(buffer, BUFFER_SIZE, stdin)) {
         buffer[strcspn(buffer, "\r\n")] = 0;
-        
-        // Check if we should exit due to server disconnection
-        if (!running) {
-            break;
-        }
-        
+        if (!running) break;
         if (strcmp(buffer, "/quit") == 0) {
             running = 0;
             break;
         }
-        
         if (strlen(buffer) > 0) {
-            // Check authentication state and command restrictions
             if (!authenticated) {
-                // Only allow authentication commands when not authenticated
-                if (strncmp(buffer, "/login", 6) == 0 || 
-                    strncmp(buffer, "/register", 9) == 0) {
-                    // Send authentication command
+                if (strncmp(buffer, "/login", 6) == 0 || strncmp(buffer, "/register", 9) == 0) {
                     if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
                         printf("Failed to send message\n");
                         running = 0;
                         break;
                     }
-                    // Don't show prompt immediately - wait for server response
                     continue;
                 } else {
                     printf("Please authenticate first. Use: /login <username> <password> or /register <username> <password>\n");
@@ -410,7 +439,6 @@ void client_mode(int client_socket) {
                     continue;
                 }
             } else {
-                // Send any command when authenticated
                 if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
                     printf("Failed to send message\n");
                     running = 0;
@@ -418,20 +446,74 @@ void client_mode(int client_socket) {
                 }
             }
         }
-        
-        // Show appropriate prompt (only for non-auth commands)
         if (authenticated) {
             printf("> ");
         } else {
             printf("auth> ");
         }
     }
-    
-    // Cleanup
     running = 0;
     shutdown(client_socket, SHUT_RDWR);
     pthread_join(receive_thread, NULL);
     printf("Disconnected from chat server\n");
+    cleanup_client_resources(client_socket);
+    return 1; // cleaned up and returned successfully
+}
+
+// Helper function to generate a self-signed certificate
+int generate_self_signed_cert(const char* username) {
+    char privkey_path[MAX_FILE_PATH_LEN];
+    char cert_path[MAX_FILE_PATH_LEN];
+    snprintf(privkey_path, sizeof(privkey_path), "RSAkeys/client_%s_private.pem", username);
+    snprintf(cert_path, sizeof(cert_path), "RSAkeys/client_%s_cert.pem", username);
+
+    FILE* fp = fopen(privkey_path, "r");
+    if (!fp) {
+        printf("ERROR: Private key not found for certificate generation.\n");
+        return 0;
+    }
+    EVP_PKEY* pkey = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
+    fclose(fp);
+    if (!pkey) {
+        printf("ERROR: Could not read private key for certificate generation.\n");
+        return 0;
+    }
+
+    X509* x509 = X509_new();
+    if (!x509) {
+        EVP_PKEY_free(pkey);
+        printf("ERROR: Could not allocate X509 certificate.\n");
+        return 0;
+    }
+    ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
+    X509_gmtime_adj(X509_get_notBefore(x509), 0);
+    X509_gmtime_adj(X509_get_notAfter(x509), 31536000L); // 1 year
+    X509_set_pubkey(x509, pkey);
+
+    X509_NAME* name = X509_get_subject_name(x509);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char*)username, -1, -1, 0);
+    X509_set_issuer_name(x509, name); // self-signed
+
+    if (!X509_sign(x509, pkey, EVP_sha256())) {
+        X509_free(x509);
+        EVP_PKEY_free(pkey);
+        printf("ERROR: Failed to sign certificate.\n");
+        return 0;
+    }
+
+    FILE* cert_fp = fopen(cert_path, "w");
+    if (!cert_fp) {
+        X509_free(x509);
+        EVP_PKEY_free(pkey);
+        printf("ERROR: Could not open cert file for writing.\n");
+        return 0;
+    }
+    PEM_write_X509(cert_fp, x509);
+    fclose(cert_fp);
+    X509_free(x509);
+    EVP_PKEY_free(pkey);
+    printf("Self-signed certificate generated: %s\n", cert_path);
+    return 1;
 }
 
 int main(int argc, char *argv[]) {
@@ -446,6 +528,37 @@ int main(int argc, char *argv[]) {
     }
     
     const char* username = argv[1];
+    
+    // Automatically generate RSA keys if they do not exist
+    char key_file[MAX_FILE_PATH_LEN];
+    snprintf(key_file, sizeof(key_file), "RSAkeys/client_%s_private.pem", username);
+    FILE* fp = fopen(key_file, "r");
+    if (!fp) {
+        printf("Private key not found for user '%s'. Generating new RSA keys...\n", username);
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "./generate_rsa_keys client %s", username);
+        int ret = system(cmd);
+        if (ret != 0) {
+            printf("Failed to generate RSA keys for user '%s'!\n", username);
+            return 1;
+        }
+    } else {
+        fclose(fp);
+    }
+    
+    // After key generation, check for certificate
+    char cert_file[MAX_FILE_PATH_LEN];
+    snprintf(cert_file, sizeof(cert_file), "RSAkeys/client_%s_cert.pem", username);
+    FILE* cert_fp = fopen(cert_file, "r");
+    if (!cert_fp) {
+        printf("Certificate not found for user '%s'. Generating self-signed certificate...\n", username);
+        if (!generate_self_signed_cert(username)) {
+            printf("Failed to generate self-signed certificate for user '%s'!\n", username);
+            return 1;
+        }
+    } else {
+        fclose(cert_fp);
+    }
     
     // Initialize OpenSSL
     OpenSSL_add_all_algorithms();
@@ -473,10 +586,34 @@ int main(int argc, char *argv[]) {
         perror("Connection failed");
         return 1;
     }
-    
-    printf("Connected to server. Starting authentication...\n");
-    
-    // Send username first
+    printf("Connected to server. Sending certificate...\n");
+    // Send certificate as first message
+    cert_fp = fopen(cert_file, "r");
+    if (!cert_fp) {
+        printf("ERROR: Could not open certificate file for sending.\n");
+        close(sock);
+        return 1;
+    }
+    char cert_buf[2048];
+    size_t cert_len = fread(cert_buf, 1, sizeof(cert_buf) - 1, cert_fp);
+    fclose(cert_fp);
+    cert_buf[cert_len] = '\0';
+    // Send certificate length first (as 4-byte int, network order)
+    uint32_t net_cert_len = htonl(cert_len);
+    if (send(sock, &net_cert_len, sizeof(net_cert_len), 0) != sizeof(net_cert_len)) {
+        printf("ERROR: Failed to send certificate length.\n");
+        close(sock);
+        return 1;
+    }
+    // Send certificate data
+    ssize_t sent_bytes = send(sock, cert_buf, cert_len, 0);
+    if (sent_bytes != (ssize_t)cert_len) {
+        printf("ERROR: Failed to send certificate data.\n");
+        close(sock);
+        return 1;
+    }
+    printf("Certificate sent to server. Starting authentication...\n");
+    // Send username after certificate
     char id_msg[BUFFER_SIZE];
     snprintf(id_msg, sizeof(id_msg), "USERNAME:%s\n", username);
     if (send(sock, id_msg, strlen(id_msg), 0) < 0) {
@@ -484,13 +621,13 @@ int main(int argc, char *argv[]) {
         close(sock);
         return 1;
     }
-    
     // Run secure chat client
-    client_mode(sock);
+    if(client_mode(sock)){
+        close(sock);
+        return 1;
+    }
     
     // Cleanup
-    close(sock);
-    pthread_mutex_destroy(&message_mutex);
-    cleanup_rsa_keys();
+    cleanup_client_resources(sock);
     return 0;
 } 

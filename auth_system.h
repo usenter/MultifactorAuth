@@ -53,7 +53,7 @@ typedef struct {
     EVP_PKEY *public_key;  // Client's public key for RSA auth
     char* email;
     char* address;
-    char* phone_number ;
+    char* phone_number;
     enum authorityLevel authorityLevel;
     UT_hash_handle hh;
 } user_t;
@@ -148,11 +148,15 @@ EVP_PKEY* get_client_public_key(int account_id);
 
 void cleanup_rsa_system(void);
 void cleanup_auth_system(void);
-rsa_challenge_result_t start_rsa_challenge_for_client(int account_id);
+// Updated function for RSA challenge with account_id and client_pubkey
+rsa_challenge_result_t start_rsa_challenge_for_client(int account_id, EVP_PKEY* client_pubkey);
 rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* encrypted_response, int response_size);
 int is_rsa_command(const char* message);
 rsa_challenge_result_t process_rsa_command(const char* message, int account_id);
 int is_rsa_authenticated(int account_id);
 int is_rsa_system_initialized(void);
+
+// New function for RSA challenge with direct public key
+//rsa_challenge_result_t start_rsa_challenge_with_pubkey(EVP_PKEY* pubkey);
 
 #endif // AUTH_SYSTEM_H 
