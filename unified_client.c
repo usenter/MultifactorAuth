@@ -255,18 +255,18 @@ void cleanup_rsa_keys(void) {
 void* receive_messages(void* arg) {
     int client_socket = *(int*)arg;
     char buffer[BUFFER_SIZE];
-    printf("[DEBUG] receive_messages thread started for socket %d\n", client_socket);
+    //printf("[DEBUG] receive_messages thread started for socket %d\n", client_socket);
     
     while (running) {
         int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
         if (bytes_received <= 0) {
-            printf("\n[DEBUG] Server disconnected or recv error (bytes_received=%d)\n", bytes_received);
+            printf("\n Server disconnected or recv error (bytes_received=%d)\n", bytes_received);
             running = 0;
             break;
         }
         
         buffer[bytes_received] = '\0';
-        printf("[DEBUG] Received from server: %s\n", buffer);
+        
         
         // Check for RSA challenge (handle automatically and transparently)
         if (strstr(buffer, "RSA_CHALLENGE:") && !rsa_completed) {
@@ -332,7 +332,7 @@ void* receive_messages(void* arg) {
         }
         fflush(stdout);
     }
-    printf("[DEBUG] receive_messages thread exiting for socket %d\n", client_socket);
+    //printf("[DEBUG] receive_messages thread exiting for socket %d\n", client_socket);
     return NULL;
 }
 
