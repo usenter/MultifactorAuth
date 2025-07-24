@@ -490,40 +490,40 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
             username_t *new_username = malloc(sizeof(username_t));
             if (new_user && new_username) {
                 //new_user->public_key = load_public_key(pubkey_path);
-                if (!new_user->public_key) {
+                /*if (!new_user->public_key) {
                     printf("Failed to load public key for user %s from %s\n", username, pubkey_path);
                     free(new_user);
                     free(new_username);
+                } else {*/
+                new_user->account_id = account_id;
+                strncpy(new_user->username, username, MAX_USERNAME_LEN - 1);
+                new_user->username[MAX_USERNAME_LEN - 1] = '\0';
+                new_username->username = strdup(username);
+                new_username->account_id = account_id;
+                new_user->public_key = NULL;
+                hash_password(password, new_user->password_hash);
+                new_user->password_hash[MAX_HASH_LEN - 1] = '\0';
+                new_user->email = strdup(email);
+                new_user->address = strdup(address);
+                new_user->phone_number = strdup(phone_number);
+                new_user->active = 1;
+                new_user->authorityLevel = authorityLevel;  
+                if (find_user(account_id) == NULL && find_username(username) == NULL) {
+                    HASH_ADD_INT(user_map, account_id, new_user);
+                    HASH_ADD_STR(username_map, username, new_username);
+                    loaded_count++;
+                    user_count++;
                 } else {
-                    new_user->account_id = account_id;
-                    strncpy(new_user->username, username, MAX_USERNAME_LEN - 1);
-                    new_user->username[MAX_USERNAME_LEN - 1] = '\0';
-                    new_username->username = strdup(username);
-                    new_username->account_id = account_id;
-                    new_user->public_key = NULL;
-                    hash_password(password, new_user->password_hash);
-                    new_user->password_hash[MAX_HASH_LEN - 1] = '\0';
-                    new_user->email = strdup(email);
-                    new_user->address = strdup(address);
-                    new_user->phone_number = strdup(phone_number);
-                    new_user->active = 1;
-                    new_user->authorityLevel = authorityLevel;  
-                    if (find_user(account_id) == NULL && find_username(username) == NULL) {
-                        HASH_ADD_INT(user_map, account_id, new_user);
-                        HASH_ADD_STR(username_map, username, new_username);
-                        loaded_count++;
-                        user_count++;
-                    } else {
-                        printf("Skipping duplicate user ID: %u\n", account_id);
-                        //EVP_PKEY_free(new_user->public_key);
-                        free(new_user->email);
-                        free(new_user->address);
-                        free(new_user->phone_number);
-                        free(new_user);
-                        free(new_username->username);
-                        free(new_username);
-                    }
+                    printf("Skipping duplicate user ID: %u\n", account_id);
+                    //EVP_PKEY_free(new_user->public_key);
+                    free(new_user->email);
+                    free(new_user->address);
+                    free(new_user->phone_number);
+                    free(new_user);
+                    free(new_username->username);
+                    free(new_username);
                 }
+                //}
                 memset(password, 0, sizeof(password));
             }
         }

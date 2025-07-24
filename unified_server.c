@@ -99,12 +99,14 @@ void broadcast_message(const char* message, int sender_socket) {
     client_t *c, *tmp;
     HASH_ITER(hh, clients_map, c, tmp) {
         if (c->active && c->socket != sender_socket) {
+            //printf("[DEBUG] Broadcasting to socket %d: %s\n", c->socket, message_with_newline);
             if (send(c->socket, message_with_newline, strlen(message_with_newline), 0) < 0) {
-                printf("WARNING: Failed to send message to client %s\n", c->nickname);
+                //printf("[DEBUG] WARNING: Failed to send to socket %d\n", c->socket);
             }
         }
     }
     pthread_mutex_unlock(&clients_mutex);
+    free(message_with_newline);
 }
 
 // Function to remove a client
@@ -122,7 +124,9 @@ void remove_client(int client_socket) {
         // Broadcast departure message (before removing the client)
         int departing_socket = c->socket;
         c->active = 0; // Mark as inactive to exclude from broadcast
+        pthread_mutex_unlock(&clients_mutex);
         broadcast_message(departure_msg, departing_socket);
+        pthread_mutex_lock(&clients_mutex);
         close(departing_socket);
         HASH_DEL(clients_map, c);
         free(c);
@@ -213,6 +217,7 @@ void* handle_authenticated_client(void* arg) {
         
         // Handle nickname change
         if (strncmp(buffer, "/nick ", 6) == 0) {
+            printf("[DEBUG] Handling /nick command from socket %d\n", client_socket);
             char new_nick[32];
             memset(new_nick, 0, sizeof(new_nick)); // Clear buffer
             strncpy(new_nick, buffer + 6, sizeof(new_nick) - 1);
@@ -255,6 +260,7 @@ void* handle_authenticated_client(void* arg) {
         
         // Handle list command
         if (strcmp(buffer, "/list") == 0) {
+            printf("[DEBUG] Handling /list command from socket %d\n", client_socket);
             get_client_list(broadcast_msg, sizeof(broadcast_msg));
             send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
             continue;
@@ -294,10 +300,15 @@ void* handle_authenticated_client(void* arg) {
     
     // Clean up session and remove client
     client_t *final_c = find_client_by_socket(client_socket);
+    unsigned int account_id = 0;
     if (final_c) {
-        remove_session(final_c->account_id);
+        account_id = final_c->account_id;
     }
     remove_client(client_socket);
+    if (account_id != 0) {
+        remove_session(account_id);
+    }
+    pthread_mutex_unlock(&clients_mutex);
     return NULL;
 }
 
