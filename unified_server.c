@@ -11,6 +11,7 @@
 #include "hashmap/uthash.h"
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+#include <dirent.h> // Required for ls, cd, and touch commands
 
 #define PORT 12345
 #define BUFFER_SIZE 1024
@@ -25,6 +26,11 @@
 pthread_t client_threads[MAX_CLIENT_THREADS];
 int client_thread_count = 0;
 
+typedef enum {
+    CLIENT_MODE_CHAT,
+    CLIENT_MODE_FILE
+} client_mode_t;
+
 // Structure to hold authenticated client information
 typedef struct client {
     int socket;
@@ -32,8 +38,11 @@ typedef struct client {
     char nickname[32];
     char username[MAX_USERNAME_LEN];
     unsigned int account_id;
+    int permLevel;
     int active;
     time_t connect_time;
+    client_mode_t mode;
+    char cwd[256]; // Current working directory for file mode
     UT_hash_handle hh; // For uthash
 } client_t;
 
@@ -154,14 +163,280 @@ void get_client_list(char* list_buffer, size_t buffer_size) {
     pthread_mutex_unlock(&clients_mutex);
 }
 
+// Forward declarations for mode handlers
+void handle_chat_mode(client_t *c, char *buffer, int client_socket){
+    char broadcast_msg[BUFFER_SIZE];
+    // Handle nickname change
+    if (strncmp(buffer, "/nick ", 6) == 0) {
+        printf("[DEBUG] Handling /nick command from socket %d\n", client_socket);
+        char new_nick[32];
+        memset(new_nick, 0, sizeof(new_nick)); // Clear buffer
+        strncpy(new_nick, buffer + 6, sizeof(new_nick) - 1);
+        new_nick[sizeof(new_nick) - 1] = '\0'; // Ensure null-termination
+        // Remove trailing whitespace/newlines
+        new_nick[strcspn(new_nick, "\r\n ")] = 0;
+
+        // Validate nickname
+        if (strlen(new_nick) == 0) {
+            snprintf(broadcast_msg, sizeof(broadcast_msg), 
+                     "Invalid nickname. Usage: /nick <name>\n");
+            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+            return;
+        }
+        
+        // Check if nickname is already taken
+        if (find_client_by_nickname(new_nick)) {
+            snprintf(broadcast_msg, sizeof(broadcast_msg), 
+                     "Nickname '%s' is already taken. Choose a different one.\n", new_nick);
+            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+            return;
+        }
+        
+        char old_nick[32];
+        pthread_mutex_lock(&clients_mutex);
+        strncpy(old_nick, c->nickname, sizeof(old_nick) - 1);
+        strncpy(c->nickname, new_nick, sizeof(c->nickname) - 1);
+        c->nickname[sizeof(c->nickname) - 1] = '\0';
+        pthread_mutex_unlock(&clients_mutex);
+        
+        snprintf(broadcast_msg, sizeof(broadcast_msg), 
+                 "Nickname changed to '%s'\n", new_nick);
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        
+        snprintf(broadcast_msg, sizeof(broadcast_msg), 
+                 "%s is now known as %s", old_nick, new_nick);
+        broadcast_message(broadcast_msg, client_socket);
+        return;
+    }
+    
+    // Handle list command
+    if (strcmp(buffer, "/list") == 0) {
+        printf("[DEBUG] Handling /list command from socket %d\n", client_socket);
+        get_client_list(broadcast_msg, sizeof(broadcast_msg));
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        return;
+    }
+    
+    // Handle help command
+    if (strcmp(buffer, "/help") == 0) {
+        snprintf(broadcast_msg, sizeof(broadcast_msg),
+                 "Chat Commands:\n"
+                 "  /nick <name> - Change your nickname\n"
+                 "  /list - Show connected users\n"
+                 "  /help - Show this help\n"
+                 "  /file - Enter file mode\n"
+                 "  /quit - Kill the overall program\n"
+                 "Just type any message to chat with everyone!\n");
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        return;
+    }
+    
+    //handle file commands
+    if (strncmp(buffer, "/file", 5) == 0) {
+        c->mode = CLIENT_MODE_FILE;
+        snprintf(broadcast_msg, sizeof(broadcast_msg), "File mode activated\n");
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        return;
+    }
+    // Handle commands that start with / but aren't recognized
+    if (buffer[0] == '/') {
+        snprintf(broadcast_msg, sizeof(broadcast_msg), 
+                 "Unknown command. Type /help for available commands.\n");
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        return;
+    }
+    
+    // Regular chat message - broadcast to everyone
+    if (strlen(buffer) > 0) {
+        snprintf(broadcast_msg, sizeof(broadcast_msg), 
+                 "%s: %s", c->nickname, buffer);
+        broadcast_message(broadcast_msg, client_socket);
+        
+        // Log the message
+        printf("CHAT [%s] %s: %s\n", c->username, c->nickname, buffer);
+        return;
+    }
+}
+//checks a given folder's permissions and returns 1 if the user has access, 0 otherwise
+// mode is either 'r' or 'w'
+int isAccessible(client_t *c, char *folderName, char mode, int client_socket){
+    char* filePath = malloc(1024);
+    snprintf(filePath, 1024, "UserDirectory/%s/.perms", folderName);
+    FILE* permsFile = fopen(filePath, "r");
+    if(permsFile == NULL){
+        printf("Permissions file not found for %s\n", folderName);
+        return 0;
+    }
+    char readPerm[32], writePerm[32];
+    fscanf(permsFile, "read: %31s\nwrite: %31s", readPerm, writePerm);
+    fclose(permsFile);
+    int readPermLevel = 2;
+    int writePermLevel = 2;
+    if(strcmp(readPerm, "user") == 0){
+        readPermLevel = 2; // any one less than level 2 can read
+    } else if(strcmp(readPerm, "admin") == 0){
+        readPermLevel = 1; // any one less than level 1 can read
+    } else if(strcmp(readPerm, "superadmin") == 0){
+        readPermLevel = 0; // superadmin can read
+    }
+    if(strcmp(writePerm, "user") == 0){
+        writePermLevel = 2; // any one less than level 2 can write
+    } else if(strcmp(writePerm, "admin") == 0){
+        writePermLevel = 1; // any one less than level 1 can write
+    } else if(strcmp(writePerm, "superadmin") == 0){
+        writePermLevel = 0; // superadmin can write
+    } 
+    if(mode == 'r'){
+        if(c->permLevel <= readPermLevel){
+            return 1;
+        }
+        else{
+            char broadcast_msg[BUFFER_SIZE];
+            snprintf(broadcast_msg, sizeof(broadcast_msg), "You do not have permission to read this file/access this directory\n");
+            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+            return 0;
+        }
+    } else if(mode == 'w'){
+        if(c->permLevel <= writePermLevel){
+            return 1;
+        }
+        else{
+            char broadcast_msg[BUFFER_SIZE];
+            snprintf(broadcast_msg, sizeof(broadcast_msg), "You do not have permission to write to this file/access this directory\n");
+            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+            return 0;
+        }
+    }
+    return 0;   
+}
+
+
+void handle_file_mode(client_t *c, char *buffer, int client_socket){
+    char broadcast_msg[BUFFER_SIZE];
+    if(strncmp(buffer, "/end", 5) == 0){
+        c->mode = CLIENT_MODE_CHAT;
+        snprintf(broadcast_msg, sizeof(broadcast_msg), "File mode ended, returning to chat mode\n");
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        return;
+    }
+    if(strncmp(buffer, "/help", 5) == 0){
+        char* userPermName = "user";
+        if(c->permLevel == SUPER_ADMIN){
+            userPermName = "superadmin";
+        } else if(c->permLevel == ADMIN){
+            userPermName = "admin";
+        }
+        snprintf(broadcast_msg, sizeof(broadcast_msg), "File mode commands work similar to a terminal. The following commands are available:\n"
+                 "  ls - List files in the current directory\n"
+                 "  cd <directory> - Change to a different directory\n"
+                 "  pwd - Show the current working directory\n"
+                 "  cat <file> - Display the contents of a file\n"
+                 "  touch <file> - Create a new file\n"
+                 "  rm <file> - Delete a file\n"
+                 "  mkdir <directory> - Create a new directory\n"
+                 "  rmdir <directory> - Delete a directory\n"
+                 "  /help - Show this help\n"
+                 "  /end - End file mode and return to chat mode\n"
+                 "  /quit - kill the overall program\n"
+                "Note that the file mode is not a full terminal, so some commands may not work as expected.\n"
+                "Additionally, access to files is limited by the user's permissions.\n"
+                "Your permissions are: %s\n", userPermName);
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        return;
+    }
+    if(strncmp(buffer, "/list", 5) == 0 || strncmp(buffer, "/nick", 5) == 0 || strncmp(buffer, "/file", 5) == 0){
+        snprintf(broadcast_msg, sizeof(broadcast_msg), "Chat mode commands are not available in file mode\n");
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        buffer = "\0"; //clear buffer
+        return;
+    }
+    // ls command
+    if(strncmp(buffer, "ls", 2) == 0) {
+        printf("User %s is trying to list directory %s\n", c->username, c->cwd);
+        char *folderName = strrchr(c->cwd, '/'); //special handling for ls command
+        if (folderName) {
+            folderName = folderName + 1;
+        } else {
+            folderName = "."; // For root directory (UserDirectory)
+        }
+        printf("Checking permissions for %s\n", folderName);
+        if(!isAccessible(c, folderName, 'r', client_socket)){
+            printf("User %s does not have permission to read directory %s\n", c->username, c->cwd);
+            return;
+        }
+        DIR *dir = opendir(c->cwd);
+        if (!dir) {
+            snprintf(broadcast_msg, sizeof(broadcast_msg), "Could not open directory: %s\n", c->cwd);
+            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+            return;
+        }
+        struct dirent *entry;
+        snprintf(broadcast_msg, sizeof(broadcast_msg), "Contents of %s:\n", c->cwd);
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_name[0] == '.') continue; // skip hidden files
+            snprintf(broadcast_msg, sizeof(broadcast_msg), "%s\n", entry->d_name);
+            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        }
+        closedir(dir);
+        return;
+    }
+    // cd command
+    if(strncmp(buffer, "cd ", 3) == 0) {
+        char new_dir[256];
+        snprintf(new_dir, sizeof(new_dir), "%s/%s", c->cwd, buffer+3);
+        // Remove trailing slashes/newlines
+        new_dir[strcspn(new_dir, "\r\n ")] = 0;
+        DIR *dir = opendir(new_dir);
+        if (!dir) {
+            snprintf(broadcast_msg, sizeof(broadcast_msg), "Directory does not exist: %s\n", new_dir);
+            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+            return;
+        }
+        closedir(dir);
+        // Check access
+        char *folderName = strrchr(new_dir, '/');
+        folderName = folderName ? folderName+1 : new_dir;
+        if(!isAccessible(c, folderName, 'r', client_socket)) return;
+        strncpy(c->cwd, new_dir, sizeof(c->cwd)-1);
+        c->cwd[sizeof(c->cwd)-1] = '\0';
+        snprintf(broadcast_msg, sizeof(broadcast_msg), "Changed directory to %s\n", c->cwd);
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        return;
+    }
+    // touch command
+    if(strncmp(buffer, "touch ", 6) == 0) {
+        if(!isAccessible(c, c->cwd, 'w', client_socket)) return;
+        char file_path[512];
+        snprintf(file_path, sizeof(file_path), "%s/%s", c->cwd, buffer+6);
+        // Remove trailing slashes/newlines
+        file_path[strcspn(file_path, "\r\n ")] = 0;
+        FILE *f = fopen(file_path, "w");
+        if (!f) {
+            snprintf(broadcast_msg, sizeof(broadcast_msg), "Failed to create file: %s\n", file_path);
+            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+            return;
+        }
+        fclose(f);
+        snprintf(broadcast_msg, sizeof(broadcast_msg), "File created: %s\n", file_path);
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        return;
+    }
+    // pwd command
+    if(strncmp(buffer, "pwd", 3) == 0) {
+        snprintf(broadcast_msg, sizeof(broadcast_msg), "%s\n", c->cwd);
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        return;
+    }
+}
+
 // Function to handle individual authenticated client
 void* handle_authenticated_client(void* arg) {
     int client_socket = *(int*)arg;
     free(arg); // Free the allocated memory for the index
     
-    //client_t *c = find_client_by_socket(client_socket);
-    
     char buffer[BUFFER_SIZE];
+    client_t *c = find_client_by_socket(client_socket);
     char broadcast_msg[BUFFER_SIZE];
     
     // Send welcome message and instructions
@@ -172,12 +447,12 @@ void* handle_authenticated_client(void* arg) {
              "  /list - Show connected users\n"
              "  /help - Show this help\n"
              "  /quit - Leave the chat\n"
+             "  /file - Enter file mode\n"
              "Type your messages to chat with everyone!\n\n", 
              PROGRAM_NAME);
     send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
     
     // Announce new user to everyone
-    client_t *c = find_client_by_socket(client_socket);
     snprintf(broadcast_msg, sizeof(broadcast_msg), 
              "%s joined the chat", c->nickname);
     broadcast_message(broadcast_msg, client_socket);
@@ -187,7 +462,7 @@ void* handle_authenticated_client(void* arg) {
         int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
         if (bytes_received <= 0) {
             client_t *c = find_client_by_socket(client_socket);
-            printf("Client %s disconnected\n", c->nickname);
+            printf("Client %s disconnected\n", c ? c->nickname : "(unknown)");
             break;
         }
         
@@ -201,100 +476,27 @@ void* handle_authenticated_client(void* arg) {
         
         // Check if session is still valid
         c = find_client_by_socket(client_socket);
+        if (!c){
+            printf("Client %d not valid\n", client_socket);
+            break;
+        }
         if (!is_authenticated(c->account_id)) {
             snprintf(broadcast_msg, sizeof(broadcast_msg), 
                      "Session expired. Please reconnect and authenticate again.\n");
             send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
             break;
         }
-        
-        // Handle quit command
+        // Handle quit command(universal quit command)
         if (strcmp(buffer, "/quit") == 0) {
             snprintf(broadcast_msg, sizeof(broadcast_msg), "Goodbye! You have left the chat.\n");
             send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
             break;
         }
-        
-        // Handle nickname change
-        if (strncmp(buffer, "/nick ", 6) == 0) {
-            printf("[DEBUG] Handling /nick command from socket %d\n", client_socket);
-            char new_nick[32];
-            memset(new_nick, 0, sizeof(new_nick)); // Clear buffer
-            strncpy(new_nick, buffer + 6, sizeof(new_nick) - 1);
-            new_nick[sizeof(new_nick) - 1] = '\0'; // Ensure null-termination
-            // Remove trailing whitespace/newlines
-            new_nick[strcspn(new_nick, "\r\n ")] = 0;
-
-            // Validate nickname
-            if (strlen(new_nick) == 0) {
-                snprintf(broadcast_msg, sizeof(broadcast_msg), 
-                         "Invalid nickname. Usage: /nick <name>\n");
-                send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-                continue;
-            }
-            
-            // Check if nickname is already taken
-            if (find_client_by_nickname(new_nick)) {
-                snprintf(broadcast_msg, sizeof(broadcast_msg), 
-                         "Nickname '%s' is already taken. Choose a different one.\n", new_nick);
-                send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-                continue;
-            }
-            
-            char old_nick[32];
-            pthread_mutex_lock(&clients_mutex);
-            strncpy(old_nick, c->nickname, sizeof(old_nick) - 1);
-            strncpy(c->nickname, new_nick, sizeof(c->nickname) - 1);
-            c->nickname[sizeof(c->nickname) - 1] = '\0';
-            pthread_mutex_unlock(&clients_mutex);
-            
-            snprintf(broadcast_msg, sizeof(broadcast_msg), 
-                     "Nickname changed to '%s'\n", new_nick);
-            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-            
-            snprintf(broadcast_msg, sizeof(broadcast_msg), 
-                     "%s is now known as %s", old_nick, new_nick);
-            broadcast_message(broadcast_msg, client_socket);
-            continue;
-        }
-        
-        // Handle list command
-        if (strcmp(buffer, "/list") == 0) {
-            printf("[DEBUG] Handling /list command from socket %d\n", client_socket);
-            get_client_list(broadcast_msg, sizeof(broadcast_msg));
-            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-            continue;
-        }
-        
-        // Handle help command
-        if (strcmp(buffer, "/help") == 0) {
-            snprintf(broadcast_msg, sizeof(broadcast_msg),
-                     "Chat Commands:\n"
-                     "  /nick <name> - Change your nickname\n"
-                     "  /list - Show connected users\n"
-                     "  /help - Show this help\n"
-                     "  /quit - Leave the chat\n"
-                     "Just type any message to chat with everyone!\n");
-            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-            continue;
-        }
-        
-        // Handle commands that start with / but aren't recognized
-        if (buffer[0] == '/') {
-            snprintf(broadcast_msg, sizeof(broadcast_msg), 
-                     "Unknown command. Type /help for available commands.\n");
-            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-            continue;
-        }
-        
-        // Regular chat message - broadcast to everyone
-        if (strlen(buffer) > 0) {
-            snprintf(broadcast_msg, sizeof(broadcast_msg), 
-                     "%s: %s", c->nickname, buffer);
-            broadcast_message(broadcast_msg, client_socket);
-            
-            // Log the message
-            printf("CHAT [%s] %s: %s\n", c->username, c->nickname, buffer);
+        // Dispatch based on mode
+        if (c->mode == CLIENT_MODE_CHAT) {
+            handle_chat_mode(c, buffer, client_socket);
+        } else if (c->mode == CLIENT_MODE_FILE) {
+            handle_file_mode(c, buffer, client_socket);
         }
     }
     
@@ -585,11 +787,14 @@ void* handle_new_connection(void* arg) {
                         new_client->active = 1;
                         new_client->connect_time = time(NULL);
                         new_client->account_id = account_id;
-                        
+                        new_client->mode = CLIENT_MODE_CHAT; // Initialize mode
+                        new_client->permLevel = find_user(account_id)->authLevel;
                         // Set username and initial nickname
                         strncpy(new_client->username, username, MAX_USERNAME_LEN - 1);
                         new_client->username[MAX_USERNAME_LEN - 1] = '\0';
                         snprintf(new_client->nickname, sizeof(new_client->nickname), "%s", username);
+                        strncpy(new_client->cwd, "UserDirectory", sizeof(new_client->cwd)-1);
+                        new_client->cwd[sizeof(new_client->cwd)-1] = '\0';
                         
                         add_authenticated_client(new_client);
                         
@@ -626,6 +831,8 @@ void* handle_new_connection(void* arg) {
     close(client_socket);
     return NULL;
 }
+
+
 
 // Function to broadcast shutdown message to all authenticated clients
 void broadcast_shutdown_message(void) {

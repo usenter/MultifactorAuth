@@ -249,6 +249,13 @@ void cleanup_rsa_keys(void) {
     }
 }
 
+//function for file handling mode
+int file_handling(const char* username){
+    printf("File handling for user %s\n", username);
+    return 1;
+
+}
+
 // Authentication is now handled by users typing /login commands directly
 
 // Function to receive messages from server (chat mode)
@@ -365,7 +372,7 @@ void cleanup_client_resources(int client_socket) {
 }
 
 // Function to handle secure chat client
-int client_mode(int client_socket) {
+int client_mode(int client_socket, const char* username) {
     char buffer[BUFFER_SIZE];
     pthread_t receive_thread;
 
@@ -449,6 +456,9 @@ int client_mode(int client_socket) {
             }
         }
         if (authenticated) {
+            if(strncmp(buffer, "/file", 5) == 0){
+                file_handling(username);
+            }
             printf("> ");
         } else {
             printf("auth> ");
@@ -624,7 +634,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     // Run secure chat client
-    if(client_mode(sock)){
+    if(client_mode(sock, username)){
         close(sock);
         return 1;
     }

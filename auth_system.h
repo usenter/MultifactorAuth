@@ -38,8 +38,8 @@
 #endif
 
 
-enum authorityLevel {
-    OWNER,
+enum authLevel {
+    SUPER_ADMIN,
     ADMIN,
     USER
 };
@@ -54,7 +54,7 @@ typedef struct {
     char* email;
     char* address;
     char* phone_number;
-    enum authorityLevel authorityLevel;
+    enum authLevel authLevel;
     UT_hash_handle hh;
 } user_t;
 
