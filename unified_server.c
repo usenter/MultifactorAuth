@@ -25,6 +25,7 @@
 #define MAX_CLIENT_THREADS 1024
 pthread_t client_threads[MAX_CLIENT_THREADS];
 int client_thread_count = 0;
+int overrideBroadcast = 0; // when true, messages are broadcast to all clients, not just chat mode clients
 
 // Client structure and mode definitions are now in fileOperations.h
 
@@ -89,7 +90,7 @@ void broadcast_message(const char* message, int sender_socket) {
     pthread_mutex_lock(&clients_mutex);
     client_t *c, *tmp;
     HASH_ITER(hh, clients_map, c, tmp) {
-        if (c->active && c->socket != sender_socket) {
+        if ((c->active && c->socket != sender_socket) && (c->mode == CLIENT_MODE_CHAT || overrideBroadcast)) {
             //printf("[DEBUG] Broadcasting to socket %d: %s\n", c->socket, message_with_newline);
             if (send(c->socket, message_with_newline, strlen(message_with_newline), 0) < 0) {
                 //printf("[DEBUG] WARNING: Failed to send to socket %d\n", c->socket);
@@ -116,7 +117,9 @@ void remove_client(int client_socket) {
         int departing_socket = c->socket;
         c->active = 0; // Mark as inactive to exclude from broadcast
         pthread_mutex_unlock(&clients_mutex);
+        overrideBroadcast = 1;
         broadcast_message(departure_msg, departing_socket);
+        overrideBroadcast = 0;
         pthread_mutex_lock(&clients_mutex);
         close(departing_socket);
         HASH_DEL(clients_map, c);

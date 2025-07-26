@@ -41,8 +41,14 @@ typedef struct client {
 
 // File operation function declarations
 void handle_file_mode(client_t *c, char *buffer, int client_socket);
-
+void handle_ls_command(client_t *c, char *buffer, int client_socket);
+void handle_cd_command(client_t *c, char *buffer, int client_socket);
+void handle_touch_command(client_t *c, char *buffer, int client_socket);
+void handle_rm_command(client_t *c, char *buffer, int client_socket);
+void handle_rmdir_command(client_t *c, char *buffer, int client_socket);
+void handle_mkdir_command(client_t *c, char *buffer, int client_socket);
+void handle_cat_command(client_t *c, char *buffer, int client_socket);
 // Utility functions
-int isAccessible(client_t *c, char *folderName, char mode, int client_socket);
+int isAccessible(client_t *c, char *fullPath, char mode, int client_socket);
 
 #endif // FILE_OPERATIONS_H 

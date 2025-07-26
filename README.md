@@ -31,10 +31,10 @@ make all
 ```
 
 ### 2. Create User Database
-Create `users.txt` with format `accountID:username:password:email:address:phone number` (one per line):
+Create `users.txt` with format `accountID:username:password:email:address:phone number:authorityGroup(integer from 0-9)` (one per line):
 ```
-1:alice:password123:alice@email.com:address1:phone#
-2:bob:secretpass:bob@email.com:address2:phone#
+1:alice:password123:alice@email.com:address1:phone#:9
+2:bob:secretpass:bob@email.com:address2:phone#:4
 ```
 
 Encrypt it:
@@ -76,8 +76,16 @@ auth> /register newuser newpassword
 ```
 > /nick <name>        # Change nickname
 > /list               # Show connected users
-> /quit               # Leave chat
+> /quit               # End program
+> /file               # Enter file handling mode
 > Hello everyone!     # Send message
+```
+
+### File commands
+```
+> /help               # Lists usable file commands(like ls, cd, touch)
+> /chat               # Switch back to chat mode
+> /quit               # kill program
 ```
 
 ## Requirements
