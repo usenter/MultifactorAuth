@@ -1,1 +1,1 @@
-any file in this directory can be accessed by a user
+any file in this directory can be accessed by a user, lowest level users cannot write to it though.

@@ -20,6 +20,7 @@
 #define MAX_EMAIL_LEN 64
 #define MAX_ADDRESS_LEN 64
 #define MAX_PHONE_NUMBER_LEN 12
+#define numAuths 10
 
 // RSA Authentication constants
 #define RSA_KEY_SIZE 2048
@@ -38,11 +39,7 @@
 #endif
 
 
-enum authLevel {
-    SUPER_ADMIN,
-    ADMIN,
-    USER
-};
+
 
 // User structure
 typedef struct {
@@ -54,7 +51,7 @@ typedef struct {
     char* email;
     char* address;
     char* phone_number;
-    enum authLevel authLevel;
+    int authLevel;
     UT_hash_handle hh;
 } user_t;
 

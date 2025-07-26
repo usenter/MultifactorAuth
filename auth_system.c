@@ -15,6 +15,7 @@ username_t *username_map = NULL;
 
 static int user_count = 0;
 static int session_count = 0;
+ // number of divisions for permissions
 
 // RSA Authentication global variables
 static rsa_keypair_t server_keys = {NULL, NULL};
@@ -375,6 +376,8 @@ username_t* find_username(const char* username) {
     return found;
 }
 
+
+
 int load_users_from_encrypted_file(const char* encrypted_filename, const char* key) {
     printf("Loading users from encrypted file: %s\n", encrypted_filename);
     
@@ -392,11 +395,13 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
     unsigned int account_id;
     char username[MAX_USERNAME_LEN];
     char password[MAX_PASSWORD_LEN];  // Plaintext password from decrypted data
-    char pubkey_path[MAX_FILE_PATH_LEN];  // Path to public key file
     char email[MAX_EMAIL_LEN];
     char address[MAX_ADDRESS_LEN];
     char phone_number[MAX_PHONE_NUMBER_LEN];
-    enum authLevel authLevel;
+    //format for permString is:
+    //auth0 auth1 auth2 auth3 auth4 auth5 auth6 auth7 auth8 auth9 '\0'
+    // 0     0     0     0     0     0     0     0     0     0    
+    int auth; // the auth level of the user is the index of the perm string we need to look at 
     int loaded_count = 0;
     
     // Parse decrypted data line by line
@@ -414,8 +419,8 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
         
         // Parse id:username:password:pubkey_path:email:address:phone_number format
         char email[128], address[128], phone_number[12];
-        if (sscanf(line_start, "%u:%31[^:]:%63[^:]:%511[^:]:%127[^:]:%127[^:]:%11[^:]:%u[^:]",
-                   &account_id, username, password, pubkey_path, email, address, phone_number, &authLevel) == 8) {
+        if (sscanf(line_start, "%u:%31[^:]:%63[^:]:%127[^:]:%127[^:]:%11[^:]:%1d[^:]",
+                   &account_id, username, password, email, address, phone_number, &auth) == 7) {
             user_t *new_user = malloc(sizeof(user_t));
             username_t *new_username = malloc(sizeof(username_t));
             if (!new_user) {
@@ -428,16 +433,6 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
                 free(new_user);
                 continue;
             }
-
-            // Load public key
-            //new_user->public_key = load_public_key(pubkey_path);
-            /*if (!new_user->public_key) {
-                printf("Failed to load public key for user %s from %s\n", username, pubkey_path);
-                free(new_user);
-                free(new_username);
-                continue;
-            }*/
-
             //stores the username as a tie to the account_id
             new_username->account_id = account_id;
             new_user->account_id = account_id;
@@ -452,7 +447,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
             new_user->address = strdup(address);
             new_user->phone_number = strdup(phone_number);
             new_user->active = 1;
-            new_user->authLevel = authLevel;    
+            new_user->authLevel = auth;
             // Check if user already exists
             if (find_user(account_id) == NULL && find_username(username) == NULL) {
                 HASH_ADD_INT(user_map, account_id, new_user);
@@ -461,7 +456,6 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
                 user_count++;
             } else {
                 printf("Skipping duplicate account ID: %u\n", account_id);
-                //EVP_PKEY_free(new_user->public_key);
                 free(new_user->email);
                 free(new_user->address);
                 free(new_user->phone_number);
@@ -484,17 +478,11 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
     // Handle last line if it doesn't end with newline
     if (line_start < data + decrypt_result.size && user_count < MAX_USERS) {
         char email[128], address[128], phone_number[12];
-        if (sscanf(line_start, "%u:%31[^:]:%63[^:]:%511[^:]:%127[^:]:%127[^:]:%11[^:]:%u[^:]",
-                   &account_id, username, password, pubkey_path, email, address, phone_number, &authLevel) == 8) {
+        if (sscanf(line_start, "%u:%31[^:]:%63[^:]:%127[^:]:%127[^:]:%11[^:]:%1d[^:]",
+                   &account_id, username, password, email, address, phone_number, &auth) == 7) {
             user_t *new_user = malloc(sizeof(user_t));
             username_t *new_username = malloc(sizeof(username_t));
             if (new_user && new_username) {
-                //new_user->public_key = load_public_key(pubkey_path);
-                /*if (!new_user->public_key) {
-                    printf("Failed to load public key for user %s from %s\n", username, pubkey_path);
-                    free(new_user);
-                    free(new_username);
-                } else {*/
                 new_user->account_id = account_id;
                 strncpy(new_user->username, username, MAX_USERNAME_LEN - 1);
                 new_user->username[MAX_USERNAME_LEN - 1] = '\0';
@@ -507,7 +495,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
                 new_user->address = strdup(address);
                 new_user->phone_number = strdup(phone_number);
                 new_user->active = 1;
-                new_user->authLevel = authLevel;  
+                new_user->authLevel = auth;
                 if (find_user(account_id) == NULL && find_username(username) == NULL) {
                     HASH_ADD_INT(user_map, account_id, new_user);
                     HASH_ADD_STR(username_map, username, new_username);
@@ -515,7 +503,6 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
                     user_count++;
                 } else {
                     printf("Skipping duplicate user ID: %u\n", account_id);
-                    //EVP_PKEY_free(new_user->public_key);
                     free(new_user->email);
                     free(new_user->address);
                     free(new_user->phone_number);
@@ -523,7 +510,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
                     free(new_username->username);
                     free(new_username);
                 }
-                //}
+               
                 memset(password, 0, sizeof(password));
             }
         }
@@ -1024,7 +1011,6 @@ void cleanup_rsa_system(void) {
 
 // Clean up auth system resources
 void cleanup_auth_system(void) {
-    printf("Cleaning up user map\n");
     if (user_map) {
         user_t *current, *temp;
         HASH_ITER(hh, user_map, current, temp) {
@@ -1036,7 +1022,6 @@ void cleanup_auth_system(void) {
             free(current);
         }
     }
-    printf("Cleaning up username map\n");
     if (username_map) {
         username_t *current, *temp;
         HASH_ITER(hh, username_map, current, temp) {
@@ -1045,7 +1030,6 @@ void cleanup_auth_system(void) {
             free(current);
         }
     }
-    printf("Cleaning up session map\n");
     if (session_map) {
         session_t *current, *temp;
         HASH_ITER(hh, session_map, current, temp) {

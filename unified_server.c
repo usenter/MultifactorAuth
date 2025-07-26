@@ -11,7 +11,7 @@
 #include "hashmap/uthash.h"
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
-#include <dirent.h> // Required for ls, cd, and touch commands
+#include "fileOperations.h" // File mode operations
 
 #define PORT 12345
 #define BUFFER_SIZE 1024
@@ -26,25 +26,7 @@
 pthread_t client_threads[MAX_CLIENT_THREADS];
 int client_thread_count = 0;
 
-typedef enum {
-    CLIENT_MODE_CHAT,
-    CLIENT_MODE_FILE
-} client_mode_t;
-
-// Structure to hold authenticated client information
-typedef struct client {
-    int socket;
-    struct sockaddr_in addr;
-    char nickname[32];
-    char username[MAX_USERNAME_LEN];
-    unsigned int account_id;
-    int permLevel;
-    int active;
-    time_t connect_time;
-    client_mode_t mode;
-    char cwd[256]; // Current working directory for file mode
-    UT_hash_handle hh; // For uthash
-} client_t;
+// Client structure and mode definitions are now in fileOperations.h
 
 // Global variables
 client_t *clients_map = NULL; // Hashmap root
@@ -259,176 +241,10 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
 }
 //checks a given folder's permissions and returns 1 if the user has access, 0 otherwise
 // mode is either 'r' or 'w'
-int isAccessible(client_t *c, char *folderName, char mode, int client_socket){
-    char* filePath = malloc(1024);
-    snprintf(filePath, 1024, "UserDirectory/%s/.perms", folderName);
-    FILE* permsFile = fopen(filePath, "r");
-    if(permsFile == NULL){
-        printf("Permissions file not found for %s\n", folderName);
-        return 0;
-    }
-    char readPerm[32], writePerm[32];
-    fscanf(permsFile, "read: %31s\nwrite: %31s", readPerm, writePerm);
-    fclose(permsFile);
-    int readPermLevel = 2;
-    int writePermLevel = 2;
-    if(strcmp(readPerm, "user") == 0){
-        readPermLevel = 2; // any one less than level 2 can read
-    } else if(strcmp(readPerm, "admin") == 0){
-        readPermLevel = 1; // any one less than level 1 can read
-    } else if(strcmp(readPerm, "superadmin") == 0){
-        readPermLevel = 0; // superadmin can read
-    }
-    if(strcmp(writePerm, "user") == 0){
-        writePermLevel = 2; // any one less than level 2 can write
-    } else if(strcmp(writePerm, "admin") == 0){
-        writePermLevel = 1; // any one less than level 1 can write
-    } else if(strcmp(writePerm, "superadmin") == 0){
-        writePermLevel = 0; // superadmin can write
-    } 
-    if(mode == 'r'){
-        if(c->permLevel <= readPermLevel){
-            return 1;
-        }
-        else{
-            char broadcast_msg[BUFFER_SIZE];
-            snprintf(broadcast_msg, sizeof(broadcast_msg), "You do not have permission to read this file/access this directory\n");
-            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-            return 0;
-        }
-    } else if(mode == 'w'){
-        if(c->permLevel <= writePermLevel){
-            return 1;
-        }
-        else{
-            char broadcast_msg[BUFFER_SIZE];
-            snprintf(broadcast_msg, sizeof(broadcast_msg), "You do not have permission to write to this file/access this directory\n");
-            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-            return 0;
-        }
-    }
-    return 0;   
-}
+// Permission checking is now in fileOperations.c
 
 
-void handle_file_mode(client_t *c, char *buffer, int client_socket){
-    char broadcast_msg[BUFFER_SIZE];
-    if(strncmp(buffer, "/end", 5) == 0){
-        c->mode = CLIENT_MODE_CHAT;
-        snprintf(broadcast_msg, sizeof(broadcast_msg), "File mode ended, returning to chat mode\n");
-        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-        return;
-    }
-    if(strncmp(buffer, "/help", 5) == 0){
-        char* userPermName = "user";
-        if(c->permLevel == SUPER_ADMIN){
-            userPermName = "superadmin";
-        } else if(c->permLevel == ADMIN){
-            userPermName = "admin";
-        }
-        snprintf(broadcast_msg, sizeof(broadcast_msg), "File mode commands work similar to a terminal. The following commands are available:\n"
-                 "  ls - List files in the current directory\n"
-                 "  cd <directory> - Change to a different directory\n"
-                 "  pwd - Show the current working directory\n"
-                 "  cat <file> - Display the contents of a file\n"
-                 "  touch <file> - Create a new file\n"
-                 "  rm <file> - Delete a file\n"
-                 "  mkdir <directory> - Create a new directory\n"
-                 "  rmdir <directory> - Delete a directory\n"
-                 "  /help - Show this help\n"
-                 "  /end - End file mode and return to chat mode\n"
-                 "  /quit - kill the overall program\n"
-                "Note that the file mode is not a full terminal, so some commands may not work as expected.\n"
-                "Additionally, access to files is limited by the user's permissions.\n"
-                "Your permissions are: %s\n", userPermName);
-        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-        return;
-    }
-    if(strncmp(buffer, "/list", 5) == 0 || strncmp(buffer, "/nick", 5) == 0 || strncmp(buffer, "/file", 5) == 0){
-        snprintf(broadcast_msg, sizeof(broadcast_msg), "Chat mode commands are not available in file mode\n");
-        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-        buffer = "\0"; //clear buffer
-        return;
-    }
-    // ls command
-    if(strncmp(buffer, "ls", 2) == 0) {
-        printf("User %s is trying to list directory %s\n", c->username, c->cwd);
-        char *folderName = strrchr(c->cwd, '/'); //special handling for ls command
-        if (folderName) {
-            folderName = folderName + 1;
-        } else {
-            folderName = "."; // For root directory (UserDirectory)
-        }
-        printf("Checking permissions for %s\n", folderName);
-        if(!isAccessible(c, folderName, 'r', client_socket)){
-            printf("User %s does not have permission to read directory %s\n", c->username, c->cwd);
-            return;
-        }
-        DIR *dir = opendir(c->cwd);
-        if (!dir) {
-            snprintf(broadcast_msg, sizeof(broadcast_msg), "Could not open directory: %s\n", c->cwd);
-            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-            return;
-        }
-        struct dirent *entry;
-        snprintf(broadcast_msg, sizeof(broadcast_msg), "Contents of %s:\n", c->cwd);
-        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-        while ((entry = readdir(dir)) != NULL) {
-            if (entry->d_name[0] == '.') continue; // skip hidden files
-            snprintf(broadcast_msg, sizeof(broadcast_msg), "%s\n", entry->d_name);
-            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-        }
-        closedir(dir);
-        return;
-    }
-    // cd command
-    if(strncmp(buffer, "cd ", 3) == 0) {
-        char new_dir[256];
-        snprintf(new_dir, sizeof(new_dir), "%s/%s", c->cwd, buffer+3);
-        // Remove trailing slashes/newlines
-        new_dir[strcspn(new_dir, "\r\n ")] = 0;
-        DIR *dir = opendir(new_dir);
-        if (!dir) {
-            snprintf(broadcast_msg, sizeof(broadcast_msg), "Directory does not exist: %s\n", new_dir);
-            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-            return;
-        }
-        closedir(dir);
-        // Check access
-        char *folderName = strrchr(new_dir, '/');
-        folderName = folderName ? folderName+1 : new_dir;
-        if(!isAccessible(c, folderName, 'r', client_socket)) return;
-        strncpy(c->cwd, new_dir, sizeof(c->cwd)-1);
-        c->cwd[sizeof(c->cwd)-1] = '\0';
-        snprintf(broadcast_msg, sizeof(broadcast_msg), "Changed directory to %s\n", c->cwd);
-        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-        return;
-    }
-    // touch command
-    if(strncmp(buffer, "touch ", 6) == 0) {
-        if(!isAccessible(c, c->cwd, 'w', client_socket)) return;
-        char file_path[512];
-        snprintf(file_path, sizeof(file_path), "%s/%s", c->cwd, buffer+6);
-        // Remove trailing slashes/newlines
-        file_path[strcspn(file_path, "\r\n ")] = 0;
-        FILE *f = fopen(file_path, "w");
-        if (!f) {
-            snprintf(broadcast_msg, sizeof(broadcast_msg), "Failed to create file: %s\n", file_path);
-            send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-            return;
-        }
-        fclose(f);
-        snprintf(broadcast_msg, sizeof(broadcast_msg), "File created: %s\n", file_path);
-        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-        return;
-    }
-    // pwd command
-    if(strncmp(buffer, "pwd", 3) == 0) {
-        snprintf(broadcast_msg, sizeof(broadcast_msg), "%s\n", c->cwd);
-        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
-        return;
-    }
-}
+// File mode handling is now in fileOperations.c
 
 // Function to handle individual authenticated client
 void* handle_authenticated_client(void* arg) {
@@ -498,6 +314,7 @@ void* handle_authenticated_client(void* arg) {
         } else if (c->mode == CLIENT_MODE_FILE) {
             handle_file_mode(c, buffer, client_socket);
         }
+        
     }
     
     // Clean up session and remove client
@@ -788,7 +605,7 @@ void* handle_new_connection(void* arg) {
                         new_client->connect_time = time(NULL);
                         new_client->account_id = account_id;
                         new_client->mode = CLIENT_MODE_CHAT; // Initialize mode
-                        new_client->permLevel = find_user(account_id)->authLevel;
+                        new_client->authLevel = find_user(account_id)->authLevel;
                         // Set username and initial nickname
                         strncpy(new_client->username, username, MAX_USERNAME_LEN - 1);
                         new_client->username[MAX_USERNAME_LEN - 1] = '\0';
@@ -1042,19 +859,19 @@ int main(int argc, char *argv[]) {
     pthread_mutex_lock(&clients_mutex);
     client_t *c, *tmp;
     HASH_ITER(hh, clients_map, c, tmp) {
-        printf("Closing client socket %s\n", c->nickname);
+        //printf("Closing client socket %s\n", c->nickname);
         close(c->socket); // This will unblock recv() in handler threads
     }
     pthread_mutex_unlock(&clients_mutex);
 
-    printf("Joining all client handler threads\n");
+    //printf("Joining all client handler threads\n");
     // Now join all client handler threads
     for (int i = client_thread_count-1; i >= 0; i--) {
-        printf("Joining client handler thread %d\n", i);
+        //printf("Joining client handler thread %d\n", i);
         pthread_join(client_threads[i], NULL);
     }
 
-    printf("Safely freeing all remaining clients\n");
+    printf("Freeing remaining clients\n");
     // Now, safely free all remaining clients
     pthread_mutex_lock(&clients_mutex);
     HASH_ITER(hh, clients_map, c, tmp) {
@@ -1062,14 +879,12 @@ int main(int argc, char *argv[]) {
         free(c);
     }
     pthread_mutex_unlock(&clients_mutex);
-    printf("Cleaning up RSA system\n");
+
     // Cleanup and shutdown
     close(server_socket);
-    printf("Server socket closed\n");
     cleanup_server();
-    printf("Cleaning up authentication system\n");
     cleanup_auth_system(); // Clean up authentication system hashmaps
-    
+    pthread_mutex_destroy(&clients_mutex);
     printf("%s shutdown complete\n", PROGRAM_NAME);
     return 0;
 } 

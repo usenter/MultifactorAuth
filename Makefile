@@ -4,7 +4,7 @@ CFLAGS = -Wall -Wextra -std=c17 -pthread -D_POSIX_C_SOURCE=200809L
 LIBS = -lssl -lcrypto
 
 # Object files
-OBJS = encryptionTools.o auth_system.o 
+OBJS = encryptionTools.o auth_system.o fileOperations.o 
 
 # Targets
 all: unified_server unified_client encryptionTools_test user_encryptor generate_rsa_keys
@@ -14,6 +14,9 @@ encryptionTools.o: decryptionFunctions/encryptionTools.c decryptionFunctions/enc
 	$(CC) $(CFLAGS) -c $< -o $@
 
 auth_system.o: auth_system.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+fileOperations.o: fileOperations.c fileOperations.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 

@@ -1,2 +1,2 @@
-read: user
-write: admin 
+read:  1111111111
+write: 0111111111 
