@@ -32,69 +32,6 @@ void hash_password(const char* password, char* hash) {
     
     sprintf(hash, "%08lx", hash_val);
 }
-/*
-int user_compare(const void *a, const void *b, void* udata) {
-    const user_t *ua = a;
-    const user_t *ub = b;
-    return strcmp(ua->username, ub->username);
-}
-
-bool user_iter(const void *item, void* udata) {
-    const user_t *user = item;
-    printf("%s\n", user->username);
-    return true;
-}
-
-uint64_t user_hash(const void *item, uint64_t seed0, uint64_t seed1) {
-    const user_t *user = item;
-    return hashmap_sip(user->username, strlen(user->username), seed0, seed1);
-}
-
-// Hashmap functions for client key entries
-int client_key_compare(const void *a, const void *b, void* udata) {
-    const client_key_entry_t *ca = a;
-    const client_key_entry_t *cb = b;
-    return strcmp(ca->client_id, cb->client_id);
-}
-
-uint64_t client_key_hash(const void *item, uint64_t seed0, uint64_t seed1) {
-    const client_key_entry_t *entry = item;
-    return hashmap_sip(entry->client_id, strlen(entry->client_id), seed0, seed1);
-}*/
-
-
-
-/*
-// Hashmap functions for sessions
-int session_compare(const void *a, const void *b, void* udata) {
-    const session_t *sa = a;
-    const session_t *sb = b;
-    return sa->client_socket - sb->client_socket;
-}
-
-uint64_t session_hash(const void *item, uint64_t seed0, uint64_t seed1) {
-    const session_t *session = item;
-    return hashmap_sip(&session->client_socket, sizeof(session->client_socket), seed0, seed1);
-}
-    */
-/*
-// Create a session for lookup
-session_t create_session_lookup(int client_socket) {
-    session_t session;
-    memset(&session, 0, sizeof(session));
-    session.client_socket = client_socket;
-    return session;
-}
-
-// Constructor: create a user_t with just a username (for lookups)
-user_t create_user(const char* username) {
-    user_t user;
-    strncpy(user.username, username, MAX_USERNAME_LEN - 1);
-    user.username[MAX_USERNAME_LEN - 1] = '\0';
-    user.password_hash[0] = '\0';  // Empty password hash
-    user.active = 0;               // Default to inactive
-    return user;
-}*/
 // Verify password against hash
 int verify_password(const char* password, const char* hash) {
     char computed_hash[MAX_HASH_LEN];

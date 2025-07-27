@@ -15,7 +15,7 @@
 
 // Buffer size for file operations
 #define BUFFER_SIZE 1024
-
+#define MAX_DIRECTORIES 1000
 
 
 // Client mode enumeration
