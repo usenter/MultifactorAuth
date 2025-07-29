@@ -125,6 +125,8 @@ void remove_session(int account_id);
 int update_session(int account_id, const session_t* updated_session);
 int is_authenticated(int account_id);
 void cleanup_expired_sessions(void);
+void cleanup_session(session_t *session);
+void cleanup_user(user_t *user);
 void hash_password(const char* password, char* hash);
 int verify_password(const char* password, const char* hash);
 void save_users_to_file(const char* filename);

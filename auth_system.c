@@ -12,6 +12,11 @@
 user_t *user_map = NULL;
 session_t *session_map = NULL;  // Maps account_id -> session_t
 username_t *username_map = NULL;
+pthread_mutex_t user_map_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t session_map_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t username_map_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t rsa_system_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 
 static int user_count = 0;
 static int session_count = 0;
@@ -40,17 +45,6 @@ int verify_password(const char* password, const char* hash) {
     return strcmp(computed_hash, hash) == 0;
 }
 
-// Initialize authentication system - deprecated
-/*void init_auth_system(void) {
-    users = hashmap_new(sizeof(user_t), 0, 0, 0, user_hash, user_compare, NULL, NULL);
-
-    user_count = 0;
-    session_count = 0;
-    
-    load_users_from_file("users.txt");
-    
-}*/
-
 int init_encrypted_auth_system(char* userFile, char* key) {
     user_map = NULL;
     session_map = NULL;
@@ -78,12 +72,18 @@ int add_user(int account_id, const char* username, const char* password) {
         printf("User count is at the maximum\n");
         return 0; // No space
     }
+    pthread_mutex_lock(&user_map_mutex);
     if(find_user(account_id) == NULL) {
         HASH_ADD_INT(user_map, account_id, user);
         user_count++;
+        pthread_mutex_unlock(&user_map_mutex);
     }
+    
+
     else{
+        pthread_mutex_unlock(&user_map_mutex);
         printf("User already exists\n");
+        cleanup_user(user);
         return 0;
     }   
 
@@ -93,7 +93,9 @@ int add_user(int account_id, const char* username, const char* password) {
 
 user_t* find_user(int account_id) {
     user_t *user = NULL;
+   
     HASH_FIND_INT(user_map, &account_id, user);
+    
     return user;
 }
 
@@ -112,7 +114,9 @@ int authenticate_user(const char* username, const char* password, int account_id
    
     
     user_t *found_ptr = NULL;
+    pthread_mutex_lock(&user_map_mutex);
     HASH_FIND_INT(user_map, &account_id, found_ptr);
+    pthread_mutex_unlock(&user_map_mutex);
     if (found_ptr != NULL) {
         if (found_ptr->active) {
             // Check that the username matches the account_id's username
@@ -130,7 +134,9 @@ int authenticate_user(const char* username, const char* password, int account_id
 // Create a new session
 int create_session(int account_id) {
     // Find the user first
+    pthread_mutex_lock(&user_map_mutex);
     user_t *user = find_user(account_id);
+    pthread_mutex_unlock(&user_map_mutex);
     if (!user) {
         printf("Cannot create session: user not found\n");
         return 0;
@@ -138,7 +144,9 @@ int create_session(int account_id) {
        
     // Check if session already exists (from RSA phase)
     session_t *existing_session = NULL;
+    pthread_mutex_lock(&session_map_mutex);
     HASH_FIND_INT(session_map, &account_id, existing_session);
+    pthread_mutex_unlock(&session_map_mutex);
     if (existing_session) {
         // Update existing session
         existing_session->authenticated = 1;
@@ -163,7 +171,9 @@ int create_session(int account_id) {
     session->authenticated = 1;
     session->rsa_authenticated = 0;
     
+    pthread_mutex_lock(&session_map_mutex);
     HASH_ADD_INT(session_map, account_id, session);
+    pthread_mutex_unlock(&session_map_mutex);
     session_count++;
     
     return 1; // Success
@@ -176,11 +186,14 @@ void remove_session(int account_id) {
     }
     
     session_t *found = NULL;
+    pthread_mutex_lock(&session_map_mutex);
     HASH_FIND_INT(session_map, &account_id, found);
-    
+    pthread_mutex_unlock(&session_map_mutex);
     if (found && found->authenticated) {
+        pthread_mutex_lock(&session_map_mutex);
         HASH_DEL(session_map, found);
-        free(found);
+        pthread_mutex_unlock(&session_map_mutex);
+        cleanup_session(found);
         session_count--;
     }
 }
@@ -192,8 +205,9 @@ int update_session(int account_id, const session_t* updated_session) {
     }
     
     session_t *found = NULL;
+    pthread_mutex_lock(&session_map_mutex);
     HASH_FIND_INT(session_map, &account_id, found);
-    
+    pthread_mutex_unlock(&session_map_mutex);
     if (found) {
         found->login_time = updated_session->login_time;
         found->authenticated = updated_session->authenticated;
@@ -208,7 +222,9 @@ int update_session(int account_id, const session_t* updated_session) {
 // Check if a user is RSA authenticated
 int is_rsa_authenticated(int account_id) {
     session_t *session = NULL;
+    pthread_mutex_lock(&session_map_mutex);
     HASH_FIND_INT(session_map, &account_id, session);
+    pthread_mutex_unlock(&session_map_mutex);
     if (!session || !session->rsa_authenticated) {
         return 0;
     }
@@ -218,7 +234,9 @@ int is_rsa_authenticated(int account_id) {
 // Check if a user is authenticated
 int is_authenticated(int account_id) {
     session_t *session = NULL;
+    pthread_mutex_lock(&session_map_mutex);
     HASH_FIND_INT(session_map, &account_id, session);
+    pthread_mutex_unlock(&session_map_mutex);
     if (!session || !session->authenticated) {
         return 0;
     }
@@ -238,16 +256,14 @@ void cleanup_expired_sessions(void) {
         return; // Nothing to clean up
     }
     
-    
-    
     session_t *current, *temp;
+    pthread_mutex_lock(&session_map_mutex);
     HASH_ITER(hh, session_map, current, temp) {
        HASH_DEL(session_map, current);
-       free(current);
+       cleanup_session(current);
        session_count--;
     }
-    
-    
+    pthread_mutex_unlock(&session_map_mutex);
 }
 
 // Save users to file
@@ -386,20 +402,22 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
             new_user->active = 1;
             new_user->authLevel = auth;
             // Check if user already exists
+            pthread_mutex_lock(&user_map_mutex);
+            pthread_mutex_lock(&username_map_mutex);
             if (find_user(account_id) == NULL && find_username(username) == NULL) {
                 HASH_ADD_INT(user_map, account_id, new_user);
                 HASH_ADD_STR(username_map, username, new_username);
+                
                 loaded_count++;
                 user_count++;
             } else {
+               
                 printf("Skipping duplicate account ID: %u\n", account_id);
-                free(new_user->email);
-                free(new_user->address);
-                free(new_user->phone_number);
-                free(new_user);
-                free(new_username->username);
+                cleanup_user(new_user);
                 free(new_username);
             }
+            pthread_mutex_unlock(&username_map_mutex);
+            pthread_mutex_unlock(&user_map_mutex);
             
             // Clear the plaintext password from memory immediately
             memset(password, 0, sizeof(password));
@@ -433,21 +451,22 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
                 new_user->phone_number = strdup(phone_number);
                 new_user->active = 1;
                 new_user->authLevel = auth;
+                pthread_mutex_lock(&user_map_mutex);
+                pthread_mutex_lock(&username_map_mutex);
                 if (find_user(account_id) == NULL && find_username(username) == NULL) {
+                    
                     HASH_ADD_INT(user_map, account_id, new_user);
+                    
                     HASH_ADD_STR(username_map, username, new_username);
+                    
                     loaded_count++;
                     user_count++;
                 } else {
                     printf("Skipping duplicate user ID: %u\n", account_id);
-                    free(new_user->email);
-                    free(new_user->address);
-                    free(new_user->phone_number);
-                    free(new_user);
-                    free(new_username->username);
-                    free(new_username);
+                    cleanup_user(new_user);
                 }
-               
+                pthread_mutex_unlock(&user_map_mutex);
+                pthread_mutex_unlock(&username_map_mutex);
                 memset(password, 0, sizeof(password));
             }
         }
@@ -553,11 +572,13 @@ auth_result_t process_auth_command(const char* message, int account_id) {
 // RSA AUTHENTICATION IMPLEMENTATION
 // ================================
 
-// Get a user's public key by account_id
+/*// Get a user's public key by account_id
 EVP_PKEY* get_client_public_key(int account_id) {
+    pthread_mutex_lock(&user_map_mutex);
     user_t *user = find_user(account_id);
+    pthread_mutex_unlock(&user_map_mutex);
     return user ? user->public_key : NULL;
-}
+}*/
 
 // Initialize RSA system - now just verifies server keys
 int init_rsa_system(const char* server_private_key_file, const char* server_public_key_file) {
@@ -724,7 +745,9 @@ rsa_challenge_result_t start_rsa_challenge_for_client(int account_id, EVP_PKEY* 
         return result;
     }
     // Find the user
+    pthread_mutex_lock(&user_map_mutex);
     user_t *user = find_user(account_id);
+    pthread_mutex_unlock(&user_map_mutex);
     if (!user) {
         snprintf(result.response, sizeof(result.response), "%s No user found for account", RSA_AUTH_FAILED);
         return result;
@@ -738,7 +761,9 @@ rsa_challenge_result_t start_rsa_challenge_for_client(int account_id, EVP_PKEY* 
         return result;
     }
     session_t *session = NULL;
+    pthread_mutex_lock(&session_map_mutex);
     HASH_FIND_INT(session_map, &account_id, session);
+    pthread_mutex_unlock(&session_map_mutex);
     if (!session) {
         session = malloc(sizeof(session_t));
         memset(session, 0, sizeof(session_t));
@@ -749,13 +774,16 @@ rsa_challenge_result_t start_rsa_challenge_for_client(int account_id, EVP_PKEY* 
         session->rsa_authenticated = 0;
         // Store the client's public key in the session
         session->user->public_key = EVP_PKEY_dup(client_pubkey);
+        pthread_mutex_lock(&session_map_mutex);
         HASH_ADD_INT(session_map, account_id, session);
+        pthread_mutex_unlock(&session_map_mutex);
         session_count++;
         printf("[DEBUG] Created session for account %d and stored client_pubkey.\n", account_id);
     }
     // Generate random challenge
     if (RAND_bytes(session->challenge, RSA_CHALLENGE_SIZE) != 1) {
         snprintf(result.response, sizeof(result.response), "%s Failed to generate challenge", RSA_AUTH_FAILED);
+        cleanup_session(session);
         return result;
     }
     // Use the provided public key for encryption
@@ -763,6 +791,7 @@ rsa_challenge_result_t start_rsa_challenge_for_client(int account_id, EVP_PKEY* 
     if (!ctx || EVP_PKEY_encrypt_init(ctx) <= 0 || EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0) {
         if (ctx) EVP_PKEY_CTX_free(ctx);
         snprintf(result.response, sizeof(result.response), "%s Failed to setup encryption", RSA_AUTH_FAILED);
+        cleanup_session(session);
         return result;
     }
     size_t outlen = MAX_RSA_ENCRYPTED_SIZE;
@@ -792,7 +821,9 @@ rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* 
     
     printf("RSA system initialized and server private key loaded.\n");
     // Find session
+    pthread_mutex_lock(&user_map_mutex);
     user_t *user = find_user(account_id);
+    pthread_mutex_unlock(&user_map_mutex);
     if (!user) {
         snprintf(result.response, sizeof(result.response), 
                 "%s No user for account %d", RSA_AUTH_FAILED, account_id);
@@ -801,7 +832,9 @@ rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* 
     }
     
     session_t *session = NULL;
+    pthread_mutex_lock(&session_map_mutex);
     HASH_FIND_INT(session_map, &account_id, session);
+    pthread_mutex_unlock(&session_map_mutex);
     if (!session) {
         snprintf(result.response, sizeof(result.response), 
                 "%s No active session", RSA_AUTH_FAILED);
@@ -930,6 +963,27 @@ int is_rsa_system_initialized(void) {
     return rsa_system_initialized;
 }
 
+void cleanup_user(user_t *user) {
+    if (user->public_key) {
+        EVP_PKEY_free(user->public_key);
+    }
+    free(user->email);
+    free(user->address);
+    free(user->phone_number);
+    free(user);
+}
+
+void cleanup_session(session_t *session) {    
+    if (session) {
+        if (session->user) {
+            if (session->user->public_key) {
+                EVP_PKEY_free(session->user->public_key);
+            }
+            free(session->user);
+        }
+        free(session);
+    }
+}
 // Cleanup RSA system
 void cleanup_rsa_system(void) {
     if (server_keys.private_key) {
@@ -950,6 +1004,7 @@ void cleanup_rsa_system(void) {
 void cleanup_auth_system(void) {
     if (user_map) {
         user_t *current, *temp;
+        pthread_mutex_lock(&user_map_mutex);
         HASH_ITER(hh, user_map, current, temp) {
             HASH_DEL(user_map, current);
             if (current->public_key) {
@@ -958,21 +1013,26 @@ void cleanup_auth_system(void) {
             }
             free(current);
         }
+        pthread_mutex_unlock(&user_map_mutex);
     }
     if (username_map) {
         username_t *current, *temp;
+        pthread_mutex_lock(&username_map_mutex);
         HASH_ITER(hh, username_map, current, temp) {
             HASH_DEL(username_map, current);
             free(current->username);
             free(current);
         }
+        pthread_mutex_unlock(&username_map_mutex);
     }
     if (session_map) {
         session_t *current, *temp;
+        pthread_mutex_lock(&session_map_mutex);
         HASH_ITER(hh, session_map, current, temp) {
             HASH_DEL(session_map, current);
-            free(current);
+            cleanup_session(current);
         }
+        pthread_mutex_unlock(&session_map_mutex);
     }
     user_count = 0;
     session_count = 0;
