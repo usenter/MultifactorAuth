@@ -419,31 +419,64 @@ void handle_cat_command(client_t *c, char *buffer, int client_socket){
     char filename[256];
     strncpy(filename, args, sizeof(filename) - 1);
     filename[sizeof(filename) - 1] = '\0';
-
-
-    struct stat file_stat;
-
-    // Get file metadata
-    if (stat(filename, &file_stat) == -1) {
-        perror("Error retrieving file information");
-        return;
-    }
-    FILE* file = fopen(filename, "r");
+    filename[strcspn(filename, "\r\n ")] = '\0';  // Remove whitespace
     
-    char *tempStore = malloc(file_stat.st_size);
-    if(!tempStore){
-        snprintf(broadcast_msg, sizeof(broadcast_msg), "Failed to allocate memory for file: %s\n", filename);
+    // Check read permissions for current directory
+    if(!isAccessible(c, c->cwd, 'r', client_socket)) return;
+    
+    // Construct full file path
+    char filepath[512];
+    snprintf(filepath, sizeof(filepath), "%s/%s", c->cwd, filename);
+    
+    struct stat file_stat;
+    
+    // Get file metadata
+    if (stat(filepath, &file_stat) == -1) {
+        snprintf(broadcast_msg, sizeof(broadcast_msg), "File not found: %s\n", filename);
         send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
         return;
     }
-    fread(tempStore, 1, file_stat.st_size, file);
+    
+    // Check if it's a regular file
+    if (!S_ISREG(file_stat.st_mode)) {
+        snprintf(broadcast_msg, sizeof(broadcast_msg), "Not a regular file: %s\n", filename);
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        return;
+    }
+    
+    FILE* file = fopen(filepath, "r");
+    if (!file) {
+        snprintf(broadcast_msg, sizeof(broadcast_msg), "Failed to open file: %s\n", filename);
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        return;
+    }
+    
+    char *tempStore = malloc(file_stat.st_size + 1);  // +1 for null terminator
+    if(!tempStore){
+        snprintf(broadcast_msg, sizeof(broadcast_msg), "Failed to allocate memory for file: %s\n", filename);
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        fclose(file);
+        return;
+    }
+    
+    size_t bytes_read = fread(tempStore, 1, file_stat.st_size, file);
     fclose(file);
+    
+    if (bytes_read != (size_t)file_stat.st_size) {
+        snprintf(broadcast_msg, sizeof(broadcast_msg), "Failed to read complete file: %s\n", filename);
+        send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
+        free(tempStore);
+        return;
+    }
+    
+    tempStore[file_stat.st_size] = '\0';  // Null terminate for text files
+    
     snprintf(broadcast_msg, sizeof(broadcast_msg), "Contents of %s:\n", filename);
     send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
     send(client_socket, tempStore, file_stat.st_size, 0);
+    
     free(tempStore);
     return;
-
 }
 // Check if user has access to a folder/file
 int isAccessible(client_t *c, char *fullPath, char mode, int client_socket) {
@@ -518,8 +551,8 @@ int isAccessible(client_t *c, char *fullPath, char mode, int client_socket) {
     return 0;
 }
 
-
-
+ // encryption system to be integrated later
+/*
 // Global master password and salt
 static char master_password[256] = {0};
 static unsigned char master_salt[32];
@@ -530,10 +563,12 @@ typedef struct {
     char directory_path[512];
     unsigned char key[32];  // 256-bit key for AES-256
     unsigned char iv[16];   // 128-bit IV for AES
+    UT_hash_handle hh;
+    //need to turn into hash;
 } encryption_key_t;
 
 // Global array to store encryption keys (in practice, you might load this from a secure file)
-encryption_key_t directory_keys[MAX_DIRECTORIES];
+encryption_key_t *directoryKeys_map = NULL;
 int num_keys = 0;
 
 // Function to initialize encryption system with admin password
@@ -615,29 +650,30 @@ int derive_directory_key(const char* directory_path, unsigned char* key_out, uns
 }
 // Function to get encryption key for a directory
 encryption_key_t* get_directory_key(const char* directory_path) {
-    for (int i = 0; i < num_keys; i++) {
-        if (strcmp(directory_keys[i].directory_path, directory_path) == 0) {
-            return &directory_keys[i];
-        }
-    }
-    return NULL;
+    encryption_key_t *key;
+    HASH_FIND(hh, directoryKeys_map, directory_path, strlen(directory_path), key);
+    return key;
 }
 
 // Function to generate a new encryption key for a directory using master password
 int generate_directory_key(const char* directory_path) {
-    if (num_keys >= MAX_DIRECTORIES) return -1;
     if (!encryption_initialized) return -1;
     
-    encryption_key_t* new_key = &directory_keys[num_keys];
-    strncpy(new_key->directory_path, directory_path, sizeof(new_key->directory_path) - 1);
-    
-    // Derive key and IV from master password and directory path
-    if (derive_directory_key(directory_path, new_key->key, new_key->iv) != 0) {
+    encryption_key_t* new_key = malloc(sizeof(encryption_key_t));
+    if(!new_key){
+        printf("Failed to allocate memory for new key\n");
         return -1;
     }
-    
-    num_keys++;
-    return 0;
+    strncpy(new_key->directory_path, directory_path, sizeof(new_key->directory_path) - 1);
+    new_key->directory_path[sizeof(new_key->directory_path) - 1] = '\0';
+    HASH_ADD_KEYPTR(hh, directoryKeys_map, new_key->directory_path, strlen(new_key->directory_path), new_key);
+    // Derive key and IV from master password and directory path
+    if (derive_directory_key(directory_path, new_key->key, new_key->iv) != 0) {
+        HASH_DEL(directoryKeys_map, new_key);
+        free(new_key);
+        return -1;
+    }
+    return 1;
 }
 
 // Admin function to change master password (re-encrypts all files)
@@ -763,7 +799,7 @@ void show_encryption_status() {
     
     printf("=== Encryption Status ===\n");
     printf("Encryption initialized: %s\n", encryption_initialized ? "Yes" : "No");
-    printf("Number of directory keys cached: %d\n", num_keys);
+    printf("Number of directory keys cached: %d\n", HASH_COUNT(directoryKeys_map));
     printf("Master salt: ");
     for (int i = 0; i < 8; i++) {  // Show only first 8 bytes for security
         printf("%02x", master_salt[i]);
@@ -771,8 +807,9 @@ void show_encryption_status() {
     printf("...\n");
     
     printf("\nDirectory keys:\n");
-    for (int i = 0; i < num_keys; i++) {
-        printf("  - %s\n", directory_keys[i].directory_path);
+    encryption_key_t *key, *temp  = NULL;
+    HASH_ITER(hh, directoryKeys_map, key, temp) {
+        printf("  - %s\n", key->directory_path);
     }
 }
 
@@ -1234,4 +1271,4 @@ int encrypt_existing_file_enhanced(const char* filepath, const char* directory_p
     
     printf("Encrypted file: %s\n", filepath);
     return 0;
-}
+}*/

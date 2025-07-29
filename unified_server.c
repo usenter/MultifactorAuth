@@ -5,13 +5,13 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <pthread.h>
 #include <signal.h>
 #include "auth_system.h"
 #include "hashmap/uthash.h"
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include "fileOperations.h" // File mode operations
+#include "email_service.h" // Email notification service
 
 #define PORT 12345
 #define BUFFER_SIZE 1024
@@ -599,6 +599,35 @@ void* handle_new_connection(void* arg) {
                 send(client_socket, auth_result.response, strlen(auth_result.response), 0);
                 
                 if (auth_result.success && auth_result.authenticated) {
+                    // Get current time for email notification
+                    time_t current_time = time(NULL);
+                    char time_str[64];
+                    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&current_time));
+                    
+                    // Get client IP address
+                    char client_ip[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+                    
+                    // Get user email from database and send notification
+                    user_t* user = find_user(account_id);
+                    email_config_t* email_cfg = get_email_config();
+                    
+                    if (email_cfg && email_cfg->email_notifications_enabled) {
+                        const char* target_email = NULL;
+                        
+                        if (email_cfg->use_default_email) {
+                            target_email = email_cfg->default_email;
+                        } else if (user && user->email[0] != '\0') {
+                            target_email = user->email;
+                        }
+                        
+                        if (target_email) {
+                            printf("Sending login notification email to %s for user %s\n", target_email, username);
+                            // Send email notification (non-blocking)
+                            //send_login_notification(username, target_email, time_str, client_ip);
+                        }
+                    }
+                    
                     // Add to authenticated clients list and start chat handler
                     client_t *new_client = malloc(sizeof(client_t));
                     if (new_client) {
@@ -774,6 +803,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     printf("RSA two-factor authentication enabled!\n");
+
+    // Initialize email service
+    printf("Initializing email service...\n");
+    if (initialize_email_service("email_config.txt") != 0) {
+        printf("WARNING: Email service initialization failed. Email notifications will not be sent.\n");
+    } else {
+        printf("Email service initialized successfully!\n");
+    }
     
     // Set up signal handlers for graceful shutdown
     signal(SIGINT, signal_handler);
@@ -887,6 +924,7 @@ int main(int argc, char *argv[]) {
     close(server_socket);
     cleanup_server();
     cleanup_auth_system(); // Clean up authentication system hashmaps
+    cleanup_email_service(); // Clean up email service
     pthread_mutex_destroy(&clients_mutex);
     printf("%s shutdown complete\n", PROGRAM_NAME);
     return 0;

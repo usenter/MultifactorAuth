@@ -12,6 +12,8 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <time.h>
+#include <pthread.h>
+
 
 // Buffer size for file operations
 #define BUFFER_SIZE 1024
