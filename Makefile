@@ -4,10 +4,10 @@ CFLAGS = -Wall -Wextra -std=c17 -pthread -D_POSIX_C_SOURCE=200809L
 LIBS = -lssl -lcrypto -lcurl
 
 # Object files
-OBJS = encryptionTools.o auth_system.o fileOperations.o config_parser.o
+OBJS = encryptionTools.o auth_system.o fileOperations.o config_parser.o emailTest.o
 
 # Targets
-all: unified_server unified_client encryptionTools_test user_encryptor generate_rsa_keys email_config_manager emailTest
+all: unified_server unified_client encryptionTools_test user_encryptor generate_rsa_keys emailTest
 
 # Object file rules with header dependencies
 encryptionTools.o: decryptionFunctions/encryptionTools.c decryptionFunctions/encryptionTools.h
@@ -29,6 +29,9 @@ config_parser.o: config_parser.c config_parser.h
 # Standalone encryption tools test executable
 encryptionTools_test: decryptionFunctions/encryptionTools.c decryptionFunctions/encryptionTools.h
 	$(CC) $(CFLAGS) -DTEST_MAIN -o $@ $< $(LIBS)
+
+tempUnifiedServer: tempUnifiedServer.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 # Standalone file encryption/decryption tool
 user_encryptor: userEncryptionTools/user_encryptor.c
@@ -61,6 +64,6 @@ emailTest: emailTest.c
 
 # Clean
 clean:
-	rm -f unified_server unified_client encryptionTools_test user_encryptor generate_rsa_keys test_email_service email_config_manager $(OBJS) *.pem
+	rm -f unified_server unified_client encryptionTools_test user_encryptor generate_rsa_keys emailTest $(OBJS) *.pem
 
 .PHONY: all clean 

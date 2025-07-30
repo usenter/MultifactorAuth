@@ -20,7 +20,7 @@ build/
 .cursor/
 .vscode/
 Checkers/
-
+TestingScripts/
 # Temporary files
 temp.txt
 decrypted_users.txt
