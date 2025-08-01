@@ -16,10 +16,12 @@ MultifactorAuth/
 ├── unified_server.c         # Secure authenticated chat server
 ├── unified_client.c         # Chat client with automatic RSA auth
 ├── auth_system.c/h          # Authentication and RSA implementation
+├── fileOperations.c/h       # Handles all file interface commands
 ├── encryptionTools.c/h      # Database encryption/decryption
 ├── generate_rsa_keys.c      # RSA key pair generation utility
 ├── user_encryptor.c         # User database encryption tool
 ├── hashmap/                 # Third-party hashmap library
+├── UserDirectory/           # Client-accesible directory for file handling
 └── Makefile                 # Build configuration
 ```
 
@@ -54,7 +56,19 @@ Replace names as you wish, but the encrypted file name must be changed in unifie
 ./generate_rsa_keys client <name2>
 ```
 
-### 4. Run. The example encrypted_users.txt in the repository uses the password ```rabbit```
+### 4. Create an emailConfig.json for ease of testing(sets default bcc email and sending email)
+```
+example confif file:
+  {
+    "sender": "<sender email>@gmail.com",
+    "receiver": "<bcc email>@gmail.com",
+    "password": "<generate app password via gmail>"
+  }
+```
+
+If you do not want this functionality, set `useJSON = 0` in emailTest.c, and define a from email.
+
+### 5. Run. The example encrypted_users.txt in the repository uses the password ```rabbit```
 ```bash
 # Start server
 ./unified_server myDatabasePassword
@@ -66,10 +80,14 @@ Replace names as you wish, but the encrypted file name must be changed in unifie
 
 ## Usage
 
-### Authentication
+### Authentication via Password
 ```
 auth> /login <name1> <password1>
-auth> /register newuser newpassword
+```
+
+### Authentication via email: check your email for token
+```
+auth> /token <token>
 ```
 
 ### Chat Commands
