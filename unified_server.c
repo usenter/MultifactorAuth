@@ -7,27 +7,62 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <errno.h>
+#include <time.h>
+#include <pthread.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
 #include "auth_system.h"
 #include "hashmap/uthash.h"
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include "fileOperations.h" // File mode operations
+#include "socketHandling/socketHandling.h"
 
+
+int setup_initial_connection(int client_socket);
+void* handle_authenticated_client(void* arg);
 #define PORT 12345
 #define BUFFER_SIZE 1024
 #define MAX_CLIENTS 20
 #define DEFAULT_USER_FILE "encrypted_users.txt"
-
+#define MAX_EVENTS 100
 // Program information
 #define PROGRAM_NAME "AuthenticatedChatServer"
-
+char default_cwd[256] = "UserDirectory/";
 // Add a list to track client handler threads
 #define MAX_CLIENT_THREADS 1024
 pthread_t client_threads[MAX_CLIENT_THREADS];
 int client_thread_count = 0;
 int overrideBroadcast = 0; // when true, messages are broadcast to all clients, not just chat mode clients
+// Socket state tracking
+typedef enum {
+    SOCKET_STATE_NEW,           // Just connected, needs auth
+    SOCKET_STATE_AUTHENTICATING,// In authentication process
+    SOCKET_STATE_AUTHENTICATED  // Fully authenticated
+} socket_state_t;
 
-// Client structure and mode definitions are now in fileOperations.h
+typedef struct {
+    int socket;
+    socket_state_t state;
+    time_t last_activity;
+    int account_id;            // Set after successful auth
+    UT_hash_handle hh;        // For hash table
+} socket_info_t;
+
+// Global socket state tracking
+socket_info_t *socket_map = NULL;
+pthread_mutex_t socket_map_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Thread communication
+typedef struct {
+    int epoll_fd;            // epoll fd for this thread
+    pthread_t thread_id;
+    volatile int running;
+} thread_context_t;
+
+thread_context_t auth_thread_ctx;
+thread_context_t cmd_thread_ctx;
 
 // Global variables with proper mutex protection
 client_t *clients_map = NULL; // Hashmap root
@@ -36,47 +71,29 @@ pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t thread_count_mutex = PTHREAD_MUTEX_INITIALIZER; // NEW: protect thread array
 volatile int server_running = 1;
 char* user_file = DEFAULT_USER_FILE;
-
-// Make server_socket global for signal handler access
-int server_socket = -1;
-pthread_mutex_t server_socket_mutex = PTHREAD_MUTEX_INITIALIZER; // NEW: protect server socket
-
-// Signal handler for graceful shutdown
-void signal_handler(int sig) {
-    (void)sig; // Suppress unused parameter warning
-    printf("\nServer shutdown requested...\n");
-    server_running = 0;
-    
-    // Close server socket to unblock accept() - with proper synchronization
-    pthread_mutex_lock(&server_socket_mutex);
-    if (server_socket != -1) {
-        close(server_socket);
-        server_socket = -1;
-    }
-    pthread_mutex_unlock(&server_socket_mutex);
+char* emailPassword = NULL; // Fill this in if you disable useJSON parameter in emailTest.c
+// Socket management functions
+socket_info_t* get_socket_info(int socket) {
+    socket_info_t *info = NULL;
+    pthread_mutex_lock(&socket_map_mutex);
+    HASH_FIND_INT(socket_map, &socket, info);
+    pthread_mutex_unlock(&socket_map_mutex);
+    return info;
 }
 
-// Function to add a new authenticated client - FIXED
-void add_authenticated_client(client_t *new_client) {
-    pthread_mutex_lock(&clients_mutex);
+void add_socket_info(int socket) {
+    socket_info_t *info = malloc(sizeof(socket_info_t));
+    if (!info) return;
     
-    // Check if client already exists (prevent duplicates)
-    client_t *existing = NULL;
-    HASH_FIND_INT(clients_map, &new_client->socket, existing);
-    if (existing) {
-        pthread_mutex_unlock(&clients_mutex);
-        printf("Warning: Client socket %d already exists in map\n", new_client->socket);
-        return;
-    }
+    info->socket = socket;
+    info->state = SOCKET_STATE_NEW;
+    info->last_activity = time(NULL);
+    info->account_id = -1;
     
-    HASH_ADD_INT(clients_map, socket, new_client);
-    client_count++;
-    printf("Added client %s (socket %d). Total clients: %d\n", 
-           new_client->nickname, new_client->socket, client_count);
-    
-    pthread_mutex_unlock(&clients_mutex);
+    pthread_mutex_lock(&socket_map_mutex);
+    HASH_ADD_INT(socket_map, socket, info);
+    pthread_mutex_unlock(&socket_map_mutex);
 }
-
 // Function to find client by socket - IMPROVED
 client_t* find_client_by_socket(int client_socket) {
     client_t *c = NULL;
@@ -89,23 +106,17 @@ client_t* find_client_by_socket(int client_socket) {
     pthread_mutex_unlock(&clients_mutex);
     return c;
 }
-
-// Function to find client by nickname - IMPROVED
-client_t* find_client_by_nickname(const char* nickname) {
-    client_t *c, *tmp, *result = NULL;
-    
-    pthread_mutex_lock(&clients_mutex);
-    HASH_ITER(hh, clients_map, c, tmp) {
-        if (c->active && strcmp(c->nickname, nickname) == 0) {
-            result = c;
-            break;
-        }
+void remove_socket_info(int socket) {
+    socket_info_t *info = NULL;
+    pthread_mutex_lock(&socket_map_mutex);
+    HASH_FIND_INT(socket_map, &socket, info);
+    if (info) {
+        HASH_DEL(socket_map, info);
+        free(info);
     }
-    pthread_mutex_unlock(&clients_mutex);
-    return result;
+    pthread_mutex_unlock(&socket_map_mutex);
 }
 
-// Function to broadcast message to all authenticated clients except sender - FIXED
 void broadcast_message(const char* message, int sender_socket) {
     if (!message) return;
     
@@ -143,15 +154,16 @@ void broadcast_message(const char* message, int sender_socket) {
     pthread_mutex_unlock(&clients_mutex);
     free(message_with_newline);
 }
-
-// Function to remove a client - COMPLETELY REWRITTEN for thread safety
 void remove_client(int client_socket) {
+    printf("[CLEANUP] Starting cleanup for socket %d\n", client_socket);
+    
     pthread_mutex_lock(&clients_mutex);
     
     client_t *c = NULL;
     HASH_FIND_INT(clients_map, &client_socket, c);
     if (!c) {
         pthread_mutex_unlock(&clients_mutex);
+        printf("[CLEANUP] No client found for socket %d\n", client_socket);
         return; // Client not found
     }
     
@@ -168,14 +180,21 @@ void remove_client(int client_socket) {
     strncpy(nickname_copy, c->nickname, sizeof(nickname_copy) - 1);
     nickname_copy[sizeof(nickname_copy) - 1] = '\0';
     
-    printf("User '%s' (%s) left the chat (Total clients: %d)\n", 
+    printf("[CLEANUP] User '%s' (%s) left the chat (Total clients: %d)\n", 
            username_copy, nickname_copy, client_count - 1);
     
     // Remove from hash table
+    pthread_mutex_lock(&clients_mutex);
     HASH_DEL(clients_map, c);
     client_count--;
-    
     pthread_mutex_unlock(&clients_mutex);
+    
+    // Remove from socket tracking
+    remove_socket_info(client_socket);
+    
+    // Remove from epoll (both auth and command threads)
+    epoll_ctl(auth_thread_ctx.epoll_fd, EPOLL_CTL_DEL, client_socket, NULL);
+    epoll_ctl(cmd_thread_ctx.epoll_fd, EPOLL_CTL_DEL, client_socket, NULL);
     
     // Close socket outside of mutex
     close(client_socket);
@@ -191,12 +210,58 @@ void remove_client(int client_socket) {
     
     // Remove session BEFORE freeing the client structure
     if (account_id != 0) {
+        printf("[CLEANUP] Removing session for account_id %d\n", account_id);
         remove_session(account_id);
     }
     
     // Free the client structure AFTER removing session
     free(c);
+    printf("[CLEANUP] Cleanup complete for socket %d\n", client_socket);
 }
+
+void update_socket_state(int socket, socket_state_t new_state) {
+    socket_info_t *info = NULL;
+    pthread_mutex_lock(&socket_map_mutex);
+    HASH_FIND_INT(socket_map, &socket, info);
+    if (info) {
+        printf("[SOCKET_STATE] Socket %d: %d -> %d\n", socket, info->state, new_state);
+        info->state = new_state;
+        info->last_activity = time(NULL);
+    }
+    pthread_mutex_unlock(&socket_map_mutex);
+}
+
+// Debug function to dump all socket states
+/*void dump_socket_states(void) {
+    printf("[SOCKET_DUMP] Current socket states:\n");
+    pthread_mutex_lock(&socket_map_mutex);
+    socket_info_t *info, *tmp;
+    HASH_ITER(hh, socket_map, info, tmp) {
+        const char* state_str = (info->state == SOCKET_STATE_NEW) ? "NEW" :
+                               (info->state == SOCKET_STATE_AUTHENTICATING) ? "AUTHENTICATING" :
+                               (info->state == SOCKET_STATE_AUTHENTICATED) ? "AUTHENTICATED" : "UNKNOWN";
+        printf("[SOCKET_DUMP]   Socket %d: state=%s, account_id=%d, last_activity=%ld\n", 
+               info->socket, state_str, info->account_id, info->last_activity);
+    }
+    pthread_mutex_unlock(&socket_map_mutex);
+}*/
+// Function to find client by nickname - IMPROVED
+client_t* find_client_by_nickname(const char* nickname) {
+    client_t *c, *tmp, *result = NULL;
+    
+    pthread_mutex_lock(&clients_mutex);
+    HASH_ITER(hh, clients_map, c, tmp) {
+        if (c->active && strcmp(c->nickname, nickname) == 0) {
+            result = c;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+    return result;
+}
+
+
+// Function to remove a client - COMPLETELY REWRITTEN for thread safety
 
 // Function to get list of connected clients - FIXED
 void get_client_list(char* list_buffer, size_t buffer_size) {
@@ -219,6 +284,80 @@ void get_client_list(char* list_buffer, size_t buffer_size) {
     
     pthread_mutex_unlock(&clients_mutex);
 }
+
+
+// Move socket from auth thread to command thread
+void promote_to_authenticated(int socket, int account_id) {
+    printf("[PROMOTE] Starting promotion for socket %d, account_id %d\n", socket, account_id);
+    
+    // Create client structure
+    client_t *new_client = malloc(sizeof(client_t));
+    if (!new_client) {
+        perror("Failed to allocate client structure");
+        return;
+    }
+    
+    // Initialize client
+    memset(new_client, 0, sizeof(client_t));
+    new_client->socket = socket;
+    new_client->account_id = account_id;
+    new_client->active = 1;
+    new_client->mode = CLIENT_MODE_CHAT;
+    strncpy(new_client->cwd, default_cwd, sizeof(new_client->cwd) - 1);
+    new_client->cwd[sizeof(new_client->cwd) - 1] = '\0';
+    
+    // Get user info for the client
+    user_t *user = find_user(account_id);
+    if (user) {
+        strncpy(new_client->username, user->username, MAX_USERNAME_LEN - 1);
+        strncpy(new_client->nickname, user->username, sizeof(new_client->nickname) - 1);
+    }
+    
+    // Add to clients map
+    pthread_mutex_lock(&clients_mutex);
+    HASH_ADD_INT(clients_map, socket, new_client);
+    client_count++;
+    pthread_mutex_unlock(&clients_mutex);
+    
+    // Remove from auth epoll
+    printf("[PROMOTE] Removing socket %d from auth epoll\n", socket);
+    if (epoll_ctl(auth_thread_ctx.epoll_fd, EPOLL_CTL_DEL, socket, NULL) == -1) {
+        perror("Failed to remove from auth epoll");
+    }
+    
+    // Update socket state
+    socket_info_t *info = NULL;
+    pthread_mutex_lock(&socket_map_mutex);
+    HASH_FIND_INT(socket_map, &socket, info);
+    if (info) {
+        info->state = SOCKET_STATE_AUTHENTICATED;
+        info->account_id = account_id;
+        info->last_activity = time(NULL);
+        printf("[PROMOTE] Updated socket %d state to AUTHENTICATED\n", socket);
+    }
+    pthread_mutex_unlock(&socket_map_mutex);
+    
+    // Add to command thread epoll
+    struct epoll_event event;
+    event.events = EPOLLIN | EPOLLET;
+    event.data.fd = socket;
+    printf("[PROMOTE] Adding socket %d to command thread epoll\n", socket);
+    if (epoll_ctl(cmd_thread_ctx.epoll_fd, EPOLL_CTL_ADD, socket, &event) == -1) {
+        perror("Failed to add to command thread epoll");
+        remove_client(socket);
+        return;
+    }
+    printf("[PROMOTE] Successfully added socket %d to command thread epoll\n", socket);
+    char response[BUFFER_SIZE];
+    snprintf(response, sizeof(response), "AUTH_SUCCESS:You are now fully authenticated.\n");
+    send(socket, response, strlen(response), 0);
+    // Announce new user
+    char announcement[BUFFER_SIZE];
+    snprintf(announcement, sizeof(announcement), "%s has joined the chat", new_client->nickname);
+    broadcast_message(announcement, socket);
+
+}
+
 
 // Chat mode handler - IMPROVED with better error checking
 void handle_chat_mode(client_t *c, char *buffer, int client_socket){
@@ -306,18 +445,21 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
     
     // Handle file commands
     if (strncmp(buffer, "/file", 5) == 0) {
+        printf("[DEBUG] Handling /file command from socket %d\n", client_socket);
+        
         pthread_mutex_lock(&clients_mutex);
-        client_t *client = NULL;
-        HASH_FIND_INT(clients_map, &client_socket, client);
-        if (client && client->active) {
-            client->mode = CLIENT_MODE_FILE;
+        // Use the client pointer that was already passed to this function
+        if (c && c->active) {
+            c->mode = CLIENT_MODE_FILE;
+            printf("[DEBUG] Client %d mode changed to FILE\n", client_socket);
+        } else {
+            printf("[DEBUG] Client not found or inactive for socket %d\n", client_socket);
         }
         pthread_mutex_unlock(&clients_mutex);
         
         snprintf(broadcast_msg, sizeof(broadcast_msg), "File mode activated\n");
         send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
         return;
-    }
     
     // Handle unknown commands
     if (buffer[0] == '/') {
@@ -338,15 +480,288 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
         return;
     }
 }
-
-// Function to safely add thread to tracking array
-void add_client_thread(pthread_t thread) {
-    pthread_mutex_lock(&thread_count_mutex);
-    if (client_thread_count < MAX_CLIENT_THREADS) {
-        client_threads[client_thread_count++] = thread;
-    }
-    pthread_mutex_unlock(&thread_count_mutex);
 }
+
+// Authentication thread function
+void* auth_thread_func(void *arg) {
+    thread_context_t *ctx = (thread_context_t *)arg;
+    struct epoll_event events[MAX_EVENTS];
+    char buffer[BUFFER_SIZE];
+    
+    printf("Authentication thread started\n");
+    
+    while (ctx->running) {
+        int nfds = epoll_wait(ctx->epoll_fd, events, MAX_EVENTS, 100);
+        if (nfds == -1) {
+            if (errno == EINTR) continue;
+            perror("epoll_wait in auth thread");
+            break;
+        }
+        
+        if (nfds > 0) {
+            printf("[AUTH_THREAD] epoll_wait returned %d events\n", nfds);
+        }
+        
+        // Debug: dump socket states every few seconds when no events
+        static time_t last_dump = 0;
+        if (nfds == 0) {
+            time_t now = time(NULL);
+            if (now - last_dump > 5) {
+                //dump_socket_states();
+                last_dump = now;
+            }
+        }
+        
+        for (int i = 0; i < nfds; i++) {
+            int client_socket = events[i].data.fd;
+            socket_info_t *info = get_socket_info(client_socket);
+            if (!info) continue;
+            
+            ssize_t bytes_read = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
+            if (bytes_read <= 0) {
+                printf("[AUTH_THREAD] Socket %d disconnected (bytes_read=%zd)\n", client_socket, bytes_read);
+                remove_socket_info(client_socket);
+                close(client_socket);
+                continue;
+            }
+            
+            buffer[bytes_read] = '\0';
+            buffer[strcspn(buffer, "\r\n")] = 0;
+            
+            // Process authentication messages
+            printf("[AUTH_THREAD] Socket %d: received %zd bytes, state=%d, account_id=%d\n", 
+                   client_socket, bytes_read, info->state, info->account_id);
+            printf("[AUTH_THREAD] Socket %d: raw data: '%s'\n", client_socket, buffer);
+            char response[BUFFER_SIZE];
+            
+            // Skip processing if this is a new connection (shouldn't happen anymore, but safety check)
+            if (info->state == SOCKET_STATE_NEW) {
+                printf("[AUTH_THREAD] WARNING: Socket %d in NEW state in epoll - this shouldn't happen\n", client_socket);
+                continue;
+            }
+            
+            // We need to determine account_id for process_auth_message
+            // For initial auth, we might not have it yet, so we'll handle this step by step
+            int account_id = info->account_id;
+            
+            // If we don't have account_id yet, try to extract from login command
+            if (account_id <= 0 && strncmp(buffer, "/login", 6) == 0) {
+                char username[MAX_USERNAME_LEN];
+                if (sscanf(buffer, "/login %31s", username) == 1) {
+                    username_t *uname_entry = find_username(username);
+                    if (uname_entry) {
+                        account_id = uname_entry->account_id;
+                        // Update socket info with account_id
+                        pthread_mutex_lock(&socket_map_mutex);
+                        if (info) {
+                            info->account_id = account_id;
+                        }
+                        pthread_mutex_unlock(&socket_map_mutex);
+                        printf("[AUTH_THREAD] Set account_id %d for socket %d\n", account_id, client_socket);
+                    }
+                }
+            }
+            
+            int result = 0;
+            if (account_id > 0) {
+                result = process_auth_message(buffer, account_id, response, sizeof(response));
+                printf("[AUTH_THREAD] process_auth_message returned: %d\n", result);
+            } else {
+                snprintf(response, sizeof(response), "Please use /login <username> <password> to authenticate\n");
+                printf("[AUTH_THREAD] No account_id available, sending login prompt\n");
+            }
+            
+            if (result == 1) { // Message processed successfully
+                // Check if user is actually fully authenticated
+                auth_flags_t auth_status = get_auth_status(account_id);
+                printf("[AUTH_THREAD] Socket %d: auth_status=%d, AUTH_FULLY_AUTHENTICATED=%d\n", 
+                       client_socket, auth_status, AUTH_FULLY_AUTHENTICATED);
+                
+                if (auth_status == AUTH_FULLY_AUTHENTICATED) {
+                    printf("[AUTH_THREAD] Authentication COMPLETE for socket %d, promoting to chat...\n", client_socket);
+                    promote_to_authenticated(client_socket, account_id);
+                    printf("[AUTH_THREAD] Promotion complete for socket %d\n", client_socket);
+                } else {
+                    printf("[AUTH_THREAD] Authentication INCOMPLETE for socket %d, sending response\n", client_socket);
+                    send(client_socket, response, strlen(response), 0);
+                }
+            } else {
+                printf("[AUTH_THREAD] Message processing failed, sending response to socket %d: '%s'\n", client_socket, response);
+                send(client_socket, response, strlen(response), 0);
+            }
+        }
+    }
+    
+    printf("Authentication thread exiting\n");
+    return NULL;
+}
+
+// Command handling thread function
+void* cmd_thread_func(void *arg) {
+    thread_context_t *ctx = (thread_context_t *)arg;
+    struct epoll_event events[MAX_EVENTS];
+    char buffer[BUFFER_SIZE];
+    
+    printf("Command handler thread started\n");
+    
+    while (ctx->running) {
+        int nfds = epoll_wait(ctx->epoll_fd, events, MAX_EVENTS, 100);
+        if (nfds == -1) {
+            if (errno == EINTR) continue;
+            perror("epoll_wait in cmd thread");
+            break;
+        }
+        
+        if (nfds > 0) {
+            printf("[CMD_THREAD] epoll_wait returned %d events\n", nfds);
+        }
+        
+        for (int i = 0; i < nfds; i++) {
+            int client_socket = events[i].data.fd;
+            socket_info_t *info = get_socket_info(client_socket);
+            printf("[CMD_THREAD] Processing event for socket %d, info=%p, state=%d\n", 
+                   client_socket, info, info ? info->state : -1);
+            if (!info || info->state != SOCKET_STATE_AUTHENTICATED) {
+                printf("[CMD_THREAD] Skipping socket %d (no info or wrong state)\n", client_socket);
+                continue;
+            }
+            
+            ssize_t bytes_read = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
+            if (bytes_read <= 0) {
+                printf("[CMD_THREAD] Socket %d disconnected (bytes_read=%zd)\n", client_socket, bytes_read);
+                remove_socket_info(client_socket);
+                close(client_socket);
+                continue;
+            }
+            
+            buffer[bytes_read] = '\0';
+            printf("[CMD_THREAD] Socket %d: received %zd bytes, state=%d, account_id=%d\n", 
+                   client_socket, bytes_read, info->state, info->account_id);
+            printf("[CMD_THREAD] Socket %d: raw data: '%s'\n", client_socket, buffer);
+            buffer[strcspn(buffer, "\r\n")] = 0;
+            
+            // Handle commands and messages using client mode
+            printf("[CMD_THREAD] Processing message from socket %d: '%s'\n", client_socket, buffer);
+            client_t *client = find_client_by_socket(client_socket);
+            if (client) {
+                printf("[CMD_THREAD] Found client for socket %d, mode=%d\n", client_socket, client->mode);
+                
+                // Skip empty messages
+                if (strlen(buffer) == 0) {
+                    continue;
+                }
+                
+                // Handle quit command (universal quit command)
+                if (strcmp(buffer, "/quit") == 0) {
+                    char response[BUFFER_SIZE];
+                    snprintf(response, sizeof(response), "Goodbye! You have left the chat.\n");
+                    send(client_socket, response, strlen(response), 0);
+                    remove_client(client_socket);
+                    continue;
+                }
+                
+                // Dispatch based on client mode
+                if (client->mode == CLIENT_MODE_CHAT) {
+                    printf("[CMD_THREAD] Processing CHAT mode for user %s\n", client->username);
+                    handle_chat_mode(client, buffer, client_socket);
+                } else if (client->mode == CLIENT_MODE_FILE) {
+                    printf("[CMD_THREAD] Processing FILE mode for user %s\n", client->username);
+                    handle_file_mode(client, buffer, client_socket);
+                } else {
+                    printf("[CMD_THREAD] Unknown client mode %d for socket %d\n", client->mode, client_socket);
+                }
+            } else {
+                printf("[CMD_THREAD] ERROR: No client found for socket %d - this shouldn't happen for authenticated users\n", client_socket);
+                // Try to find the client in the hash table for debugging
+                pthread_mutex_lock(&clients_mutex);
+                client_t *c, *tmp;
+                HASH_ITER(hh, clients_map, c, tmp) {
+                    printf("[CMD_THREAD] DEBUG: Client in map - socket=%d, active=%d, username=%s\n", 
+                           c->socket, c->active, c->username);
+                }
+                pthread_mutex_unlock(&clients_mutex);
+            }
+        }
+    }
+    
+    printf("Command handler thread exiting\n");
+    return NULL;
+}
+
+
+
+
+
+
+
+
+
+// Make server_socket global for signal handler access
+int server_socket = -1;
+pthread_mutex_t server_socket_mutex = PTHREAD_MUTEX_INITIALIZER; // NEW: protect server socket
+
+// Removed unused work queue functions and thread functions
+
+// Signal handler for graceful shutdown
+void signal_handler(int sig) {
+    (void)sig; // Suppress unused parameter warning
+    printf("\nServer shutdown requested...\n");
+    server_running = 0;
+    
+    // Close server socket to unblock accept() - with proper synchronization
+    pthread_mutex_lock(&server_socket_mutex);
+    if (server_socket != -1) {
+        close(server_socket);
+        server_socket = -1;
+    }
+    pthread_mutex_unlock(&server_socket_mutex);
+}
+
+// Function to add a new authenticated client - FIXED
+void add_authenticated_client(client_t *new_client) {
+    printf("[ADD_CLIENT] Adding authenticated client for user '%s' (socket %d)\n", 
+           new_client->username, new_client->socket);
+    
+    pthread_mutex_lock(&clients_mutex);
+    
+    // Check if client already exists by socket (prevent duplicates)
+    client_t *existing = NULL;
+    HASH_FIND_INT(clients_map, &new_client->socket, existing);
+    if (existing) {
+        pthread_mutex_unlock(&clients_mutex);
+        printf("[ADD_CLIENT] Warning: Client socket %d already exists in map\n", new_client->socket);
+        return;
+    }
+    
+    // Check for existing client with same username and remove it
+    client_t *duplicate = NULL, *tmp = NULL;
+    HASH_ITER(hh, clients_map, duplicate, tmp) {
+        if (duplicate->active && strcmp(duplicate->username, new_client->username) == 0) {
+            printf("[ADD_CLIENT] Found existing client for user '%s' (socket %d), removing...\n", 
+                   duplicate->username, duplicate->socket);
+            HASH_DEL(clients_map, duplicate);
+            client_count--;
+            close(duplicate->socket);
+            free(duplicate);
+            break;
+        }
+    }
+    
+    HASH_ADD_INT(clients_map, socket, new_client);
+    client_count++;
+    printf("[ADD_CLIENT] Successfully added client for user '%s' (socket %d). Total clients: %d\n", 
+           new_client->username, new_client->socket, client_count);
+    
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+
+
+
+
+// Function to broadcast message to all authenticated clients except sender - FIXED
+
+
 
 // Function to handle individual authenticated client - IMPROVED
 void* handle_authenticated_client(void* arg) {
@@ -487,6 +902,7 @@ EVP_PKEY* extract_public_key(X509* client_cert, int client_socket){
 X509* extract_client_cert(int client_socket) {
     uint32_t net_cert_len;
     int recvd = recv(client_socket, &net_cert_len, sizeof(net_cert_len), MSG_WAITALL);
+    printf("recvd: %d\n", recvd);
     if (recvd != sizeof(net_cert_len)) {
         printf("Failed to receive certificate length from client.\n");
         return NULL;
@@ -524,11 +940,8 @@ X509* extract_client_cert(int client_socket) {
     return client_cert;
 }
 
-// Function to handle new client connections - MAJOR IMPROVEMENTS
-void* handle_new_connection(void* arg) {
-    int client_socket = *(int*)arg;
-    free(arg); // Free the allocated memory for the socket
-    
+// implemennts initial connection setup for epoll architecture
+int setup_initial_connection(int client_socket) {
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof(client_addr);
     getpeername(client_socket, (struct sockaddr*)&client_addr, &addr_len);
@@ -536,23 +949,26 @@ void* handle_new_connection(void* arg) {
     char buffer[BUFFER_SIZE];
     char response[BUFFER_SIZE];
     
-    printf("New connection from %s:%d (authentication required)\n", 
+    printf("Setting up initial connection for %s:%d\n", 
            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
     // Extract certificate
     X509* client_cert = extract_client_cert(client_socket);
     if (!client_cert) {
         printf("Client certificate extraction failed. Closing connection.\n");
+        printf("receivd cert: %s\n",buffer);
+        remove_socket_info(client_socket);
         close(client_socket);
-        return NULL;
+        return -1;
     }
     
     EVP_PKEY* client_pubkey = X509_get_pubkey(client_cert);
     if (!client_pubkey) {
         printf("Failed to extract public key from client certificate.\n");
         X509_free(client_cert);
+        remove_socket_info(client_socket);
         close(client_socket);
-        return NULL;
+        return -1;
     }
     
     // Print subject CN for debug
@@ -567,16 +983,20 @@ void* handle_new_connection(void* arg) {
     char username[MAX_USERNAME_LEN] = "";
     unsigned int account_id = 0;
     
+    printf("[SETUP] Socket %d: received %d bytes for username\n", client_socket, name_bytes);
+    
     if (name_bytes <= 0) {
-        printf("Client disconnected before sending username\n");
+        printf("[SETUP] Socket %d: client disconnected before sending username\n", client_socket);
         EVP_PKEY_free(client_pubkey);
         X509_free(client_cert);
+        remove_socket_info(client_socket);
         close(client_socket);
-        return NULL;
+        return -1;
     }
     
     username_buffer[name_bytes] = '\0';
     username_buffer[strcspn(username_buffer, "\r\n")] = 0;
+    printf("[SETUP] Socket %d: username data: '%s'\n", client_socket, username_buffer);
 
     if (strncmp(username_buffer, "USERNAME:", 9) == 0) {
         strncpy(username, username_buffer + 9, MAX_USERNAME_LEN - 1);
@@ -589,8 +1009,9 @@ void* handle_new_connection(void* arg) {
             send(client_socket, response, strlen(response), 0);
             EVP_PKEY_free(client_pubkey);
             X509_free(client_cert);
+            remove_socket_info(client_socket);
             close(client_socket);
-            return NULL;
+            return -1;
         }
         
         account_id = uname_entry->account_id;
@@ -601,8 +1022,9 @@ void* handle_new_connection(void* arg) {
             send(client_socket, response, strlen(response), 0);
             EVP_PKEY_free(client_pubkey);
             X509_free(client_cert);
+            remove_socket_info(client_socket);
             close(client_socket);
-            return NULL;
+            return -1;
         }
         
         user->public_key = client_pubkey;
@@ -610,10 +1032,31 @@ void* handle_new_connection(void* arg) {
         
         printf("Valid username received: %s (account_id: %u)\n", username, account_id);
         
+        // Create authentication session (chamber)
+        if (!create_auth_session(account_id)) {
+            printf("Failed to create authentication session for %s\n", username);
+            snprintf(response, sizeof(response), "ERROR: Failed to create session\n");
+            send(client_socket, response, strlen(response), 0);
+            EVP_PKEY_free(client_pubkey);
+            X509_free(client_cert);
+            remove_socket_info(client_socket);
+            close(client_socket);
+            return -1;
+        }
+        
+        // Update socket info with account_id
+        socket_info_t *info = get_socket_info(client_socket);
+        if (info) {
+            pthread_mutex_lock(&socket_map_mutex);
+            info->account_id = account_id;
+            pthread_mutex_unlock(&socket_map_mutex);
+        }
+        
+        printf("Authentication chamber created for %s (account_id: %u)\n", username, account_id);
+        
         // Generate RSA challenge
         if (is_rsa_system_initialized()) {
-            printf("Initiating automatic RSA challenge for %s%s:%d\n", 
-                   username, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+            printf("Initiating automatic RSA challenge for %s\n", username);
             rsa_challenge_result_t rsa_result = start_rsa_challenge_for_client(account_id, user->public_key);
             
             if (rsa_result.success && rsa_result.encrypted_size > 0) {
@@ -630,18 +1073,30 @@ void* handle_new_connection(void* arg) {
                 printf("Failed to generate/send RSA challenge for %s\n", username);
                 EVP_PKEY_free(client_pubkey);
                 X509_free(client_cert);
+                remove_socket_info(client_socket);
                 close(client_socket);
-                return NULL;
+                return -1;
             }
         }
+        
+        // Send authentication prompt
+        snprintf(response, sizeof(response),
+                 "%s - Authentication Required\n"
+                 "========================================\n"
+                 "Please authenticate to access the chat:\n"
+                 "  /login <username> <password> - Login with existing account\n"
+                 "  /register <username> <password> - Create new account\n\n", PROGRAM_NAME);
+        send(client_socket, response, strlen(response), 0);
+        
     } else {
         printf("Invalid username format received\n");
         snprintf(response, sizeof(response), "ERROR: Invalid username format\n");
         send(client_socket, response, strlen(response), 0);
         EVP_PKEY_free(client_pubkey);
         X509_free(client_cert);
+        remove_socket_info(client_socket);
         close(client_socket);
-        return NULL;
+        return -1;
     }
     
     if (client_pubkey) {
@@ -649,118 +1104,10 @@ void* handle_new_connection(void* arg) {
     }
     X509_free(client_cert);
     
-    // Authentication prompt for non-RSA systems
-    if (!is_rsa_system_initialized()) {
-        snprintf(response, sizeof(response),
-                 "%s - Authentication Required\n"
-                 "========================================\n"
-                 "Password-only mode (RSA keys not configured).\n\n"
-                 "Please authenticate to access the chat:\n"
-                 "  /login <username> <password> - Login with existing account\n"
-                 "  /register <username> <password> - Create new account\n\n"
-                 "Note: For enhanced security, configure RSA keys.\n", PROGRAM_NAME);
-        send(client_socket, response, strlen(response), 0);
-    }
-    
-    // Authentication loop
-    while (server_running) {
-        int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
-        if (bytes_received <= 0) {
-            printf("Client %s:%d disconnected during authentication\n", 
-                   inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-            break;
-        }
-        
-        buffer[bytes_received] = '\0';
-        buffer[strcspn(buffer, "\r\n")] = 0;
-        
-        if (strlen(buffer) == 0) {
-            continue;
-        }
-        
-        if (is_auth_command(buffer)) {
-            if (is_rsa_command(buffer)) {
-                rsa_challenge_result_t rsa_result = process_rsa_command(buffer, account_id);
-                
-                if (rsa_result.success && strstr(rsa_result.response, "RSA authentication successful")) {
-                    snprintf(response, sizeof(response),
-                             "Please authenticate to access the secure chat:\n"
-                             "  /login <username> <password> - Login with existing account\n"
-                             "  /register <username> <password> - Create new account\n\n"
-                             "Ready for secure login.\n");
-                    send(client_socket, response, strlen(response), 0);
-                } else if (!rsa_result.success) {
-                    printf("RSA authentication FAILED for account %u - connection will be terminated\n", 
-                           account_id);
-                    snprintf(response, sizeof(response), 
-                             "RSA_FAILED - RSA authentication failed. Connection terminated.\n");
-                    send(client_socket, response, strlen(response), 0);
-                    break;
-                }
-            } 
-            else {
-                // Handle regular auth commands
-                auth_result_t auth_result = process_auth_command(buffer, account_id);
-                send(client_socket, auth_result.response, strlen(auth_result.response), 0);
-                
-                if (auth_result.success && auth_result.authenticated) {
-                    // Create new client structure
-                    client_t *new_client = malloc(sizeof(client_t));
-                    if (new_client) {
-                        new_client->socket = client_socket;
-                        new_client->addr = client_addr;
-                        new_client->active = 1;
-                        new_client->connect_time = time(NULL);
-                        new_client->account_id = account_id;
-                        new_client->mode = CLIENT_MODE_CHAT;
-                        new_client->authLevel = find_user(account_id)->authLevel;
-                        
-                        // Set username and initial nickname
-                        strncpy(new_client->username, username, MAX_USERNAME_LEN - 1);
-                        new_client->username[MAX_USERNAME_LEN - 1] = '\0';
-                        snprintf(new_client->nickname, sizeof(new_client->nickname), "%s", username);
-                        strncpy(new_client->cwd, "UserDirectory", sizeof(new_client->cwd)-1);
-                        new_client->cwd[sizeof(new_client->cwd)-1] = '\0';
-                        
-                        add_authenticated_client(new_client);
-                        
-                        // Start chat handler thread
-                        int* arg = malloc(sizeof(int));
-                        pthread_t chat_thread;
-                        if (arg) {
-                            *arg = client_socket;
-                            if (pthread_create(&chat_thread, NULL, handle_authenticated_client, arg) == 0) {
-                                add_client_thread(chat_thread); // Use safe function
-                                return NULL;
-                            } else {
-                                printf("Failed to create chat handler thread\n");
-                                free(arg);
-                                remove_client(client_socket);
-                            }
-                        } 
-                        else {
-                            printf("Memory allocation failed for chat thread\n");
-                            remove_client(client_socket);
-                        }
-                    } else {
-                        printf("Memory allocation failed for client structure\n");
-                        snprintf(response, sizeof(response), "ERROR: Server memory allocation failed\n");
-                        send(client_socket, response, strlen(response), 0);
-                    }
-                    break;
-                }
-            }
-        } 
-        else {
-            snprintf(response, sizeof(response), 
-                     "Please authenticate first using /login or /register\n");
-            send(client_socket, response, strlen(response), 0);
-        }
-    }
-    
-    close(client_socket);
-    return NULL;
+    printf("Initial connection setup completed for %s (account_id: %u)\n", username, account_id);
+    return 0; // Success
 }
+
 
 // Function to broadcast shutdown message to all authenticated clients - IMPROVED
 void broadcast_shutdown_message(void) {
@@ -844,23 +1191,38 @@ void cleanup_server(void) {
     }
     pthread_mutex_unlock(&clients_mutex);
     
-    // Wait for all client handler threads to finish
-    printf("Waiting for all client handler threads to finish...\n");
-    pthread_mutex_lock(&thread_count_mutex);
-    for (int i = 0; i < client_thread_count; i++) {
-        pthread_mutex_unlock(&thread_count_mutex);
-        pthread_join(client_threads[i], NULL);
-        pthread_mutex_lock(&thread_count_mutex);
+    // Stop worker threads
+    printf("Stopping worker threads...\n");
+    auth_thread_ctx.running = 0;
+    cmd_thread_ctx.running = 0;
+    
+    // Wait for threads to finish
+    printf("Waiting for auth thread...\n");
+    pthread_join(auth_thread_ctx.thread_id, NULL);
+    printf("Waiting for command thread...\n");
+    pthread_join(cmd_thread_ctx.thread_id, NULL);
+    
+    // Close epoll fds
+    close(auth_thread_ctx.epoll_fd);
+    close(cmd_thread_ctx.epoll_fd);
+    
+    // Clean up socket map
+    socket_info_t *current, *temp_socket;
+    pthread_mutex_lock(&socket_map_mutex);
+    HASH_ITER(hh, socket_map, current, temp_socket) {
+        HASH_DEL(socket_map, current);
+        close(current->socket);
+        free(current);
     }
-    client_thread_count = 0;
-    pthread_mutex_unlock(&thread_count_mutex);
+    pthread_mutex_unlock(&socket_map_mutex);
     
     // Now safely free all remaining clients
     printf("Freeing remaining client structures...\n");
     pthread_mutex_lock(&clients_mutex);
-    HASH_ITER(hh, clients_map, c, tmp) {
-        HASH_DEL(clients_map, c);
-        free(c);
+    client_t *current_client, *temp_client;
+    HASH_ITER(hh, clients_map, current_client, temp_client) {
+        HASH_DEL(clients_map, current_client);
+        free(current_client);
     }
     client_count = 0;
     pthread_mutex_unlock(&clients_mutex);
@@ -920,7 +1282,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     printf("RSA two-factor authentication enabled!\n");
-    
+    if(!init_email_system("userStatus.txt")){
+        printf("Failed to initialize email system\n");
+        return 1;
+    }
+    printf("Email system initialized!\n");
+
+    // Removed unused work queue initialization and thread creation
+
     // Set up signal handlers for graceful shutdown
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -976,44 +1345,122 @@ int main(int argc, char *argv[]) {
     printf("Server ready! Press Ctrl+C to exit\n");
     printf("========================================================================\n");
     
-    // Main server loop - accept client connections
+    // Set up epoll for main thread (accepting connections)
+    int main_epoll_fd = epoll_create1(0);
+    if (main_epoll_fd == -1) {
+        perror("epoll_create1 (main)");
+        return 1;
+    }
+    
+    // Set up epoll for auth thread
+    auth_thread_ctx.epoll_fd = epoll_create1(0);
+    if (auth_thread_ctx.epoll_fd == -1) {
+        perror("epoll_create1 (auth)");
+        return 1;
+    }
+    
+    // Set up epoll for command thread
+    cmd_thread_ctx.epoll_fd = epoll_create1(0);
+    if (cmd_thread_ctx.epoll_fd == -1) {
+        perror("epoll_create1 (cmd)");
+        return 1;
+    }
+    
+    // Add server socket to main epoll
+    struct epoll_event server_event;
+    server_event.events = EPOLLIN;
+    server_event.data.ptr = NULL; // Server socket marker
+    epoll_ctl(main_epoll_fd, EPOLL_CTL_ADD, server_socket, &server_event);
+    
+    // Start worker threads
+    auth_thread_ctx.running = 1;
+    cmd_thread_ctx.running = 1;
+    
+    if (pthread_create(&auth_thread_ctx.thread_id, NULL, auth_thread_func, &auth_thread_ctx) != 0) {
+        perror("Failed to create auth thread");
+        return 1;
+    }
+    
+    if (pthread_create(&cmd_thread_ctx.thread_id, NULL, cmd_thread_func, &cmd_thread_ctx) != 0) {
+        perror("Failed to create command thread");
+        return 1;
+    }
+    
+    // Main accept loop
+    struct epoll_event events[MAX_EVENTS];
     while (server_running) {
-        struct sockaddr_in client_addr;
-        socklen_t client_addr_len = sizeof(client_addr);
-        
-        pthread_mutex_lock(&server_socket_mutex);
-        int current_server_socket = server_socket;
-        pthread_mutex_unlock(&server_socket_mutex);
-        
-        if (current_server_socket == -1) {
-            break; // Server socket was closed
+        int nfds = epoll_wait(main_epoll_fd, events, MAX_EVENTS, 100);
+        if (nfds == -1) {
+            if (errno == EINTR) continue;
+            perror("epoll_wait (main)");
+            break;
         }
         
-        int client_socket = accept(current_server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
-        if (client_socket < 0) {
-            if (server_running) {
-                printf("Accept failed or server shutting down\n");
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.ptr == NULL) {
+                // New connection
+                struct sockaddr_in client_addr;
+                socklen_t client_addr_len = sizeof(client_addr);
+                
+                int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
+                if (client_socket < 0) {
+                    if (server_running) {
+                        perror("accept");
+                    }
+                    continue;
+                }
+                
+                printf("[MAIN_EPOLL] New connection from %s:%d (socket=%d)\n", 
+                       inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), client_socket);
+                
+                // Set non-blocking
+                int flags = fcntl(client_socket, F_GETFL, 0);
+                fcntl(client_socket, F_SETFL, flags | O_NONBLOCK);
+                
+                // Initialize socket tracking
+                add_socket_info(client_socket);
+                
+                // Set initial state
+                socket_info_t *info = get_socket_info(client_socket);
+                if (info) {
+                    info->state = SOCKET_STATE_NEW;
+                    info->last_activity = time(NULL);
+                    printf("[MAIN_EPOLL] Socket %d: initialized with state=NEW\n", client_socket);
+                }
+                
+                // Handle initial connection setup BEFORE adding to epoll (certificate extraction, RSA challenge)
+                printf("[MAIN_EPOLL] Socket %d: starting initial setup\n", client_socket);
+                if (setup_initial_connection(client_socket) == 0) {
+                    // Setup successful, update socket state and add to epoll
+                    socket_info_t *updated_info = get_socket_info(client_socket);
+                    if (updated_info) {
+                        updated_info->state = SOCKET_STATE_AUTHENTICATING;
+                        printf("[MAIN_EPOLL] Socket %d: setup successful, state=AUTHENTICATING\n", client_socket);
+                    }
+                    
+                    // Add to auth thread's epoll AFTER setup is complete
+                    struct epoll_event client_event;
+                    client_event.events = EPOLLIN | EPOLLET;
+                    client_event.data.fd = client_socket;
+                    if (epoll_ctl(auth_thread_ctx.epoll_fd, EPOLL_CTL_ADD, client_socket, &client_event) == -1) {
+                        perror("epoll_ctl (auth)");
+                        remove_socket_info(client_socket);
+                        close(client_socket);
+                        continue;
+                    }
+                    
+                    printf("[MAIN_EPOLL] Socket %d: added to auth thread epoll\n", client_socket);
+                } else {
+                    // Setup failed, socket is already cleaned up
+                    printf("[MAIN_EPOLL] Socket %d: setup failed\n", client_socket);
+                    continue;
+                }
             }
-            continue;
-        }
-        
-        // Create thread to handle authentication for this client
-        pthread_t auth_thread;
-        int* socket_ptr = malloc(sizeof(int));
-        if (socket_ptr) {
-            *socket_ptr = client_socket;
-            if (pthread_create(&auth_thread, NULL, handle_new_connection, socket_ptr) != 0) {
-                printf("Failed to create authentication thread\n");
-                free(socket_ptr);
-                close(client_socket);
-            } else {
-                pthread_detach(auth_thread);  // Let auth threads clean up themselves
-            }
-        } else {
-            printf("Memory allocation failed\n");
-            close(client_socket);
         }
     }
+    
+    // Cleanup
+    close(main_epoll_fd);
     
     // Cleanup and shutdown
     pthread_mutex_lock(&server_socket_mutex);
@@ -1022,9 +1469,18 @@ int main(int argc, char *argv[]) {
         server_socket = -1;
     }
     pthread_mutex_unlock(&server_socket_mutex);
-    
     cleanup_server();
+    
+    // Add a small delay to ensure all threads have completely finished
+    // before cleaning up the auth system to prevent deadlock
+    struct timespec delay = {0, 500000000}; // 500ms in nanoseconds
+    nanosleep(&delay, NULL);
+    
     cleanup_auth_system(); // Clean up authentication system hashmaps
+    OPENSSL_cleanup();
+    pthread_mutex_destroy(&clients_mutex);
+    pthread_mutex_destroy(&thread_count_mutex);
+    pthread_mutex_destroy(&server_socket_mutex);
     printf("%s shutdown complete\n", PROGRAM_NAME);
     return 0;
 }    

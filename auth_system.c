@@ -321,7 +321,7 @@ session_t* find_session(int account_id) {
     return session;
 }
 
-/*Functions for verifying user*/
+//Functions for verifying user
 int generateVerificationCode(const char* username) {
     // Create a seed using username and current time
     unsigned int seed = 0;
@@ -1072,17 +1072,6 @@ auth_result_t process_auth_command(const char* message, int account_id) {
 
 
 
-// ================================
-// RSA AUTHENTICATION IMPLEMENTATION
-// ================================
-
-/*// Get a user's public key by account_id
-EVP_PKEY* get_client_public_key(int account_id) {
-    pthread_mutex_lock(&user_map_mutex);
-    user_t *user = find_user(account_id);
-    pthread_mutex_unlock(&user_map_mutex);
-    return user ? user->public_key : NULL;
-}*/
 
 // Initialize RSA system - now just verifies server keys
 int init_rsa_system(const char* server_private_key_file, const char* server_public_key_file) {
@@ -1356,16 +1345,10 @@ rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* 
     }
     
     size_t outlen = sizeof(decrypted_challenge);  // Use actual buffer size
-    //printf("DEBUG: About to decrypt client response of %d bytes\n", response_size);
-    //printf("DEBUG: Expected response size: %d bytes\n", MAX_RSA_ENCRYPTED_SIZE);
-    //printf("DEBUG: Decryption buffer size: %zu bytes\n", outlen);
+
     
     int decrypt_result = EVP_PKEY_decrypt(ctx, decrypted_challenge, &outlen, encrypted_response, response_size);
-    /*
-    printf("DEBUG: Decryption result: %d\n", decrypt_result);
-    printf("DEBUG: Actual decrypted size: %zu bytes\n", outlen);
-    printf("DEBUG: Expected decrypted size: %d bytes\n", RSA_CHALLENGE_SIZE);
-    */
+   
     if (decrypt_result <= 0) {
         ERR_print_errors_fp(stdout);
         EVP_PKEY_CTX_free(ctx);

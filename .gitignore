@@ -14,6 +14,9 @@ RSA_AUTH_SETUP.md
 *.out
 *.pem
 
+emailConfig.json
+userStatus.txt
+
 # Build directories
 build/
 .cache/
@@ -21,6 +24,7 @@ build/
 .vscode/
 Checkers/
 TestingScripts/
+socketHandling/
 # Temporary files
 temp.txt
 decrypted_users.txt

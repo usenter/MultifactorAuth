@@ -348,6 +348,8 @@ void* receive_messages(void* arg) {
             } else {
                 printf("\n%s", buffer);
                 printf("You are now authenticated\n");
+                email_authenticated = 1;
+                password_authenticated = 1;
             }
         } else {
             printf("\n%s", buffer);
@@ -410,7 +412,7 @@ int client_mode(int client_socket, const char* username) {
             running = 0;
             return 0;
         }
-
+        printf("[CLIENT_DEBUG] Parsing server input...\n");
         buffer[bytes_received] = '\0';
         if (strstr(buffer, "RSA_CHALLENGE:") && !rsa_completed) {
             char* challenge_start = strstr(buffer, "RSA_CHALLENGE:") + 14;
@@ -422,32 +424,37 @@ int client_mode(int client_socket, const char* username) {
                 rsa_ok = 1;
                 printf("[RSA] SUCCESS: RSA mutual authentication completed!\n");
                 printf("[RSA] You may now login with your username and password.\n");
-            } else {
+            } 
+            else {
                 printf("[RSA] FAILED: RSA authentication failed! Connection may be terminated.\n");
                 running = 0;
                 return 0;
             }
-        } else if (strstr(buffer, "RSA_FAILED")) {
+        }
+        else if (strstr(buffer, "RSA_FAILED")) {
             printf("\nRSA authentication failed - connection may be terminated by server.\n");
             running = 0;
             return 0;
-        } else if (strstr(buffer, "SECURITY_ERROR")) {
+        } 
+        else if (strstr(buffer, "SECURITY_ERROR")) {
             printf("\nSECURITY ERROR: RSA authentication is required but failed.\n");
             printf("Make sure you have the correct RSA keys for your client.\n");
             running = 0;
             return 0;
-        } else {
+        } 
+        else {
             // Print any other server message (e.g., banner, info)
             printf("%s", buffer);
         }
         
     }
-
+    printf("[CLIENT_DEBUG] RSA challenge completed\n");
     // Now start the receive thread for chat and further messages
     if (pthread_create(&receive_thread, NULL, receive_messages, &client_socket) != 0) {
         printf("Failed to create receive thread\n");
         return 0;
     }
+    printf("[CLIENT_DEBUG] started receive thread\n");
 
     // Main loop to send messages
     while (running && fgets(buffer, BUFFER_SIZE, stdin)) {
@@ -460,6 +467,7 @@ int client_mode(int client_socket, const char* username) {
         if (strlen(buffer) > 0) {
             if (!password_authenticated) {
                 if (strncmp(buffer, "/login", 6) == 0 || strncmp(buffer, "/register", 9) == 0) {
+                    printf("[CLIENT_DEBUG] Sending auth command to server: '%s'\n", buffer);
                     if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
                         printf("Failed to send message\n");
                         running = 0;
@@ -474,6 +482,7 @@ int client_mode(int client_socket, const char* username) {
             }
             else if(!email_authenticated) {
                 if(strncmp(buffer, "/token", 6) == 0 || strncmp(buffer, "/newToken", 9) == 0){
+                    printf("[CLIENT_DEBUG] Sending token command to server: '%s'\n", buffer);
                     if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
                         printf("Failed to send message\n");
                         running = 0;
@@ -486,6 +495,7 @@ int client_mode(int client_socket, const char* username) {
                     continue;
                 }
             } else {
+                printf("[CLIENT_DEBUG] Sending chat message to server: '%s'\n", buffer);
                 if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
                     printf("Failed to send message\n");
                     running = 0;
@@ -637,6 +647,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     printf("Connected to server. Sending certificate...\n");
+    
+    // Clear any leftover data in the socket buffer
+    char clear_buf[1024];
+    while (recv(sock, clear_buf, sizeof(clear_buf), MSG_PEEK | MSG_DONTWAIT) > 0) {
+        recv(sock, clear_buf, sizeof(clear_buf), 0);
+    }
+    
     // Send certificate as first message
     cert_fp = fopen(cert_file, "r");
     if (!cert_fp) {
@@ -645,20 +662,24 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     char cert_buf[2048];
+    memset(cert_buf, 0, sizeof(cert_buf)); // Clear buffer
     size_t cert_len = fread(cert_buf, 1, sizeof(cert_buf) - 1, cert_fp);
     fclose(cert_fp);
     cert_buf[cert_len] = '\0';
+    
     // Send certificate length first (as 4-byte int, network order)
     uint32_t net_cert_len = htonl(cert_len);
+    printf("[CLIENT_DEBUG] Sending certificate length: %d bytes\n", net_cert_len);
     if (send(sock, &net_cert_len, sizeof(net_cert_len), 0) != sizeof(net_cert_len)) {
         printf("ERROR: Failed to send certificate length.\n");
         close(sock);
         return 1;
     }
+    
     // Send certificate data
     ssize_t sent_bytes = send(sock, cert_buf, cert_len, 0);
     if (sent_bytes != (ssize_t)cert_len) {
-        printf("ERROR: Failed to send certificate data.\n");
+        printf("ERROR: Failed to send certificate data. Sent %zd of %zu bytes\n", sent_bytes, cert_len);
         close(sock);
         return 1;
     }

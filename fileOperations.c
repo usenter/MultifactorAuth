@@ -11,6 +11,7 @@ const char *auths[numAuths] = {
 
 void handle_file_mode(client_t *c, char *buffer, int client_socket){
     char broadcast_msg[BUFFER_SIZE];
+    printf("[DEBUG] File mode command received: %s\n", buffer);
     if(strncmp(buffer, "/chat", 5) == 0){
         c->mode = CLIENT_MODE_CHAT;
         snprintf(broadcast_msg, sizeof(broadcast_msg), "File mode ended, returning to chat mode\n");
@@ -61,6 +62,7 @@ void handle_file_mode(client_t *c, char *buffer, int client_socket){
     }
     // pwd command
     if(strncmp(buffer, "pwd", 3) == 0) {
+        printf("User %s is trying to get the current working directory%s\n", c->username, c->cwd);
         snprintf(broadcast_msg, sizeof(broadcast_msg), "%s\n", c->cwd);
         send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
         return;
