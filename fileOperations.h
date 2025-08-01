@@ -43,7 +43,7 @@ typedef struct client {
 
 // File operation function declarations
 void handle_file_mode(client_t *c, char *buffer, int client_socket);
-void handle_ls_command(client_t *c, char *buffer, int client_socket);
+void handle_ls_command(client_t *c, int client_socket);
 void handle_cd_command(client_t *c, char *buffer, int client_socket);
 void handle_touch_command(client_t *c, char *buffer, int client_socket);
 void handle_rm_command(client_t *c, char *buffer, int client_socket);

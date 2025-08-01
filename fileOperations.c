@@ -46,7 +46,7 @@ void handle_file_mode(client_t *c, char *buffer, int client_socket){
     
     // ls command
     if(strncmp(buffer, "ls", 2) == 0) {
-        handle_ls_command(c, buffer, client_socket);
+        handle_ls_command(c, client_socket);
         return;
     }
     // cd command
@@ -86,7 +86,7 @@ void handle_file_mode(client_t *c, char *buffer, int client_socket){
 
 
 
-void handle_ls_command(client_t *c, char *buffer, int client_socket){
+void handle_ls_command(client_t *c,  int client_socket){
     char broadcast_msg[BUFFER_SIZE];
     printf("User %s is trying to list directory %s\n", c->username, c->cwd);
     
