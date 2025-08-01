@@ -11,7 +11,7 @@
 #include <openssl/err.h>
 #include "hashmap/uthash.h"
 #include "decryptionFunctions/encryptionTools.h"
-#include "emailTest.h"
+#include "emailFunction.h"
 
 
 #define MAX_USERNAME_LEN 32

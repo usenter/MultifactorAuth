@@ -4,7 +4,7 @@
 #include <cjson/cJSON.h>
 #include <stdlib.h>
 #include <time.h>
-#include "emailTest.h"
+#include "emailFunction.h"
 
 int useJSON = 1;  // If this is not set to 1, you need to define the emailFrom variable
 const char* emailConfigFile = "emailConfig.json";
