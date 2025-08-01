@@ -1,13 +1,13 @@
 # Simplified Makefile for TCP Server/Client Project (Linux)
 CC = clang
 CFLAGS = -Wall -Wextra -std=c17 -pthread -D_POSIX_C_SOURCE=200809L
-LIBS = -lssl -lcrypto -lcurl
+LIBS = -lssl -lcrypto -lcurl -lcjson
 
 # Object files
-OBJS = encryptionTools.o auth_system.o fileOperations.o config_parser.o emailTest.o
+OBJS = encryptionTools.o auth_system.o fileOperations.o emailTest.o
 
 # Targets
-all: unified_server unified_client encryptionTools_test user_encryptor generate_rsa_keys emailTest
+all: unified_server unified_client encryptionTools_test user_encryptor generate_rsa_keys
 
 # Object file rules with header dependencies
 encryptionTools.o: decryptionFunctions/encryptionTools.c decryptionFunctions/encryptionTools.h
@@ -19,19 +19,11 @@ auth_system.o: auth_system.c
 fileOperations.o: fileOperations.c fileOperations.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Email test executable
+emailTest: emailTest.c
+	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
 
 
-config_parser.o: config_parser.c config_parser.h
-	$(CC) $(CFLAGS) -c $< -o $@
-
-
-
-# Standalone encryption tools test executable
-encryptionTools_test: decryptionFunctions/encryptionTools.c decryptionFunctions/encryptionTools.h
-	$(CC) $(CFLAGS) -DTEST_MAIN -o $@ $< $(LIBS)
-
-tempUnifiedServer: tempUnifiedServer.c
-	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 # Standalone file encryption/decryption tool
 user_encryptor: userEncryptionTools/user_encryptor.c
@@ -40,6 +32,9 @@ user_encryptor: userEncryptionTools/user_encryptor.c
 # Server with authentication (uses object files)
 unified_server: unified_server.c $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+encryptionTools_test: decryptionFunctions/encryptionTools.c decryptionFunctions/encryptionTools.h
+	$(CC) $(CFLAGS) -DTEST_MAIN -o $@ $< $(LIBS)
 
 # Unified client with authentication support (includes RSA authentication)
 unified_client: unified_client.c
@@ -51,13 +46,10 @@ generate_rsa_keys: generate_rsa_keys.c $(OBJS)
 
 
 
-# Email configuration manager
-email_config_manager: email_config_manager.c config_parser.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
-# Email test
-emailTest: emailTest.c
-	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+
+
 
 
 
