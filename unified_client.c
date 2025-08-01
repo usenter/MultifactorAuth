@@ -26,8 +26,10 @@
 #define PROGRAM_NAME "AuthenticatedChatClient"
 
 volatile int running = 1;
-int authenticated = 0;
+int password_authenticated = 0;
 int rsa_completed = 0;
+int email_authenticated = 0;
+
 
 // RSA keys for automatic authentication
 EVP_PKEY* client_private_key = NULL;
@@ -322,17 +324,37 @@ void* receive_messages(void* arg) {
         // Store the message
         store_message(buffer);
         
+        // Check for token expiry
+        if (strstr(buffer, "AUTH_TOKEN_EXPIRED")) {
+            printf("\nYour token has expired. Use /newToken to request a new one.\n");
+        }
+        // Check for token failure
+        else if (strstr(buffer, "AUTH_TOKEN_FAIL")) {
+            printf("\nInvalid token. Please check your email and try again.\n");
+        }
+        // Check for lockout
+        else if (strstr(buffer, "AUTH_LOCKED")) {
+            printf("\nAccount locked due to too many failed attempts. Please try again later.\n");
+        }
         // Check if we got authenticated
-        if (strncmp(buffer, "AUTH_SUCCESS", 12) == 0) {
-            authenticated = 1;
-            printf("\n%s", buffer);
-            printf("You are now authenticated\n");
+        else if (strncmp(buffer, "AUTH_SUCCESS", 12) == 0) {
+            if (strstr(buffer, "Email token verified successfully")) {
+                printf("\nEmail verification successful! You are now fully authenticated.\n");
+                email_authenticated = 1;
+            } else if (strstr(buffer, "Password verified")) {
+                password_authenticated = 1;
+                printf("\nPassword verified. Please check your email for a 6-digit token.\n");
+                printf("Use /token <code> to enter the token, or /newToken to request a new one.\n");
+            } else {
+                printf("\n%s", buffer);
+                printf("You are now authenticated\n");
+            }
         } else {
             printf("\n%s", buffer);
         }
         
         // Show prompt based on authentication state
-        if (authenticated) {
+        if (password_authenticated && email_authenticated) {
             printf("> ");
         } else {
             printf("auth> ");
@@ -388,6 +410,7 @@ int client_mode(int client_socket, const char* username) {
             running = 0;
             return 0;
         }
+
         buffer[bytes_received] = '\0';
         if (strstr(buffer, "RSA_CHALLENGE:") && !rsa_completed) {
             char* challenge_start = strstr(buffer, "RSA_CHALLENGE:") + 14;
@@ -417,6 +440,7 @@ int client_mode(int client_socket, const char* username) {
             // Print any other server message (e.g., banner, info)
             printf("%s", buffer);
         }
+        
     }
 
     // Now start the receive thread for chat and further messages
@@ -434,16 +458,30 @@ int client_mode(int client_socket, const char* username) {
             break;
         }
         if (strlen(buffer) > 0) {
-            if (!authenticated) {
+            if (!password_authenticated) {
                 if (strncmp(buffer, "/login", 6) == 0 || strncmp(buffer, "/register", 9) == 0) {
                     if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
                         printf("Failed to send message\n");
                         running = 0;
                         break;
                     }
-                    continue;
-                } else {
+                }
+                else {
                     printf("Please authenticate first. Use: /login <username> <password> or /register <username> <password>\n");
+                    printf("auth> ");
+                    continue;
+                }
+            }
+            else if(!email_authenticated) {
+                if(strncmp(buffer, "/token", 6) == 0 || strncmp(buffer, "/newToken", 9) == 0){
+                    if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
+                        printf("Failed to send message\n");
+                        running = 0;
+                        break;
+                    }
+                }
+                else {
+                    printf("Please authenticate first. Use: /token <code> or /newToken\n");
                     printf("auth> ");
                     continue;
                 }
@@ -455,7 +493,7 @@ int client_mode(int client_socket, const char* username) {
                 }
             }
         }
-        if (authenticated) {
+        if (password_authenticated && email_authenticated) {
             if(strncmp(buffer, "/file", 5) == 0){
                 file_handling(username);
             }

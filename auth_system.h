@@ -11,6 +11,8 @@
 #include <openssl/err.h>
 #include "hashmap/uthash.h"
 #include "decryptionFunctions/encryptionTools.h"
+#include "emailTest.h"
+
 
 #define MAX_USERNAME_LEN 32
 #define MAX_PASSWORD_LEN 64
@@ -61,15 +63,39 @@ typedef struct {
     EVP_PKEY *public_key;
 } rsa_keypair_t;
 
+// Email token authentication constants
+#define EMAIL_TOKEN_LENGTH 6
+#define MAX_TOKEN_ATTEMPTS 3
+#define LOCKOUT_DURATION 600  // 10 minutes in seconds
+#define TOKEN_EXPIRY_TIME 60  // 1 minute in seconds
+
+// Email token structure
+typedef struct {
+    int token;
+    time_t created_time;
+    int attempts;
+    time_t lockout_until;
+} email_token_t;
+
+// Authentication flags using bit operations
+typedef enum {
+    AUTH_NONE = 0,
+    AUTH_PASSWORD = (1 << 0),    // 0001 - Password authentication completed
+    AUTH_RSA = (1 << 1),         // 0010 - RSA challenge-response completed
+    AUTH_EMAIL = (1 << 2),       // 0100 - Email challenge-response completed
+    AUTH_LOCKED = (1 << 3),      // 1000 - Account is locked
+    AUTH_FULLY_AUTHENTICATED = AUTH_PASSWORD | AUTH_RSA | AUTH_EMAIL  // 0111 - Password, RSA, and Email
+} auth_flags_t;
+
 // Session structure
 typedef struct {
     unsigned int account_id;  // Key for lookup
     user_t *user;            // Pointer to the authenticated user
     time_t login_time;
-    int authenticated;
-    int rsa_authenticated;   // RSA challenge-response completed
-    unsigned char challenge[RSA_CHALLENGE_SIZE];  // Current challenge
-    UT_hash_handle hh;
+    unsigned char challenge[RSA_CHALLENGE_SIZE];
+    auth_flags_t auth_status;  // Authentication flags with bit operations
+    email_token_t email_token;  // Email token for 2FA
+    UT_hash_handle hh;  // Required for hash table functionality
 } session_t;
 
 typedef struct{
@@ -97,6 +123,13 @@ typedef struct {
 #define AUTH_SUCCESS "AUTH_SUCCESS"
 #define AUTH_FAILED "AUTH_FAILED"
 #define AUTH_LOGOUT "/logout"
+
+#define AUTH_TOKEN "/token"
+#define AUTH_NEW_TOKEN "/newToken"
+#define AUTH_LOCKED "AUTH_LOCKED"
+#define AUTH_TOKEN_EXPIRED "AUTH_TOKEN_EXPIRED"
+#define AUTH_TOKEN_FAIL "AUTH_TOKEN_FAIL"
+#define AUTH_TOKEN_PROMPT "AUTH_TOKEN_PROMPT"
 
 // RSA Authentication commands
 #define RSA_AUTH_START "/rsa_start"
@@ -136,6 +169,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
 // New authentication processing functions
 auth_result_t process_auth_command(const char* message, int account_id);
 int is_auth_command(const char* message);
+int is_token_command(const char* message);
 
 // RSA Authentication functions
 int init_rsa_system(const char* server_private_key_file, const char* server_public_key_file);
@@ -154,7 +188,26 @@ int is_rsa_command(const char* message);
 rsa_challenge_result_t process_rsa_command(const char* message, int account_id);
 int is_rsa_authenticated(int account_id);
 int is_rsa_system_initialized(void);
+void sendEmailVerification(session_t* session);
+int is_email_command(const char* message);
+int process_email_command(const char* message, int account_id);
 
+// New authentication flow functions
+int init_email_system(char* email_file);
+int create_auth_session(int account_id);
+auth_flags_t get_auth_status(int account_id);
+int process_auth_message(const char* message, int account_id, char* response, size_t response_size);
+int verify_email_token(int account_id, const char* token);
+int generate_new_token(int account_id);
+int is_token_expired(int account_id);
+int is_user_locked_out(int account_id);
+int get_remaining_lockout_time(int account_id);
+int handle_token_command(const char* message, int account_id);
+int handle_new_token_command(int account_id);
+void load_lockout_status(const char* filename);
+void save_lockout_status(const char* filename);
+int get_session_attempts(int account_id);
+session_t* find_session(int account_id);
 // New function for RSA challenge with direct public key
 //rsa_challenge_result_t start_rsa_challenge_with_pubkey(EVP_PKEY* pubkey);
 
