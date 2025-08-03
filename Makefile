@@ -4,7 +4,7 @@ CFLAGS = -Wall -Wextra -std=c17 -pthread -D_POSIX_C_SOURCE=200809L
 LIBS = -lssl -lcrypto -lcurl -lcjson
 
 # Object files
-OBJS = encryptionTools.o auth_system.o fileOperations.o emailTest.o
+OBJS = encryptionTools.o auth_system.o fileOperations.o emailFunction.o
 
 # Targets
 all: unified_server unified_client encryptionTools_test user_encryptor generate_rsa_keys
@@ -20,8 +20,8 @@ fileOperations.o: fileOperations.c fileOperations.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Email test executable
-emailTest: emailTest.c
-	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
+emailFunction.o: emailFunctions/emailFunction.c emailFunctions/emailFunction.h
+	$(CC) $(CFLAGS) -c $< -o $@
 
 
 

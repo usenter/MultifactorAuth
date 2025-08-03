@@ -124,7 +124,9 @@ int read_credentials_json_full(const char *filename, char** from_email, char** t
     const cJSON *js_sender = cJSON_GetObjectItemCaseSensitive(json, "sender");
     const cJSON *js_receiver = cJSON_GetObjectItemCaseSensitive(json, "receiver");
     const cJSON *js_password = cJSON_GetObjectItemCaseSensitive(json, "password");
-   
+    printf("DEBUG: js_sender: %s\n", js_sender->valuestring);
+    printf("DEBUG: js_receiver: %s\n", js_receiver->valuestring);
+    printf("DEBUG: js_password: %s\n", js_password->valuestring);
     if (!cJSON_IsString(js_sender) || !cJSON_IsString(js_receiver) || !cJSON_IsString(js_password)) {
         cJSON_Delete(json);
         return 4;

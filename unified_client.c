@@ -29,6 +29,7 @@ volatile int running = 1;
 int password_authenticated = 0;
 int rsa_completed = 0;
 int email_authenticated = 0;
+int locked = 0;
 
 
 // RSA keys for automatic authentication
@@ -334,7 +335,11 @@ void* receive_messages(void* arg) {
         }
         // Check for lockout
         else if (strstr(buffer, "AUTH_LOCKED")) {
-            printf("\nAccount locked due to too many failed attempts. Please try again later.\n");
+            printf("\n%s\n", buffer);
+            locked = 1;
+        }
+        else if (strstr(buffer, "AUTH_TOKEN_GEN_SUCCESS")) {
+            printf("\n%s\n", buffer);
         }
         // Check if we got authenticated
         else if (strncmp(buffer, "AUTH_SUCCESS", 12) == 0) {
@@ -351,7 +356,8 @@ void* receive_messages(void* arg) {
                 email_authenticated = 1;
                 password_authenticated = 1;
             }
-        } else {
+        } 
+        else {
             printf("\n%s", buffer);
         }
         
@@ -474,10 +480,14 @@ int client_mode(int client_socket, const char* username) {
                         break;
                     }
                 }
-                else {
+                else if (!locked) {
                     printf("Please authenticate first. Use: /login <username> <password> or /register <username> <password>\n");
                     printf("auth> ");
                     continue;
+                }
+                else{
+                    //send token command to receieve a message back
+                    send(client_socket, "/token", 7, 0);
                 }
             }
             else if(!email_authenticated) {
@@ -666,10 +676,8 @@ int main(int argc, char *argv[]) {
     size_t cert_len = fread(cert_buf, 1, sizeof(cert_buf) - 1, cert_fp);
     fclose(cert_fp);
     cert_buf[cert_len] = '\0';
-    
     // Send certificate length first (as 4-byte int, network order)
     uint32_t net_cert_len = htonl(cert_len);
-    printf("[CLIENT_DEBUG] Sending certificate length: %d bytes\n", net_cert_len);
     if (send(sock, &net_cert_len, sizeof(net_cert_len), 0) != sizeof(net_cert_len)) {
         printf("ERROR: Failed to send certificate length.\n");
         close(sock);

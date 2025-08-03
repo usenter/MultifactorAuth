@@ -46,15 +46,12 @@ Encrypt it:
 Replace names as you wish, but the encrypted file name must be changed in unified_server.c
 
 
-### 3. Create a folder `RSAkeys/`. Then generate RSA Keys:
+### 3. Create a folder `RSAkeys/`. Then generate Server RSA Key:
 ```bash
 # Generate server keys
 ./generate_rsa_keys server
-
-# Generate client keys (one per client)
-./generate_rsa_keys client <name1>
-./generate_rsa_keys client <name2>
 ```
+Client keys are auto generated.
 
 ### 4. Create an emailConfig.json for ease of testing(sets default bcc email and sending email)
 ```

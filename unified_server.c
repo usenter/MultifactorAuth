@@ -552,11 +552,9 @@ void* auth_thread_func(void *arg) {
                     if (uname_entry) {
                         account_id = uname_entry->account_id;
                         // Update socket info with account_id
-                        pthread_mutex_lock(&socket_map_mutex);
                         if (info) {
                             info->account_id = account_id;
                         }
-                        pthread_mutex_unlock(&socket_map_mutex);
                         printf("[AUTH_THREAD] Set account_id %d for socket %d\n", account_id, client_socket);
                     }
                 }
@@ -566,7 +564,8 @@ void* auth_thread_func(void *arg) {
             if (account_id > 0) {
                 result = process_auth_message(buffer, account_id, response, sizeof(response));
                 printf("[AUTH_THREAD] process_auth_message returned: %d\n", result);
-            } else {
+            } 
+            else {
                 snprintf(response, sizeof(response), "Please use /login <username> <password> to authenticate\n");
                 printf("[AUTH_THREAD] No account_id available, sending login prompt\n");
             }
@@ -574,8 +573,8 @@ void* auth_thread_func(void *arg) {
             if (result == 1) { // Message processed successfully
                 // Check if user is actually fully authenticated
                 auth_flags_t auth_status = get_auth_status(account_id);
-                printf("[AUTH_THREAD] Socket %d: auth_status=%d, AUTH_FULLY_AUTHENTICATED=%d\n", 
-                       client_socket, auth_status, AUTH_FULLY_AUTHENTICATED);
+                printf("[AUTH_THREAD] Socket %d: auth_status=%d\n", 
+                       client_socket, auth_status);
                 
                 if (auth_status == AUTH_FULLY_AUTHENTICATED) {
                     printf("[AUTH_THREAD] Authentication COMPLETE for socket %d, promoting to chat...\n", client_socket);
@@ -901,11 +900,21 @@ EVP_PKEY* extract_public_key(X509* client_cert, int client_socket){
 // Extract client certificate - IMPROVED error handling
 X509* extract_client_cert(int client_socket) {
     uint32_t net_cert_len;
-    int recvd = recv(client_socket, &net_cert_len, sizeof(net_cert_len), MSG_WAITALL);
-    printf("recvd: %d\n", recvd);
-    if (recvd != sizeof(net_cert_len)) {
-        printf("Failed to receive certificate length from client.\n");
-        return NULL;
+    
+    // Read certificate length with retry logic
+    int total_read = 0;
+    while (total_read < sizeof(net_cert_len)) {
+        int recvd = recv(client_socket, ((char*)&net_cert_len) + total_read, 
+                        sizeof(net_cert_len) - total_read, 0);
+        if (recvd <= 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(1000); // Small delay
+                continue;
+            }
+            printf("Failed to receive certificate length from client.\n");
+            return NULL;
+        }
+        total_read += recvd;
     }
     
     uint32_t cert_len = ntohl(net_cert_len);
@@ -920,11 +929,21 @@ X509* extract_client_cert(int client_socket) {
         return NULL;
     }
     
-    recvd = recv(client_socket, cert_buf, cert_len, MSG_WAITALL);
-    if (recvd != (int)cert_len) {
-        printf("Failed to receive certificate data from client.\n");
-        free(cert_buf);
-        return NULL;
+    // Read certificate data with retry logic
+    total_read = 0;
+    while (total_read < (int)cert_len) {
+        int recvd = recv(client_socket, cert_buf + total_read, 
+                        cert_len - total_read, 0);
+        if (recvd <= 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(1000); // Small delay
+                continue;
+            }
+            printf("Failed to receive certificate data from client.\n");
+            free(cert_buf);
+            return NULL;
+        }
+        total_read += recvd;
     }
     
     cert_buf[cert_len] = '\0';
@@ -952,11 +971,19 @@ int setup_initial_connection(int client_socket) {
     printf("Setting up initial connection for %s:%d\n", 
            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
+    // Temporarily set socket to blocking
+    int flags = fcntl(client_socket, F_GETFL, 0);
+    fcntl(client_socket, F_SETFL, flags & ~O_NONBLOCK);
+
     // Extract certificate
     X509* client_cert = extract_client_cert(client_socket);
+
+    // Restore non-blocking mode after certificate extraction
+    fcntl(client_socket, F_SETFL, flags | O_NONBLOCK);
+
     if (!client_cert) {
         printf("Client certificate extraction failed. Closing connection.\n");
-        printf("receivd cert: %s\n",buffer);
+        printf("received cert: %s\n",buffer);
         remove_socket_info(client_socket);
         close(client_socket);
         return -1;
@@ -1430,6 +1457,7 @@ int main(int argc, char *argv[]) {
                 
                 // Handle initial connection setup BEFORE adding to epoll (certificate extraction, RSA challenge)
                 printf("[MAIN_EPOLL] Socket %d: starting initial setup\n", client_socket);
+                
                 if (setup_initial_connection(client_socket) == 0) {
                     // Setup successful, update socket state and add to epoll
                     socket_info_t *updated_info = get_socket_info(client_socket);

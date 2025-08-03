@@ -11,7 +11,7 @@
 #include <openssl/err.h>
 #include "hashmap/uthash.h"
 #include "decryptionFunctions/encryptionTools.h"
-#include "emailFunction.h"
+#include "emailFunctions/emailFunction.h"
 
 
 #define MAX_USERNAME_LEN 32
@@ -83,7 +83,7 @@ typedef enum {
     AUTH_PASSWORD = (1 << 0),    // 0001 - Password authentication completed
     AUTH_RSA = (1 << 1),         // 0010 - RSA challenge-response completed
     AUTH_EMAIL = (1 << 2),       // 0100 - Email challenge-response completed
-    AUTH_LOCKED = (1 << 3),      // 1000 - Account is locked
+    AUTH_STATUS_LOCKED = (1 << 3),      // 1000 - Account is locked
     AUTH_FULLY_AUTHENTICATED = AUTH_PASSWORD | AUTH_RSA | AUTH_EMAIL  // 0111 - Password, RSA, and Email
 } auth_flags_t;
 
@@ -130,6 +130,7 @@ typedef struct {
 #define AUTH_TOKEN_EXPIRED "AUTH_TOKEN_EXPIRED"
 #define AUTH_TOKEN_FAIL "AUTH_TOKEN_FAIL"
 #define AUTH_TOKEN_PROMPT "AUTH_TOKEN_PROMPT"
+#define AUTH_TOKEN_GEN_SUCCESS "AUTH_TOKEN_GEN_SUCCESS"
 
 // RSA Authentication commands
 #define RSA_AUTH_START "/rsa_start"
@@ -200,13 +201,13 @@ int process_auth_message(const char* message, int account_id, char* response, si
 int verify_email_token(int account_id, const char* token);
 int generate_new_token(int account_id);
 int is_token_expired(int account_id);
-int is_user_locked_out(int account_id);
 int get_remaining_lockout_time(int account_id);
 int handle_token_command(const char* message, int account_id);
 int handle_new_token_command(int account_id);
 void load_lockout_status(const char* filename);
 void save_lockout_status(const char* filename);
 int get_session_attempts(int account_id);
+void reset_token_attempts(int account_id);
 session_t* find_session(int account_id);
 // New function for RSA challenge with direct public key
 //rsa_challenge_result_t start_rsa_challenge_with_pubkey(EVP_PKEY* pubkey);
