@@ -848,54 +848,7 @@ void* handle_authenticated_client(void* arg) {
     return NULL;
 }
 
-// Extract public key function - IMPROVED error handling
-EVP_PKEY* extract_public_key(X509* client_cert, int client_socket){
-    uint32_t net_cert_len;
-    int recvd = recv(client_socket, &net_cert_len, sizeof(net_cert_len), MSG_WAITALL);
-    if (recvd != sizeof(net_cert_len)) {
-        printf("Failed to receive certificate length from client.\n");
-        return NULL;
-    }
-    
-    uint32_t cert_len = ntohl(net_cert_len);
-    if (cert_len == 0 || cert_len > 8192) {
-        printf("Invalid certificate length received: %u\n", cert_len);
-        return NULL;
-    }
-    
-    char* cert_buf = malloc(cert_len + 1);
-    if (!cert_buf) {
-        printf("Memory allocation failed for certificate buffer.\n");
-        return NULL;
-    }
-    
-    recvd = recv(client_socket, cert_buf, cert_len, MSG_WAITALL);
-    if (recvd != (int)cert_len) {
-        printf("Failed to receive certificate data from client.\n");
-        free(cert_buf);
-        return NULL;
-    }
-    
-    cert_buf[cert_len] = '\0';
-    BIO* cert_bio = BIO_new_mem_buf(cert_buf, cert_len);
-    client_cert = PEM_read_bio_X509(cert_bio, NULL, 0, NULL);
-    
-    BIO_free(cert_bio);
-    free(cert_buf);
-    
-    if (!client_cert) {
-        printf("Failed to parse client certificate.\n");
-        return NULL;
-    }
-    
-    EVP_PKEY* client_pubkey = X509_get_pubkey(client_cert);
-    if (!client_pubkey) {
-        printf("Failed to extract public key from client certificate.\n");
-        X509_free(client_cert);
-        return NULL;
-    }
-    return client_pubkey;
-}
+
 
 // Extract client certificate - IMPROVED error handling
 X509* extract_client_cert(int client_socket) {
