@@ -7,6 +7,7 @@
 #include "emailFunction.h"
 
 int useJSON = 1;  // If this is not set to 1, you need to define the emailFrom variable
+#define log_message_size 1024
 const char* emailConfigFile = "emailConfig.json";
 const char* emailFrom = "noreply@example.com";
 // Define all email lines
@@ -124,9 +125,10 @@ int read_credentials_json_full(const char *filename, char** from_email, char** t
     const cJSON *js_sender = cJSON_GetObjectItemCaseSensitive(json, "sender");
     const cJSON *js_receiver = cJSON_GetObjectItemCaseSensitive(json, "receiver");
     const cJSON *js_password = cJSON_GetObjectItemCaseSensitive(json, "password");
-    printf("DEBUG: js_sender: %s\n", js_sender->valuestring);
-    printf("DEBUG: js_receiver: %s\n", js_receiver->valuestring);
-    printf("DEBUG: js_password: %s\n", js_password->valuestring);
+    char log_message[log_message_size];
+    snprintf(log_message, sizeof(log_message), "[INFO][EMAIL_FUNCTION] js_sender: %s\n", js_sender->valuestring);
+    snprintf(log_message, sizeof(log_message), "[INFO][EMAIL_FUNCTION] js_receiver: %s\n", js_receiver->valuestring);
+    snprintf(log_message, sizeof(log_message), "[INFO][EMAIL_FUNCTION] js_password: %s\n", js_password->valuestring);
     if (!cJSON_IsString(js_sender) || !cJSON_IsString(js_receiver) || !cJSON_IsString(js_password)) {
         cJSON_Delete(json);
         return 4;
@@ -181,16 +183,14 @@ static size_t payload_source(void *ptr, size_t size, size_t nmemb, void *userp) 
     return to_send;
 }
 
-void send_email(emailContent_t* payload) {
+char* send_email(emailContent_t* payload) {
     if (!payload) {
-        printf("Error: NULL payload provided to send_email\n");
-        return;
+        return ("[ERROR]NULL payload provided to send_email\n");
     }
 
     // Validate that we have all required fields from the struct
     if (!payload->TO || !payload->subject || !payload->body) {
-        printf("Error: Missing required email fields (TO, subject, or body)\n");
-        return;
+        return ("[ERROR]Missing required email fields (TO, subject, or body)\n");
     }
 
     CURL *curl;
@@ -208,31 +208,26 @@ void send_email(emailContent_t* payload) {
         // Load FROM, TO, and PASSWORD from JSON file
         int result = read_credentials_json_full(emailConfigFile, &from_email, &to_email, &password);
         if (result != 0) {
-            printf("Failed to read credentials from JSON (error code: %d)\n", result);
-            return;
+            return ("[ERROR]Failed to read credentials from JSON\n");
         }
-        printf("Loaded credentials from JSON file\n");
     } else {
         // Use global emailFrom and load password from JSON, but use payload->TO
         from_email = strdup(emailFrom);
         to_email = strdup(payload->TO); // Use the TO from the struct
         int result = read_credentials_json_full(emailConfigFile, NULL, NULL, &password);
         if (result != 0) {
-            printf("Failed to read password from JSON (error code: %d)\n", result);
             free(from_email);
-            return;
+            return ("[ERROR]Failed to read password from JSON\n");
         }
-        printf("Using global FROM and struct TO\n");
     }
 
     // Format email content from the struct
     char* email_content = format_email_content(payload, from_email);
     if (!email_content) {
-        printf("Failed to format email content\n");
         free(from_email);
         free(to_email);
         free(password);
-        return;
+        return ("[ERROR]Failed to format email content\n");
     }
 
     // Initialize upload context
@@ -258,11 +253,8 @@ void send_email(emailContent_t* payload) {
 
         res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
-            fprintf(stderr, "curl_easy_perform() failed: %s\n",
-                    curl_easy_strerror(res));
-        } else {
-            printf("Email sent successfully!\n");
-        }
+            return ("[ERROR]curl_easy_perform() failed: %s\n");
+        } 
 
         curl_slist_free_all(recipients);
         curl_easy_cleanup(curl);
@@ -272,7 +264,10 @@ void send_email(emailContent_t* payload) {
     free(email_content);
     free(from_email);
     free(to_email);
-    free(password);
+    free(password);    
+    return ("[INFO]Email sent successfully!\n");
+
+
 }
 
 // Email token authentication functions
@@ -312,34 +307,4 @@ int send_email_token_to_user(const char* username, const char* email, const char
     
     return 1;
 }
-
-/*
-// Example usage for the new email system:
-
-// For testing with single email (useJSON = 1):
-// 1. Create emailConfig.json with:
-//    {
-//      "sender": "your_email@gmail.com",
-//      "receiver": "your_email@gmail.com", 
-//      "password": "your_app_password"
-//    }
-//
-// 2. Use the email system:
-emailContent_t email = {0};
-email.subject = strdup("Test Subject");
-email.body = strdup("Test email body");
-send_email(&email);
-cleanup_email_content(&email);
-
-// For production with different recipient (useJSON = 0):
-// 1. Set useJSON = 0
-// 2. Set emailFrom global variable
-// 3. Use the email system:
-emailContent_t email = {0};
-email.TO = strdup("recipient@example.com");
-email.subject = strdup("Test Subject");
-email.body = strdup("Test email body");
-send_email(&email);
-cleanup_email_content(&email);
-*/
 

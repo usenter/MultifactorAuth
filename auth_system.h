@@ -34,12 +34,14 @@
 #define RSA_HEX_BUFFER_SIZE (MAX_RSA_ENCRYPTED_SIZE * 2 + 64)  // Hex string + prefix/suffix
 #define MAX_FILE_PATH_LEN 512  // Maximum file path length for key files and such
 #define MAX_LINE_BUFFER_SIZE 512  // General line buffer for file reading
-
+#define AUTH_STATUS_UNLOCKED "AUTH_STATUS_UNLOCKED"
 // Verify challenge size is safe for OAEP padding
 #if RSA_CHALLENGE_SIZE > RSA_MAX_ENCRYPT_SIZE
 #error "RSA_CHALLENGE_SIZE too large for OAEP padding! Max size is RSA_MAX_ENCRYPT_SIZE bytes"
 #endif
 
+
+#define SERVER_LOG_FILE "server.log"
 
 
 
@@ -63,18 +65,24 @@ typedef struct {
     EVP_PKEY *public_key;
 } rsa_keypair_t;
 
+typedef struct {
+    unsigned int account_id;
+    time_t lockout_start_time;
+    int failed_attempts;
+    int is_locked;
+    UT_hash_handle hh;
+} persistent_lockout_t;
 // Email token authentication constants
 #define EMAIL_TOKEN_LENGTH 6
 #define MAX_TOKEN_ATTEMPTS 3
-#define LOCKOUT_DURATION 600  // 10 minutes in seconds
+#define LOCKOUT_DURATION 30  // 10 minutes in seconds
 #define TOKEN_EXPIRY_TIME 60  // 1 minute in seconds
 
 // Email token structure
 typedef struct {
     int token;
     time_t created_time;
-    int attempts;
-    time_t lockout_until;
+
 } email_token_t;
 
 // Authentication flags using bit operations
@@ -95,6 +103,7 @@ typedef struct {
     unsigned char challenge[RSA_CHALLENGE_SIZE];
     auth_flags_t auth_status;  // Authentication flags with bit operations
     email_token_t email_token;  // Email token for 2FA
+    persistent_lockout_t lockout_info;
     UT_hash_handle hh;  // Required for hash table functionality
 } session_t;
 
@@ -147,7 +156,8 @@ typedef struct {
     char username[MAX_USERNAME_LEN]; // Username from the command (for logging)
 } auth_result_t;
 
-// Function declarations
+// Function declarations   
+void FILE_LOG(const char* message);
 void init_auth_system(void);
 int init_encrypted_auth_system(char* userFile, char* key);
 int add_user(int account_id, const char* username, const char* password);
@@ -206,10 +216,15 @@ int handle_token_command(const char* message, int account_id);
 int handle_new_token_command(int account_id);
 void load_lockout_status(const char* filename);
 void save_lockout_status(const char* filename);
-int get_session_attempts(int account_id);
 void reset_token_attempts(int account_id);
 session_t* find_session(int account_id);
-// New function for RSA challenge with direct public key
+
+int check_persistent_lockout(unsigned int account_id);
+void save_lockout_state(void);
+void load_lockout_state(void);
+void record_failed_attempt(unsigned int account_id);
+void clear_failed_attempts(unsigned int account_id);
+int get_current_failed_attempts(unsigned int account_id);
 //rsa_challenge_result_t start_rsa_challenge_with_pubkey(EVP_PKEY* pubkey);
 
 #endif // AUTH_SYSTEM_H 

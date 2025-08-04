@@ -81,6 +81,46 @@ socket_info_t* get_socket_info(int socket) {
     return info;
 }
 
+int check_and_handle_lockout(int account_id, int client_socket) {
+    // First check persistent lockout state
+    int remaining_time = check_persistent_lockout(account_id);
+    
+    if (remaining_time > 0) {
+        char response[BUFFER_SIZE];
+        snprintf(response, sizeof(response), 
+                 "%s[PERSISTENT] Account is locked for %d more seconds due to failed authentication attempts.\n"
+                 "This lockout persists across connections. Please wait before trying again.\n", 
+                 AUTH_LOCKED, remaining_time);
+        send(client_socket, response, strlen(response), 0);
+        
+        printf("[LOCKOUT] Account %d attempted connection while locked (%d sec remaining)\n", 
+               account_id, remaining_time);
+        return 1; // Account is locked
+    }
+    
+    // Also check the existing auth system lockout
+    if (get_auth_status(account_id) & AUTH_STATUS_LOCKED) {
+        int auth_remaining = get_remaining_lockout_time(account_id);
+        if (auth_remaining > 0) {
+            char response[BUFFER_SIZE];
+            snprintf(response, sizeof(response), 
+                     "%s[SESSION] Account is locked for %d more seconds.\n", 
+                     AUTH_LOCKED, auth_remaining);
+            send(client_socket, response, strlen(response), 0);
+            return 1; // Account is locked
+        } else {
+            // Session lockout expired, send unlock message
+            char response[BUFFER_SIZE];
+            snprintf(response, sizeof(response), 
+                     "%s Account lockout has expired. You may now login.\n", 
+                     AUTH_STATUS_UNLOCKED);
+            send(client_socket, response, strlen(response), 0);
+            return 0; // Account is now unlocked
+        }
+    }
+    
+    return 0; // Account is not locked
+}
 void add_socket_info(int socket) {
     socket_info_t *info = malloc(sizeof(socket_info_t));
     if (!info) return;
@@ -141,7 +181,9 @@ void broadcast_message(const char* message, int sender_socket) {
             pthread_mutex_unlock(&clients_mutex);
             
             if (send(client_socket, message_with_newline, strlen(message_with_newline), 0) < 0) {
-                printf("[DEBUG] WARNING: Failed to send to socket %d\n", client_socket);
+                char log_message[BUFFER_SIZE];
+                snprintf(log_message, sizeof(log_message), "[WARN][MAIN_THREAD] Failed to send to socket %d\n", client_socket);
+                FILE_LOG(log_message);
                 client_t *c = find_client_by_socket(client_socket);
                 if(c){
                     c->active = 0;
@@ -288,12 +330,15 @@ void get_client_list(char* list_buffer, size_t buffer_size) {
 
 // Move socket from auth thread to command thread
 void promote_to_authenticated(int socket, int account_id) {
-    printf("[PROMOTE] Starting promotion for socket %d, account_id %d\n", socket, account_id);
+    char log_message[BUFFER_SIZE];
+    snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE-ID:%d] Starting promotion for socket %d\n", account_id, socket);
+    FILE_LOG(log_message);
     
     // Create client structure
     client_t *new_client = malloc(sizeof(client_t));
     if (!new_client) {
-        perror("Failed to allocate client structure");
+        snprintf(log_message, sizeof(log_message), "[ERROR][PROMOTE-ID:%d] Failed to allocate client structure\n", account_id);
+        FILE_LOG(log_message);
         return;
     }
     
@@ -320,9 +365,11 @@ void promote_to_authenticated(int socket, int account_id) {
     pthread_mutex_unlock(&clients_mutex);
     
     // Remove from auth epoll
-    printf("[PROMOTE] Removing socket %d from auth epoll\n", socket);
+    snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE-ID:%d] Removing socket %d from auth epoll\n", account_id, socket);
+    FILE_LOG(log_message);
     if (epoll_ctl(auth_thread_ctx.epoll_fd, EPOLL_CTL_DEL, socket, NULL) == -1) {
-        perror("Failed to remove from auth epoll");
+        snprintf(log_message, sizeof(log_message), "[ERROR][PROMOTE-ID:%d] Failed to remove from auth epoll\n", account_id);
+        FILE_LOG(log_message);
     }
     
     // Update socket state
@@ -333,7 +380,8 @@ void promote_to_authenticated(int socket, int account_id) {
         info->state = SOCKET_STATE_AUTHENTICATED;
         info->account_id = account_id;
         info->last_activity = time(NULL);
-        printf("[PROMOTE] Updated socket %d state to AUTHENTICATED\n", socket);
+        snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE-ID:%d] Updated socket %d state to AUTHENTICATED\n", account_id, socket);
+        FILE_LOG(log_message);
     }
     pthread_mutex_unlock(&socket_map_mutex);
     
@@ -341,16 +389,21 @@ void promote_to_authenticated(int socket, int account_id) {
     struct epoll_event event;
     event.events = EPOLLIN | EPOLLET;
     event.data.fd = socket;
-    printf("[PROMOTE] Adding socket %d to command thread epoll\n", socket);
+    snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE-ID:%d] Adding socket %d to command thread epoll\n", account_id, socket);
+    FILE_LOG(log_message);
     if (epoll_ctl(cmd_thread_ctx.epoll_fd, EPOLL_CTL_ADD, socket, &event) == -1) {
-        perror("Failed to add to command thread epoll");
+        snprintf(log_message, sizeof(log_message), "[ERROR][PROMOTE-ID:%d] Failed to add to command thread epoll\n", account_id);
+        FILE_LOG(log_message);
         remove_client(socket);
         return;
     }
-    printf("[PROMOTE] Successfully added socket %d to command thread epoll\n", socket);
+    snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE-ID:%d] Successfully added socket %d to command thread epoll\n", account_id, socket);
+    FILE_LOG(log_message);
     char response[BUFFER_SIZE];
     snprintf(response, sizeof(response), "AUTH_SUCCESS:You are now fully authenticated.\n");
     send(socket, response, strlen(response), 0);
+    snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE-ID:%d] Socket %d is fully authenticated\n", account_id, socket);
+    FILE_LOG(log_message);
     // Announce new user
     char announcement[BUFFER_SIZE];
     snprintf(announcement, sizeof(announcement), "%s has joined the chat", new_client->nickname);
@@ -362,10 +415,11 @@ void promote_to_authenticated(int socket, int account_id) {
 // Chat mode handler - IMPROVED with better error checking
 void handle_chat_mode(client_t *c, char *buffer, int client_socket){
     char broadcast_msg[BUFFER_SIZE];
-    
+    char log_message[BUFFER_SIZE];
     // Handle nickname change
     if (strncmp(buffer, "/nick ", 6) == 0) {
-        printf("[DEBUG] Handling /nick command from socket %d\n", client_socket);
+        snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD-ID:%d] Handling /nick command from socket %d\n", c->account_id, client_socket);
+        FILE_LOG(log_message);
         char new_nick[32];
         memset(new_nick, 0, sizeof(new_nick));
         strncpy(new_nick, buffer + 6, sizeof(new_nick) - 1);
@@ -415,6 +469,8 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
             snprintf(broadcast_msg, sizeof(broadcast_msg), 
                      "%s is now known as %s", old_nick, new_nick);
             broadcast_message(broadcast_msg, client_socket);
+            snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD-ID:%d] Nickname changed to '%s' for socket %d\n", c->account_id, new_nick, client_socket);
+            FILE_LOG(log_message);
         } else {
             pthread_mutex_unlock(&clients_mutex);
         }
@@ -423,7 +479,8 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
     
     // Handle list command
     if (strcmp(buffer, "/list") == 0) {
-        printf("[DEBUG] Handling /list command from socket %d\n", client_socket);
+        snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD-ID:%d] Handling /list command from socket %d\n", c->account_id, client_socket);
+        FILE_LOG(log_message);
         get_client_list(broadcast_msg, sizeof(broadcast_msg));
         send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
         return;
@@ -431,6 +488,8 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
     
     // Handle help command
     if (strcmp(buffer, "/help") == 0) {
+        snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD-ID:%d] Handling /help command from socket %d\n", c->account_id, client_socket);
+        FILE_LOG(log_message);
         snprintf(broadcast_msg, sizeof(broadcast_msg),
                  "Chat Commands:\n"
                  "  /nick <name> - Change your nickname\n"
@@ -445,18 +504,23 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
     
     // Handle file commands
     if (strncmp(buffer, "/file", 5) == 0) {
-        printf("[DEBUG] Handling /file command from socket %d\n", client_socket);
+        snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD-ID:%d] Handling /file command from socket %d\n", c->account_id, client_socket);
+        FILE_LOG(log_message);
         
         pthread_mutex_lock(&clients_mutex);
         // Use the client pointer that was already passed to this function
         if (c && c->active) {
             c->mode = CLIENT_MODE_FILE;
-            printf("[DEBUG] Client %d mode changed to FILE\n", client_socket);
+            snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD-ID:%d] Client %d mode changed to FILE\n", c->account_id, client_socket);
+            FILE_LOG(log_message);
         } else {
-            printf("[DEBUG] Client not found or inactive for socket %d\n", client_socket);
+            snprintf(log_message, sizeof(log_message), "[ERROR][CMD_THREAD-ID:%d] Client not found or inactive for socket %d\n", c->account_id, client_socket);
+            FILE_LOG(log_message);
         }
         pthread_mutex_unlock(&clients_mutex);
         
+        snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD-ID:%d] File mode activated for socket %d\n", c->account_id, client_socket);
+        FILE_LOG(log_message);
         snprintf(broadcast_msg, sizeof(broadcast_msg), "File mode activated\n");
         send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
         return;
@@ -476,7 +540,8 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
         broadcast_message(broadcast_msg, client_socket);
         
         // Log the message
-        printf("CHAT [%s] %s: %s\n", c->username, c->nickname, buffer);
+        snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD-ID:%d] CHAT [%s] %s: %s\n", c->account_id, c->username, c->nickname, buffer);
+        FILE_LOG(log_message);
         return;
     }
 }
@@ -487,19 +552,21 @@ void* auth_thread_func(void *arg) {
     thread_context_t *ctx = (thread_context_t *)arg;
     struct epoll_event events[MAX_EVENTS];
     char buffer[BUFFER_SIZE];
-    
-    printf("Authentication thread started\n");
+    char log_message[BUFFER_SIZE];
+    FILE_LOG("[INFO][AUTH_THREAD] Authentication thread started\n");
     
     while (ctx->running) {
         int nfds = epoll_wait(ctx->epoll_fd, events, MAX_EVENTS, 100);
         if (nfds == -1) {
             if (errno == EINTR) continue;
-            perror("epoll_wait in auth thread");
+            snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD] epoll_wait in auth thread: %s\n", strerror(errno));
+            FILE_LOG(log_message);
             break;
         }
         
         if (nfds > 0) {
-            printf("[AUTH_THREAD] epoll_wait returned %d events\n", nfds);
+            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD] epoll_wait returned %d events\n",  nfds);
+            FILE_LOG(log_message);
         }
         
         // Debug: dump socket states every few seconds when no events
@@ -519,7 +586,8 @@ void* auth_thread_func(void *arg) {
             
             ssize_t bytes_read = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
             if (bytes_read <= 0) {
-                printf("[AUTH_THREAD] Socket %d disconnected (bytes_read=%zd)\n", client_socket, bytes_read);
+                snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD-ID:%d] Socket %d disconnected (bytes_read=%zd)\n", info->account_id, client_socket, bytes_read);
+                FILE_LOG(log_message);
                 remove_socket_info(client_socket);
                 close(client_socket);
                 continue;
@@ -529,14 +597,18 @@ void* auth_thread_func(void *arg) {
             buffer[strcspn(buffer, "\r\n")] = 0;
             
             // Process authentication messages
-            printf("[AUTH_THREAD] Socket %d: received %zd bytes, state=%d, account_id=%d\n", 
-                   client_socket, bytes_read, info->state, info->account_id);
-            printf("[AUTH_THREAD] Socket %d: raw data: '%s'\n", client_socket, buffer);
+            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Socket %d: received %zd bytes, state=%d, account_id=%d\n", 
+                   info->account_id, client_socket, bytes_read, info->state, info->account_id);
+            FILE_LOG(log_message);
+            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Socket %d: raw data: '%s'\n", 
+                   info->account_id, client_socket, buffer);
+            FILE_LOG(log_message);
             char response[BUFFER_SIZE];
             
             // Skip processing if this is a new connection (shouldn't happen anymore, but safety check)
             if (info->state == SOCKET_STATE_NEW) {
-                printf("[AUTH_THREAD] WARNING: Socket %d in NEW state in epoll - this shouldn't happen\n", client_socket);
+                snprintf(log_message, sizeof(log_message), "[WARN][AUTH_THREAD-ID:%d] WARNING: Socket %d in NEW state in epoll - should not occur\n", info->account_id, client_socket);
+                FILE_LOG(log_message);
                 continue;
             }
             
@@ -555,37 +627,58 @@ void* auth_thread_func(void *arg) {
                         if (info) {
                             info->account_id = account_id;
                         }
-                        printf("[AUTH_THREAD] Set account_id %d for socket %d\n", account_id, client_socket);
+                        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Set account_id %d for socket %d\n", info->account_id, account_id, client_socket);
+                        FILE_LOG(log_message);
                     }
                 }
             }
             
             int result = 0;
             if (account_id > 0) {
+                // Check for lockout before processing any auth attempt
+                if (check_and_handle_lockout(account_id, client_socket)) {
+                    continue; // Skip processing if locked
+                }
+                if(strcmp(buffer, "/time") == 0){
+                    check_and_handle_lockout(account_id, client_socket);
+                    continue; 
+                }
                 result = process_auth_message(buffer, account_id, response, sizeof(response));
-                printf("[AUTH_THREAD] process_auth_message returned: %d\n", result);
+                snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] process_auth_message returned: %d\n", info->account_id, result);
+                FILE_LOG(log_message);
             } 
             else {
                 snprintf(response, sizeof(response), "Please use /login <username> <password> to authenticate\n");
-                printf("[AUTH_THREAD] No account_id available, sending login prompt\n");
+                snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD-ID:NA] No account_id available for socket %d, sending login prompt\n", client_socket);
+                FILE_LOG(log_message);
             }
             
             if (result == 1) { // Message processed successfully
                 // Check if user is actually fully authenticated
                 auth_flags_t auth_status = get_auth_status(account_id);
-                printf("[AUTH_THREAD] Socket %d: auth_status=%d\n", 
-                       client_socket, auth_status);
+                snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Socket %d: auth_status=%d\n", 
+                       info->account_id, client_socket, auth_status);
+                FILE_LOG(log_message);
                 
                 if (auth_status == AUTH_FULLY_AUTHENTICATED) {
-                    printf("[AUTH_THREAD] Authentication COMPLETE for socket %d, promoting to chat...\n", client_socket);
+                    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Authentication COMPLETE for socket %d, promoting to chat...\n", info->account_id, client_socket);
+                    FILE_LOG(log_message);
                     promote_to_authenticated(client_socket, account_id);
-                    printf("[AUTH_THREAD] Promotion complete for socket %d\n", client_socket);
+                    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Promotion complete for socket %d\n", info->account_id, client_socket);
+                    FILE_LOG(log_message);
                 } else {
-                    printf("[AUTH_THREAD] Authentication INCOMPLETE for socket %d, sending response\n", client_socket);
+                    
+                    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Authentication INCOMPLETE for socket %d, sending response\n", info->account_id, client_socket);
+                    FILE_LOG(log_message);
                     send(client_socket, response, strlen(response), 0);
                 }
-            } else {
-                printf("[AUTH_THREAD] Message processing failed, sending response to socket %d: '%s'\n", client_socket, response);
+            } 
+            else {
+                snprintf(log_message, 
+                    sizeof(log_message), 
+                    "[ERROR][AUTH_THREAD:%d] Message processing failed, sending response to socket %d: '%s'\n", 
+                    account_id, client_socket, response);
+                FILE_LOG(log_message);
                 send(client_socket, response, strlen(response), 0);
             }
         }
@@ -600,19 +693,23 @@ void* cmd_thread_func(void *arg) {
     thread_context_t *ctx = (thread_context_t *)arg;
     struct epoll_event events[MAX_EVENTS];
     char buffer[BUFFER_SIZE];
-    
-    printf("Command handler thread started\n");
+    char log_message[BUFFER_SIZE];
+
+    snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD] Command handler thread started\n");
+    FILE_LOG(log_message);
     
     while (ctx->running) {
         int nfds = epoll_wait(ctx->epoll_fd, events, MAX_EVENTS, 100);
         if (nfds == -1) {
             if (errno == EINTR) continue;
-            perror("epoll_wait in cmd thread");
+            snprintf(log_message, sizeof(log_message), "[ERROR][CMD_THREAD] epoll_wait in cmd thread: %s\n", strerror(errno));
+            FILE_LOG(log_message);
             break;
         }
         
         if (nfds > 0) {
-            printf("[CMD_THREAD] epoll_wait returned %d events\n", nfds);
+            snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD] epoll_wait returned %d events\n", nfds);
+            FILE_LOG(log_message);
         }
         
         for (int i = 0; i < nfds; i++) {
@@ -627,16 +724,20 @@ void* cmd_thread_func(void *arg) {
             
             ssize_t bytes_read = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
             if (bytes_read <= 0) {
-                printf("[CMD_THREAD] Socket %d disconnected (bytes_read=%zd)\n", client_socket, bytes_read);
+                snprintf(log_message, sizeof(log_message), "[ERROR][CMD_THREAD-ID:%d] Socket %d disconnected (bytes_read=%zd)\n", info->account_id, client_socket, bytes_read);
+                FILE_LOG(log_message);
                 remove_socket_info(client_socket);
                 close(client_socket);
                 continue;
             }
             
             buffer[bytes_read] = '\0';
-            printf("[CMD_THREAD] Socket %d: received %zd bytes, state=%d, account_id=%d\n", 
-                   client_socket, bytes_read, info->state, info->account_id);
-            printf("[CMD_THREAD] Socket %d: raw data: '%s'\n", client_socket, buffer);
+            snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD-ID:%d] Socket %d: received %zd bytes, state=%d\n", 
+                   info->account_id, client_socket, bytes_read, info->state);
+            FILE_LOG(log_message);
+            snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD-ID:%d] Socket %d: raw data: '%s'\n", 
+                   info->account_id, client_socket, buffer);
+            FILE_LOG(log_message);
             buffer[strcspn(buffer, "\r\n")] = 0;
             
             // Handle commands and messages using client mode
@@ -704,7 +805,9 @@ pthread_mutex_t server_socket_mutex = PTHREAD_MUTEX_INITIALIZER; // NEW: protect
 // Signal handler for graceful shutdown
 void signal_handler(int sig) {
     (void)sig; // Suppress unused parameter warning
-    printf("\nServer shutdown requested...\n");
+    char log_message[BUFFER_SIZE];
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Server shutdown requested...\n");
+    FILE_LOG(log_message);
     server_running = 0;
     
     // Close server socket to unblock accept() - with proper synchronization
@@ -718,6 +821,7 @@ void signal_handler(int sig) {
 
 // Function to add a new authenticated client - FIXED
 void add_authenticated_client(client_t *new_client) {
+    char log_message[BUFFER_SIZE];
     printf("[ADD_CLIENT] Adding authenticated client for user '%s' (socket %d)\n", 
            new_client->username, new_client->socket);
     
@@ -728,7 +832,8 @@ void add_authenticated_client(client_t *new_client) {
     HASH_FIND_INT(clients_map, &new_client->socket, existing);
     if (existing) {
         pthread_mutex_unlock(&clients_mutex);
-        printf("[ADD_CLIENT] Warning: Client socket %d already exists in map\n", new_client->socket);
+        snprintf(log_message, sizeof(log_message), "[WARN][AUTH_THREAD-ID:%d] Warning: Client socket %d already exists in map\n", new_client->account_id, new_client->socket);
+        FILE_LOG(log_message);
         return;
     }
     
@@ -736,8 +841,9 @@ void add_authenticated_client(client_t *new_client) {
     client_t *duplicate = NULL, *tmp = NULL;
     HASH_ITER(hh, clients_map, duplicate, tmp) {
         if (duplicate->active && strcmp(duplicate->username, new_client->username) == 0) {
-            printf("[ADD_CLIENT] Found existing client for user '%s' (socket %d), removing...\n", 
-                   duplicate->username, duplicate->socket);
+            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Removing existing client for user '%s' (socket %d)\n", 
+                   duplicate->account_id, duplicate->username, duplicate->socket);
+            FILE_LOG(log_message);
             HASH_DEL(clients_map, duplicate);
             client_count--;
             close(duplicate->socket);
@@ -748,8 +854,9 @@ void add_authenticated_client(client_t *new_client) {
     
     HASH_ADD_INT(clients_map, socket, new_client);
     client_count++;
-    printf("[ADD_CLIENT] Successfully added client for user '%s' (socket %d). Total clients: %d\n", 
-           new_client->username, new_client->socket, client_count);
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Successfully added client for user '%s' (socket %d). Total clients: %d\n", 
+           new_client->account_id, new_client->username, new_client->socket, client_count);
+    FILE_LOG(log_message);
     
     pthread_mutex_unlock(&clients_mutex);
 }
@@ -853,18 +960,21 @@ void* handle_authenticated_client(void* arg) {
 // Extract client certificate - IMPROVED error handling
 X509* extract_client_cert(int client_socket) {
     uint32_t net_cert_len;
-    
+    char log_message[BUFFER_SIZE];
+    client_t *c = find_client_by_socket(client_socket);
     // Read certificate length with retry logic
-    int total_read = 0;
+    unsigned long total_read = 0;
     while (total_read < sizeof(net_cert_len)) {
         int recvd = recv(client_socket, ((char*)&net_cert_len) + total_read, 
                         sizeof(net_cert_len) - total_read, 0);
         if (recvd <= 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(1000); // Small delay
+                struct timespec delay = {0, 100000000}; 
+                nanosleep(&delay, NULL);
                 continue;
             }
-            printf("Failed to receive certificate length from client.\n");
+            snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Failed to receive certificate length from client.\n", c->account_id);
+            FILE_LOG(log_message);
             return NULL;
         }
         total_read += recvd;
@@ -872,27 +982,31 @@ X509* extract_client_cert(int client_socket) {
     
     uint32_t cert_len = ntohl(net_cert_len);
     if (cert_len == 0 || cert_len > 8192) {
-        printf("Invalid certificate length received: %u\n", cert_len);
+        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Invalid certificate length received: %u\n", c->account_id, cert_len);
+        FILE_LOG(log_message);
         return NULL;
     }
     
     char* cert_buf = malloc(cert_len + 1);
     if (!cert_buf) {
-        printf("Memory allocation failed for certificate buffer.\n");
+        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Memory allocation failed for certificate buffer.\n", c->account_id);
+        FILE_LOG(log_message);
         return NULL;
     }
     
     // Read certificate data with retry logic
     total_read = 0;
-    while (total_read < (int)cert_len) {
+    while (total_read < (unsigned long)cert_len) {
         int recvd = recv(client_socket, cert_buf + total_read, 
                         cert_len - total_read, 0);
         if (recvd <= 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(1000); // Small delay
+                struct timespec delay = {0, 100000000}; 
+                nanosleep(&delay, NULL);
                 continue;
             }
-            printf("Failed to receive certificate data from client.\n");
+            snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Failed to receive certificate data from client.\n", c->account_id);
+            FILE_LOG(log_message);
             free(cert_buf);
             return NULL;
         }
@@ -906,7 +1020,8 @@ X509* extract_client_cert(int client_socket) {
     free(cert_buf);
     
     if (!client_cert) {
-        printf("Failed to parse client certificate.\n");
+        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Failed to parse client certificate.\n", c->account_id);
+        FILE_LOG(log_message);
         return NULL;
     }
     return client_cert;
@@ -914,15 +1029,17 @@ X509* extract_client_cert(int client_socket) {
 
 // implemennts initial connection setup for epoll architecture
 int setup_initial_connection(int client_socket) {
+    char log_message[BUFFER_SIZE];
+    char response[BUFFER_SIZE];
+
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof(client_addr);
     getpeername(client_socket, (struct sockaddr*)&client_addr, &addr_len);
     
-    char buffer[BUFFER_SIZE];
-    char response[BUFFER_SIZE];
     
-    printf("Setting up initial connection for %s:%d\n", 
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD] Setting up initial connection for %s:%d\n", 
            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+    FILE_LOG(log_message);
 
     // Temporarily set socket to blocking
     int flags = fcntl(client_socket, F_GETFL, 0);
@@ -935,8 +1052,8 @@ int setup_initial_connection(int client_socket) {
     fcntl(client_socket, F_SETFL, flags | O_NONBLOCK);
 
     if (!client_cert) {
-        printf("Client certificate extraction failed. Closing connection.\n");
-        printf("received cert: %s\n",buffer);
+        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD] Client certificate extraction failed. Closing connection.\n");
+        FILE_LOG(log_message);
         remove_socket_info(client_socket);
         close(client_socket);
         return -1;
@@ -944,18 +1061,20 @@ int setup_initial_connection(int client_socket) {
     
     EVP_PKEY* client_pubkey = X509_get_pubkey(client_cert);
     if (!client_pubkey) {
-        printf("Failed to extract public key from client certificate.\n");
+        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD] Failed to extract public key from client certificate.\n");
+        FILE_LOG(log_message);
         X509_free(client_cert);
         remove_socket_info(client_socket);
         close(client_socket);
         return -1;
     }
     
-    // Print subject CN for debug
+    // Print subject CN 
     X509_NAME* subj = X509_get_subject_name(client_cert);
     char cn[256];
     X509_NAME_get_text_by_NID(subj, NID_commonName, cn, sizeof(cn));
-    printf("Received client certificate. Subject CN: %s\n", cn);
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD] Received client certificate. Subject CN: %s\n", cn);
+    FILE_LOG(log_message);
 
     // Receive username
     char username_buffer[BUFFER_SIZE];
@@ -963,10 +1082,12 @@ int setup_initial_connection(int client_socket) {
     char username[MAX_USERNAME_LEN] = "";
     unsigned int account_id = 0;
     
-    printf("[SETUP] Socket %d: received %d bytes for username\n", client_socket, name_bytes);
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD] Socket %d: received %d bytes for username\n", client_socket, name_bytes);
+    FILE_LOG(log_message);
     
     if (name_bytes <= 0) {
-        printf("[SETUP] Socket %d: client disconnected before sending username\n", client_socket);
+        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD] Socket %d: client disconnected before sending username\n", client_socket);
+        FILE_LOG(log_message);
         EVP_PKEY_free(client_pubkey);
         X509_free(client_cert);
         remove_socket_info(client_socket);
@@ -976,7 +1097,8 @@ int setup_initial_connection(int client_socket) {
     
     username_buffer[name_bytes] = '\0';
     username_buffer[strcspn(username_buffer, "\r\n")] = 0;
-    printf("[SETUP] Socket %d: username data: '%s'\n", client_socket, username_buffer);
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD] Socket %d: username data: '%s'\n", client_socket, username_buffer);
+    FILE_LOG(log_message);
 
     if (strncmp(username_buffer, "USERNAME:", 9) == 0) {
         strncpy(username, username_buffer + 9, MAX_USERNAME_LEN - 1);
@@ -984,9 +1106,11 @@ int setup_initial_connection(int client_socket) {
         
         username_t *uname_entry = find_username(username);
         if (!uname_entry) {
-            printf("Invalid username received: %s\n", username);
+            snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD] Invalid username received: %s\n", username);
+            FILE_LOG(log_message);
             snprintf(response, sizeof(response), "ERROR: Invalid username\n");
             send(client_socket, response, strlen(response), 0);
+            
             EVP_PKEY_free(client_pubkey);
             X509_free(client_cert);
             remove_socket_info(client_socket);
@@ -997,8 +1121,9 @@ int setup_initial_connection(int client_socket) {
         account_id = uname_entry->account_id;
         user_t *user = find_user(account_id);
         if (!user) {
-            printf("Invalid account_id received: %u\n", account_id);
-            snprintf(response, sizeof(response), "ERROR: Invalid account_id\n");
+            snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD] Invalid account_id received: %u\n", account_id);
+            FILE_LOG(log_message);
+            snprintf(response, sizeof(response), "[ERROR][AUTH_THREAD] Invalid account_id\n");
             send(client_socket, response, strlen(response), 0);
             EVP_PKEY_free(client_pubkey);
             X509_free(client_cert);
@@ -1006,15 +1131,43 @@ int setup_initial_connection(int client_socket) {
             close(client_socket);
             return -1;
         }
+        if(get_auth_status(account_id) & AUTH_STATUS_LOCKED){
+            if(get_remaining_lockout_time(account_id) > 0){
+            snprintf(response, sizeof(response), "%s Account is locked for %d more seconds due to too many failed attempts.\n", 
+                AUTH_LOCKED, get_remaining_lockout_time(account_id));
+            send(client_socket, response, strlen(response), 0);
+            snprintf(log_message, sizeof(log_message), "[WARN][AUTH_THREAD] Account is locked for %d more seconds due to too many failed attempts.\n", get_remaining_lockout_time(account_id));
+            FILE_LOG(log_message);
+            EVP_PKEY_free(client_pubkey);
+            X509_free(client_cert);
+            remove_socket_info(client_socket);
+            close(client_socket);
+            return -1;
+            }
+            else if(get_remaining_lockout_time(account_id) <= 0){
+                session_t *session = find_session(account_id);
+                if(session){
+                    session->auth_status = AUTH_NONE;
+                }
+                snprintf(response, sizeof(response), "%s Account is unlocked. Please login with: /login <username> <password>\n", 
+                AUTH_STATUS_UNLOCKED);
+                send(client_socket, response, strlen(response), 0);
+                snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Account is unlocked.\n", account_id);
+                FILE_LOG(log_message);
+            }
+        }
         
         user->public_key = client_pubkey;
         client_pubkey = NULL; // Ownership transferred
         
-        printf("Valid username received: %s (account_id: %u)\n", username, account_id);
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Valid username received: %s \n", account_id, username);
+        FILE_LOG(log_message);
         
         // Create authentication session (chamber)
         if (!create_auth_session(account_id)) {
-            printf("Failed to create authentication session for %s\n", username);
+            snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Failed to create authentication session for %s\n", account_id, username);
+            FILE_LOG(log_message);
+
             snprintf(response, sizeof(response), "ERROR: Failed to create session\n");
             send(client_socket, response, strlen(response), 0);
             EVP_PKEY_free(client_pubkey);
@@ -1031,12 +1184,25 @@ int setup_initial_connection(int client_socket) {
             info->account_id = account_id;
             pthread_mutex_unlock(&socket_map_mutex);
         }
-        
-        printf("Authentication chamber created for %s (account_id: %u)\n", username, account_id);
+        else{
+            snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Failed to get socket info for %s\n", account_id, username);
+            FILE_LOG(log_message);
+            EVP_PKEY_free(client_pubkey);
+            X509_free(client_cert);
+            remove_socket_info(client_socket);
+            close(client_socket);
+            return -1;
+        }
+        if(check_and_handle_lockout(account_id, client_socket)){
+            return -1;
+        }
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Authentication chamber created for %s\n", account_id, username);
+        FILE_LOG(log_message);
         
         // Generate RSA challenge
         if (is_rsa_system_initialized()) {
-            printf("Initiating automatic RSA challenge for %s\n", username);
+            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Initiating automatic RSA challenge for %s\n", account_id, username);
+            FILE_LOG(log_message);
             rsa_challenge_result_t rsa_result = start_rsa_challenge_for_client(account_id, user->public_key);
             
             if (rsa_result.success && rsa_result.encrypted_size > 0) {
@@ -1048,9 +1214,11 @@ int setup_initial_connection(int client_socket) {
                 }
                 strcat(hex_output, "\n");
                 send(client_socket, hex_output, strlen(hex_output), 0);
-                printf("RSA challenge sent to %s\n", username);
+                snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] RSA challenge sent to %s\n", account_id, username);
+                FILE_LOG(log_message);
             } else {
-                printf("Failed to generate/send RSA challenge for %s\n", username);
+                snprintf(log_message,sizeof(log_message),"[CRITICAL][AUTH_THREAD-ID:%d] Failed to generate/send RSA challenge for %s\n", account_id, username);
+                FILE_LOG(log_message);
                 EVP_PKEY_free(client_pubkey);
                 X509_free(client_cert);
                 remove_socket_info(client_socket);
@@ -1060,16 +1228,21 @@ int setup_initial_connection(int client_socket) {
         }
         
         // Send authentication prompt
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Sending authentication prompt to %s\n", account_id, username);
+        FILE_LOG(log_message);
         snprintf(response, sizeof(response),
                  "%s - Authentication Required\n"
                  "========================================\n"
                  "Please authenticate to access the chat:\n"
-                 "  /login <username> <password> - Login with existing account\n"
-                 "  /register <username> <password> - Create new account\n\n", PROGRAM_NAME);
+                 "  /login <username> <password> - Login with existing account\n", PROGRAM_NAME);
+                 // will be implemented later
+                 //"  /register <username> <password> - Create new account\n\n", PROGRAM_NAME);
         send(client_socket, response, strlen(response), 0);
         
-    } else {
-        printf("Invalid username format received\n");
+    } 
+    else {
+        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Invalid username format received\n", account_id);
+        FILE_LOG(log_message);
         snprintf(response, sizeof(response), "ERROR: Invalid username format\n");
         send(client_socket, response, strlen(response), 0);
         EVP_PKEY_free(client_pubkey);
@@ -1078,13 +1251,24 @@ int setup_initial_connection(int client_socket) {
         close(client_socket);
         return -1;
     }
-    
+    if (account_id > 0) {
+        if (check_and_handle_lockout(account_id, client_socket)) {
+            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Connection rejected for account %u - locked out\n", account_id, account_id);
+            FILE_LOG(log_message);
+            EVP_PKEY_free(client_pubkey);
+            X509_free(client_cert);
+            remove_socket_info(client_socket);
+            close(client_socket);
+            return -1; // Reject connection entirely
+        }
+    }
     if (client_pubkey) {
         EVP_PKEY_free(client_pubkey);
     }
     X509_free(client_cert);
     
-    printf("Initial connection setup completed for %s (account_id: %u)\n", username, account_id);
+    snprintf(log_message, sizeof(log_message),"[INFO][AUTH_THREAD-ID:%d] Initial connection setup completed for %s \n", account_id, username);
+    FILE_LOG(log_message);
     return 0; // Success
 }
 
@@ -1092,6 +1276,9 @@ int setup_initial_connection(int client_socket) {
 // Function to broadcast shutdown message to all authenticated clients - IMPROVED
 void broadcast_shutdown_message(void) {
     char shutdown_msg[BUFFER_SIZE];
+    char log_message[BUFFER_SIZE];
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Broadcasting shutdown message to all authenticated clients\n");
+    FILE_LOG(log_message);
     snprintf(shutdown_msg, sizeof(shutdown_msg), 
              "Server is shutting down. Goodbye!\n");
     
@@ -1107,10 +1294,15 @@ void broadcast_shutdown_message(void) {
         }
     }
     pthread_mutex_unlock(&clients_mutex);
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Shutdown message broadcasted to all authenticated clients\n");
+    FILE_LOG(log_message);
 }
 
 // Print usage information
 void print_usage(const char *program_name) {
+    char log_message[BUFFER_SIZE];
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Printing usage information\n");
+    FILE_LOG(log_message);
     printf("%s - Secure Authenticated Chat Server\n", PROGRAM_NAME);
     printf("Requires encrypted user database to start\n\n");
     
@@ -1143,43 +1335,51 @@ void print_usage(const char *program_name) {
 
 // Print version information
 void print_version(void) {
+    char log_message[BUFFER_SIZE];
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Printing version information\n");
+    FILE_LOG(log_message);
     printf("%s\n", PROGRAM_NAME);
     printf("Secure authenticated chat server with encrypted user database\n");
+    FILE_LOG(log_message);
     printf("Built with OpenSSL encryption and POSIX threads\n");
+    FILE_LOG(log_message);
 }
 
 // Cleanup function for graceful shutdown - COMPLETELY REWRITTEN
 void cleanup_server(void) {
-    printf("Cleaning up server resources...\n");
-    
-    // First, broadcast shutdown message
+    char log_message[BUFFER_SIZE];
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Cleaning up server resources...\n");
+    FILE_LOG(log_message);
     broadcast_shutdown_message();
     
-    // Give clients a moment to receive the shutdown message
-    struct timespec delay = {0, 100000000}; // 100ms in nanoseconds
+    // Wait for clients to receive the shutdown message
+    struct timespec delay = {0, 100000000}; 
     nanosleep(&delay, NULL);
     
-    // Close all client connections to unblock recv() calls
-    printf("Closing all client sockets...\n");
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Closing all client sockets...\n");
+    FILE_LOG(log_message);
     pthread_mutex_lock(&clients_mutex);
     client_t *c, *tmp;
     HASH_ITER(hh, clients_map, c, tmp) {
         if (c->active) {
-            close(c->socket); // This will unblock recv() in handler threads
-            c->active = 0;    // Mark as inactive
+            close(c->socket); 
+            c->active = 0;    
         }
     }
     pthread_mutex_unlock(&clients_mutex);
     
-    // Stop worker threads
-    printf("Stopping worker threads...\n");
+    
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Stopping worker threads...\n");
+    FILE_LOG(log_message);
     auth_thread_ctx.running = 0;
     cmd_thread_ctx.running = 0;
     
     // Wait for threads to finish
-    printf("Waiting for auth thread...\n");
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Waiting for auth thread...\n");
+    FILE_LOG(log_message);
     pthread_join(auth_thread_ctx.thread_id, NULL);
-    printf("Waiting for command thread...\n");
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Waiting for command thread...\n");
+    FILE_LOG(log_message);
     pthread_join(cmd_thread_ctx.thread_id, NULL);
     
     // Close epoll fds
@@ -1188,6 +1388,8 @@ void cleanup_server(void) {
     
     // Clean up socket map
     socket_info_t *current, *temp_socket;
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Cleaning up socket map...\n");
+    FILE_LOG(log_message);
     pthread_mutex_lock(&socket_map_mutex);
     HASH_ITER(hh, socket_map, current, temp_socket) {
         HASH_DEL(socket_map, current);
@@ -1197,7 +1399,8 @@ void cleanup_server(void) {
     pthread_mutex_unlock(&socket_map_mutex);
     
     // Now safely free all remaining clients
-    printf("Freeing remaining client structures...\n");
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Freeing remaining client map...\n");
+    FILE_LOG(log_message);
     pthread_mutex_lock(&clients_mutex);
     client_t *current_client, *temp_client;
     HASH_ITER(hh, clients_map, current_client, temp_client) {
@@ -1212,10 +1415,13 @@ void cleanup_server(void) {
     pthread_mutex_destroy(&thread_count_mutex);
     pthread_mutex_destroy(&server_socket_mutex);
     
-    printf("Server cleanup complete\n");
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Server cleanup complete\n");
+    FILE_LOG(log_message);
 }
 
 int main(int argc, char *argv[]) {
+    char log_message[BUFFER_SIZE];
+
     // Handle special arguments
     if (argc == 2) {
         if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
@@ -1230,7 +1436,9 @@ int main(int argc, char *argv[]) {
     
     // Validate arguments
     if (argc != 2) {
-        fprintf(stderr, "Error: Database password required\n\n");
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Database password was not entered\n\n");
+        FILE_LOG(log_message);
+        printf("DATABASE PASSWORD REQUIRED\n\n");
         print_usage(argv[0]);
         return 1;
     }
@@ -1239,34 +1447,42 @@ int main(int argc, char *argv[]) {
     
     const char* database_password = argv[1];
     
-    printf("Starting %s...\n", PROGRAM_NAME);
-    printf("User database file: %s\n", user_file);
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Starting %s by reading user base at %s\n", PROGRAM_NAME, user_file);
+    FILE_LOG(log_message);
+
     
     // Initialize authentication system with encrypted database
-    printf("Decrypting user database...\n");
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Decrypting user database...\n");
+    FILE_LOG(log_message);
     if(!init_encrypted_auth_system(user_file, (char*)database_password)){
-        printf("Failed to initialize authentication system\n");
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Failed to initialize authentication system\n");
+        FILE_LOG(log_message);
         return 1;
     }
-    printf("User database loaded successfully!\n");
+    printf("User Database succesfully loaded!\n");
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] User database loaded successfully!\n");
+    FILE_LOG(log_message);
     
     // Initialize RSA authentication system
-    printf("Initializing RSA authentication...\n");
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Initializing RSA authentication...\n");
     if (!init_rsa_system("RSAkeys/server_private.pem", "RSAkeys/server_public.pem")) {
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Server RSA keys not found!\n");
+        FILE_LOG(log_message);
         printf("ERROR: RSA authentication keys not found!\n");
         printf("This server requires RSA two-factor authentication.\n");
-        printf("\nTo generate required keys:\n");
         printf("  1. Run: ./generate_rsa_keys server\n");
-        printf("  2. Run: ./generate_rsa_keys client [username]  # e.g., alice, bob, etc.\n");
-        printf("\nServer cannot start without RSA keys.\n");
+        printf("\nServer CANNOT start without this step.\n");
         return 1;
     }
-    printf("RSA two-factor authentication enabled!\n");
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] RSA two-factor authentication enabled!\n");
+    FILE_LOG(log_message);
     if(!init_email_system("userStatus.txt")){
-        printf("Failed to initialize email system\n");
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Failed to initialize email system\n");
+        FILE_LOG(log_message);
         return 1;
     }
-    printf("Email system initialized!\n");
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Email system initialized!\n");
+    FILE_LOG(log_message);
 
     // Removed unused work queue initialization and thread creation
 
@@ -1279,14 +1495,16 @@ int main(int argc, char *argv[]) {
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0) {
         pthread_mutex_unlock(&server_socket_mutex);
-        fprintf(stderr, "Socket creation failed\n");
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Socket creation failed\n");
+        FILE_LOG(log_message);
         return 1;
     }
     
     // Set socket options for address reuse
     int opt = 1;
     if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        fprintf(stderr, "setsockopt failed\n");
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] setsockopt failed\n");
+        FILE_LOG(log_message);
         close(server_socket);
         server_socket = -1;
         pthread_mutex_unlock(&server_socket_mutex);
@@ -1301,7 +1519,8 @@ int main(int argc, char *argv[]) {
     
     // Bind socket
     if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        fprintf(stderr, "Bind failed on port %d\n", PORT);
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Bind failed on port %d\n", PORT);
+        FILE_LOG(log_message);
         close(server_socket);
         server_socket = -1;
         pthread_mutex_unlock(&server_socket_mutex);
@@ -1310,7 +1529,8 @@ int main(int argc, char *argv[]) {
     
     // Listen for connections
     if (listen(server_socket, 10) < 0) {
-        fprintf(stderr, "Listen failed\n");
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Listen failed\n");
+        FILE_LOG(log_message);
         close(server_socket);
         server_socket = -1;
         pthread_mutex_unlock(&server_socket_mutex);
@@ -1321,28 +1541,30 @@ int main(int argc, char *argv[]) {
     
     printf("Server listening on port %d\n", PORT);
     printf("Maximum clients: %d\n", MAX_CLIENTS);
-    printf("Session timeout: %d minutes\n", AUTH_TIMEOUT / 60);
     printf("Server ready! Press Ctrl+C to exit\n");
     printf("========================================================================\n");
     
     // Set up epoll for main thread (accepting connections)
     int main_epoll_fd = epoll_create1(0);
     if (main_epoll_fd == -1) {
-        perror("epoll_create1 (main)");
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] epoll_create1 (main) failed\n");
+        FILE_LOG(log_message);
         return 1;
     }
     
     // Set up epoll for auth thread
     auth_thread_ctx.epoll_fd = epoll_create1(0);
     if (auth_thread_ctx.epoll_fd == -1) {
-        perror("epoll_create1 (auth)");
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] epoll_create1 (auth) failed\n");
+        FILE_LOG(log_message);
         return 1;
     }
     
     // Set up epoll for command thread
     cmd_thread_ctx.epoll_fd = epoll_create1(0);
     if (cmd_thread_ctx.epoll_fd == -1) {
-        perror("epoll_create1 (cmd)");
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] epoll_create1 (cmd) failed\n");
+        FILE_LOG(log_message);
         return 1;
     }
     
@@ -1357,12 +1579,14 @@ int main(int argc, char *argv[]) {
     cmd_thread_ctx.running = 1;
     
     if (pthread_create(&auth_thread_ctx.thread_id, NULL, auth_thread_func, &auth_thread_ctx) != 0) {
-        perror("Failed to create auth thread");
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Failed to create auth thread\n");
+        FILE_LOG(log_message);
         return 1;
     }
     
     if (pthread_create(&cmd_thread_ctx.thread_id, NULL, cmd_thread_func, &cmd_thread_ctx) != 0) {
-        perror("Failed to create command thread");
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Failed to create command thread\n");
+        FILE_LOG(log_message);
         return 1;
     }
     
@@ -1372,7 +1596,8 @@ int main(int argc, char *argv[]) {
         int nfds = epoll_wait(main_epoll_fd, events, MAX_EVENTS, 100);
         if (nfds == -1) {
             if (errno == EINTR) continue;
-            perror("epoll_wait (main)");
+            snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] epoll_wait (main) failed\n");
+            FILE_LOG(log_message);
             break;
         }
         
@@ -1385,14 +1610,15 @@ int main(int argc, char *argv[]) {
                 int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
                 if (client_socket < 0) {
                     if (server_running) {
-                        perror("accept");
+                        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] accept failed\n");
+                        FILE_LOG(log_message);
                     }
                     continue;
                 }
                 
-                printf("[MAIN_EPOLL] New connection from %s:%d (socket=%d)\n", 
+                snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] New connection from %s:%d (socket=%d)\n", 
                        inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), client_socket);
-                
+                FILE_LOG(log_message);
                 // Set non-blocking
                 int flags = fcntl(client_socket, F_GETFL, 0);
                 fcntl(client_socket, F_SETFL, flags | O_NONBLOCK);
@@ -1405,13 +1631,23 @@ int main(int argc, char *argv[]) {
                 if (info) {
                     info->state = SOCKET_STATE_NEW;
                     info->last_activity = time(NULL);
+                    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: initialized with state=NEW\n", client_socket);
+                    FILE_LOG(log_message);
                     printf("[MAIN_EPOLL] Socket %d: initialized with state=NEW\n", client_socket);
                 }
                 
                 // Handle initial connection setup BEFORE adding to epoll (certificate extraction, RSA challenge)
+                snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: starting initial setup\n", client_socket);
+                FILE_LOG(log_message);
                 printf("[MAIN_EPOLL] Socket %d: starting initial setup\n", client_socket);
                 
-                if (setup_initial_connection(client_socket) == 0) {
+                int setup_result = setup_initial_connection(client_socket);
+                if(setup_result != 0){
+                    remove_client(client_socket);
+                    close(client_socket);
+                    continue;
+                }
+                if (setup_result == 0) {
                     // Setup successful, update socket state and add to epoll
                     socket_info_t *updated_info = get_socket_info(client_socket);
                     if (updated_info) {
@@ -1424,16 +1660,21 @@ int main(int argc, char *argv[]) {
                     client_event.events = EPOLLIN | EPOLLET;
                     client_event.data.fd = client_socket;
                     if (epoll_ctl(auth_thread_ctx.epoll_fd, EPOLL_CTL_ADD, client_socket, &client_event) == -1) {
-                        perror("epoll_ctl (auth)");
+                        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] epoll_ctl (auth) failed\n");
+                        FILE_LOG(log_message);
                         remove_socket_info(client_socket);
                         close(client_socket);
                         continue;
                     }
                     
+                    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: added to auth thread epoll\n", client_socket);
+                    FILE_LOG(log_message);
                     printf("[MAIN_EPOLL] Socket %d: added to auth thread epoll\n", client_socket);
-                } else {
+                }
+                else {
                     // Setup failed, socket is already cleaned up
-                    printf("[MAIN_EPOLL] Socket %d: setup failed\n", client_socket);
+                    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: intial setup failed\n", client_socket);
+                    FILE_LOG(log_message);
                     continue;
                 }
             }
@@ -1462,6 +1703,8 @@ int main(int argc, char *argv[]) {
     pthread_mutex_destroy(&clients_mutex);
     pthread_mutex_destroy(&thread_count_mutex);
     pthread_mutex_destroy(&server_socket_mutex);
-    printf("%s shutdown complete\n", PROGRAM_NAME);
+    printf("Server Cleanup Succesful!\n");
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] %s shutdown complete\n", PROGRAM_NAME);
+    FILE_LOG(log_message);
     return 0;
 }    

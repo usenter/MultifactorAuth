@@ -325,6 +325,18 @@ void* receive_messages(void* arg) {
         // Store the message
         store_message(buffer);
         
+        // Handle lock/unlock status FIRST, before other processing
+        if (strstr(buffer, "AUTH_LOCKED")) {
+            printf("\n%s\n", buffer);
+            locked = 1;  // Set locked status
+            continue;
+        }
+        else if (strstr(buffer, "AUTH_STATUS_UNLOCKED")) {
+            printf("\n%s\n", buffer);
+            locked = 0;  // Explicitly unlock
+        }
+        // Handle other cases
+     
         // Check for token expiry
         if (strstr(buffer, "AUTH_TOKEN_EXPIRED")) {
             printf("\nYour token has expired. Use /newToken to request a new one.\n");
@@ -332,11 +344,8 @@ void* receive_messages(void* arg) {
         // Check for token failure
         else if (strstr(buffer, "AUTH_TOKEN_FAIL")) {
             printf("\nInvalid token. Please check your email and try again.\n");
-        }
-        // Check for lockout
-        else if (strstr(buffer, "AUTH_LOCKED")) {
-            printf("\n%s\n", buffer);
-            locked = 1;
+            struct timespec delay = {0, 300000000}; 
+            nanosleep(&delay, NULL);
         }
         else if (strstr(buffer, "AUTH_TOKEN_GEN_SUCCESS")) {
             printf("\n%s\n", buffer);
@@ -350,11 +359,13 @@ void* receive_messages(void* arg) {
                 password_authenticated = 1;
                 printf("\nPassword verified. Please check your email for a 6-digit token.\n");
                 printf("Use /token <code> to enter the token, or /newToken to request a new one.\n");
+                // Don't unlock yet - still need email verification
             } else {
                 printf("\n%s", buffer);
                 printf("You are now authenticated\n");
                 email_authenticated = 1;
                 password_authenticated = 1;
+                locked = 0;  // Unlock on successful authentication
             }
         } 
         else {
@@ -471,24 +482,28 @@ int client_mode(int client_socket, const char* username) {
             break;
         }
         if (strlen(buffer) > 0) {
+            if(locked){
+                snprintf(buffer, sizeof(buffer), "/time");
+                send(client_socket, buffer, strlen(buffer), 0);
+                continue;
+            }
             if (!password_authenticated) {
-                if (strncmp(buffer, "/login", 6) == 0 || strncmp(buffer, "/register", 9) == 0) {
+                if (strncmp(buffer, "/login", 6) == 0)  {
                     printf("[CLIENT_DEBUG] Sending auth command to server: '%s'\n", buffer);
+                    
                     if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
                         printf("Failed to send message\n");
                         running = 0;
                         break;
                     }
+                    
                 }
                 else if (!locked) {
                     printf("Please authenticate first. Use: /login <username> <password> or /register <username> <password>\n");
                     printf("auth> ");
                     continue;
                 }
-                else{
-                    //send token command to receieve a message back
-                    send(client_socket, "/token", 7, 0);
-                }
+
             }
             else if(!email_authenticated) {
                 if(strncmp(buffer, "/token", 6) == 0 || strncmp(buffer, "/newToken", 9) == 0){
@@ -517,10 +532,10 @@ int client_mode(int client_socket, const char* username) {
             if(strncmp(buffer, "/file", 5) == 0){
                 file_handling(username);
             }
-            printf("> ");
-        } else {
-            printf("auth> ");
-        }
+            else{
+                printf(">");
+            }
+        } 
     }
     running = 0;
     shutdown(client_socket, SHUT_RDWR);
@@ -671,7 +686,7 @@ int main(int argc, char *argv[]) {
         close(sock);
         return 1;
     }
-    char cert_buf[2048];
+    char cert_buf[8192];
     memset(cert_buf, 0, sizeof(cert_buf)); // Clear buffer
     size_t cert_len = fread(cert_buf, 1, sizeof(cert_buf) - 1, cert_fp);
     fclose(cert_fp);
