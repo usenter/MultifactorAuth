@@ -12,6 +12,7 @@
 #include "hashmap/uthash.h"
 #include "decryptionFunctions/encryptionTools.h"
 #include "emailFunctions/emailFunction.h"
+#include <sys/socket.h>
 
 
 #define MAX_USERNAME_LEN 32
@@ -206,8 +207,10 @@ int process_email_command(const char* message, int account_id);
 // New authentication flow functions
 int init_email_system(char* email_file);
 int create_auth_session(int account_id);
+int reset_auth_session(int account_id);
 auth_flags_t get_auth_status(int account_id);
-int process_auth_message(const char* message, int account_id, char* response, size_t response_size);
+int check_and_send_unlock_message(int account_id, char* response, size_t response_size);
+auth_result_t process_auth_message(const char* message, int account_id, char* response, size_t response_size);
 int verify_email_token(int account_id, const char* token);
 int generate_new_token(int account_id);
 int is_token_expired(int account_id);
@@ -223,7 +226,6 @@ int check_persistent_lockout(unsigned int account_id);
 void save_lockout_state(void);
 void load_lockout_state(void);
 void record_failed_attempt(unsigned int account_id);
-void clear_failed_attempts(unsigned int account_id);
 int get_current_failed_attempts(unsigned int account_id);
 //rsa_challenge_result_t start_rsa_challenge_with_pubkey(EVP_PKEY* pubkey);
 

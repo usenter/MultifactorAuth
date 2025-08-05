@@ -259,129 +259,245 @@ int file_handling(const char* username){
 
 }
 
-// Authentication is now handled by users typing /login commands directly
+typedef enum {
+    MSG_PROCESSED,    // Message handled, show prompt
+    MSG_CONTINUE,     // Message handled, don't show prompt
+    MSG_EXIT          // Exit the loop
+} MessageResult;
+
+MessageResult process_server_message(int client_socket, const char* buffer);
+MessageResult handle_rsa_messages(int client_socket, const char* buffer);
+MessageResult handle_server_shutdown(int client_socket, const char* buffer);
+MessageResult handle_auth_state_messages(const char* buffer);
+MessageResult handle_token_messages(const char* buffer);
+MessageResult handle_auth_phase_messages(const char* buffer);
+MessageResult handle_final_auth_success(const char* buffer);
+static void show_appropriate_prompt(void);
 
 // Function to receive messages from server (chat mode)
 void* receive_messages(void* arg) {
     int client_socket = *(int*)arg;
     char buffer[BUFFER_SIZE];
-    //printf("[DEBUG] receive_messages thread started for socket %d\n", client_socket);
     
     while (running) {
         int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
         if (bytes_received <= 0) {
-            printf("\n Server disconnected or recv error (bytes_received=%d)\n", bytes_received);
+            printf("\nServer disconnected or recv error (bytes_received=%d)\n", bytes_received);
             running = 0;
             break;
         }
         
         buffer[bytes_received] = '\0';
         
+        // Process the message and determine if we should continue the loop
+        MessageResult result = process_server_message(client_socket, buffer);
         
-        // Check for RSA challenge (handle automatically and transparently)
-        if (strstr(buffer, "RSA_CHALLENGE:") && !rsa_completed) {
-            char* challenge_start = strstr(buffer, "RSA_CHALLENGE:") + 14;  // Skip "RSA_CHALLENGE:"
-            char* challenge_end = strchr(challenge_start, '\n');
-            if (challenge_end) *challenge_end = '\0';
-            
-            printf("\n[RSA] Performing RSA mutual authentication...\n");
-            if (handle_rsa_challenge(client_socket, challenge_start)) {
-                rsa_completed = 1;
-                printf("[RSA] SUCCESS: RSA mutual authentication completed!\n");
-                printf("[RSA] Secure encrypted channel established between client and server.\n");
-                printf("[RSA] You may now login with your username and password.\n");
-                printf("\n");
-            } else {
-                printf("[RSA] FAILED: RSA authentication failed! Connection may be terminated.\n");
-            }
-            return NULL; // Don't process this message further
+        if (result == MSG_EXIT) {
+            break;
         }
         
-        // Check for RSA failure
-        if (strstr(buffer, "RSA_FAILED")) {
-            printf("\nRSA authentication failed - :connection may be terminated by server.\n");
-            running = 0;
-            return NULL;
+        if (result == MSG_PROCESSED) {
+            show_appropriate_prompt();
         }
-        
-        // Check for security errors
-        if (strstr(buffer, "SECURITY_ERROR")) {
-            printf("\nSECURITY ERROR: RSA authentication is required but failed.\n");
-            printf("Make sure you have the correct RSA keys for your client.\n");
-            return NULL; // Don't process further
-        }
-        
-        // Check for server shutdown/disconnect messages
-        if (strstr(buffer, "Server is shutting down") || 
-            strstr(buffer, "server disconnected") ||
-            strstr(buffer, "Server disconnected")) {
-            printf("\n%s", buffer);
-            printf("Server is shutting down. Client exiting immediately...\n");
-            running = 0;
-            cleanup_client_resources(client_socket);
-            exit(0); // Exit immediately
-        }
-        
-        // Store the message
-        store_message(buffer);
-        
-        // Handle lock/unlock status FIRST, before other processing
-        if (strstr(buffer, "AUTH_LOCKED")) {
-            printf("\n%s\n", buffer);
-            locked = 1;  // Set locked status
-            continue;
-        }
-        else if (strstr(buffer, "AUTH_STATUS_UNLOCKED")) {
-            printf("\n%s\n", buffer);
-            locked = 0;  // Explicitly unlock
-        }
-        // Handle other cases
-     
-        // Check for token expiry
-        if (strstr(buffer, "AUTH_TOKEN_EXPIRED")) {
-            printf("\nYour token has expired. Use /newToken to request a new one.\n");
-        }
-        // Check for token failure
-        else if (strstr(buffer, "AUTH_TOKEN_FAIL")) {
-            printf("\nInvalid token. Please check your email and try again.\n");
-            struct timespec delay = {0, 300000000}; 
-            nanosleep(&delay, NULL);
-        }
-        else if (strstr(buffer, "AUTH_TOKEN_GEN_SUCCESS")) {
-            printf("\n%s\n", buffer);
-        }
-        // Check if we got authenticated
-        else if (strncmp(buffer, "AUTH_SUCCESS", 12) == 0) {
-            if (strstr(buffer, "Email token verified successfully")) {
-                printf("\nEmail verification successful! You are now fully authenticated.\n");
-                email_authenticated = 1;
-            } else if (strstr(buffer, "Password verified")) {
-                password_authenticated = 1;
-                printf("\nPassword verified. Please check your email for a 6-digit token.\n");
-                printf("Use /token <code> to enter the token, or /newToken to request a new one.\n");
-                // Don't unlock yet - still need email verification
-            } else {
-                printf("\n%s", buffer);
-                printf("You are now authenticated\n");
-                email_authenticated = 1;
-                password_authenticated = 1;
-                locked = 0;  // Unlock on successful authentication
-            }
-        } 
-        else {
-            printf("\n%s", buffer);
-        }
-        
-        // Show prompt based on authentication state
-        if (password_authenticated && email_authenticated) {
-            printf("> ");
-        } else {
-            printf("auth> ");
-        }
-        fflush(stdout);
     }
-    //printf("[DEBUG] receive_messages thread exiting for socket %d\n", client_socket);
+    
     return NULL;
+}
+
+
+
+MessageResult process_server_message(int client_socket, const char* buffer) {
+    // Store the message first
+    store_message(buffer);
+    
+    // Handle RSA authentication
+    MessageResult rsa_result = handle_rsa_messages(client_socket, buffer);
+    if (rsa_result != MSG_PROCESSED) {
+        return rsa_result;
+    }
+    
+    // Handle server shutdown
+    MessageResult shutdown_result = handle_server_shutdown(client_socket, buffer);
+    if (shutdown_result != MSG_PROCESSED) {
+        return shutdown_result;
+    }
+    
+    // Handle authentication state changes
+    MessageResult auth_result = handle_auth_state_messages(buffer);
+    if (auth_result != MSG_PROCESSED) {
+        return auth_result;
+    }
+    
+    // Handle token-related messages  
+    MessageResult token_result = handle_token_messages(buffer);
+    if (token_result != MSG_PROCESSED) {
+        return token_result;
+    }
+    
+    // Handle authentication phase messages
+    MessageResult phase_result = handle_auth_phase_messages(buffer);
+    if (phase_result != MSG_PROCESSED) {
+        return phase_result;
+    }
+    
+    // Handle final authentication success
+    if (handle_final_auth_success(buffer) == MSG_CONTINUE) {
+        return MSG_CONTINUE;
+    }
+    
+    // Default: show server message
+    printf("%s\n", buffer);
+    return MSG_PROCESSED;
+}
+
+MessageResult handle_rsa_messages(int client_socket, const char* buffer) {
+    if (strstr(buffer, "RSA_CHALLENGE:") && !rsa_completed) {
+        char* challenge_start = strstr(buffer, "RSA_CHALLENGE:") + 14;
+        char* challenge_end = strchr(challenge_start, '\n');
+        if (challenge_end) *challenge_end = '\0';
+        
+        printf("\n[RSA] Performing RSA mutual authentication...\n");
+        if (handle_rsa_challenge(client_socket, challenge_start)) {
+            rsa_completed = 1;
+            printf("[RSA] SUCCESS: RSA mutual authentication completed!\n");
+            printf("[RSA] Secure encrypted channel established between client and server.\n");
+            printf("[RSA] You may now login with your username and password.\n\n");
+        } else {
+            printf("[RSA] FAILED: RSA authentication failed! Connection may be terminated.\n");
+        }
+        return MSG_EXIT;
+    }
+    
+    if (strstr(buffer, "RSA_FAILED")) {
+        printf("\nRSA authentication failed - connection may be terminated by server.\n");
+        running = 0;
+        return MSG_EXIT;
+    }
+    
+    if (strstr(buffer, "SECURITY_ERROR")) {
+        printf("\nSECURITY ERROR: RSA authentication is required but failed.\n");
+        printf("Make sure you have the correct RSA keys for your client.\n");
+        return MSG_EXIT;
+    }
+    
+    if (strncmp(buffer, "RSA_AUTH_SUCCESS", 16) == 0) {
+        rsa_completed = 1;
+        return MSG_CONTINUE;
+    }
+    
+    return MSG_PROCESSED;
+}
+
+MessageResult handle_server_shutdown(int client_socket, const char* buffer) {
+    if (strstr(buffer, "Server is shutting down") || 
+        strstr(buffer, "server disconnected") ||
+        strstr(buffer, "Server disconnected")) {
+        
+        printf("\n%s", buffer);
+        printf("Server is shutting down. Client exiting immediately...\n");
+        running = 0;
+        
+        cleanup_client_resources(client_socket); 
+        exit(0);
+    }
+    return MSG_PROCESSED;
+}
+
+MessageResult handle_auth_state_messages(const char* buffer) {
+    if (strstr(buffer, "AUTH_LOCKED")) {
+        printf("\n%s\n", buffer);
+        locked = 1;
+        return MSG_CONTINUE;
+    }
+    
+    if (strstr(buffer, "AUTH_STATUS_UNLOCKED")) {
+        locked = 0;
+        password_authenticated = 0;
+        email_authenticated = 0;
+        return MSG_PROCESSED;
+    }
+    
+    return MSG_PROCESSED;
+}
+
+MessageResult handle_token_messages(const char* buffer) {
+    if (strstr(buffer, "AUTH_TOKEN_EXPIRED")) {
+        printf("\nYour token has expired. Use /newToken to request a new one.\n");
+        struct timespec delay = {0, 300000000}; 
+        nanosleep(&delay, NULL);
+        show_appropriate_prompt();
+
+        return MSG_CONTINUE;
+    }
+    
+    if (strstr(buffer, "AUTH_TOKEN_FAIL")) {
+        const char* token_fail_message = buffer+ 16;
+        printf("%s\n", token_fail_message);
+        struct timespec delay = {0, 300000000}; 
+        nanosleep(&delay, NULL);
+        show_appropriate_prompt();
+        return MSG_CONTINUE;
+    }
+    
+    if (strstr(buffer, "AUTH_TOKEN_GEN_SUCCESS")) {
+        printf("A new token has been sent to your email.\n");
+        struct timespec delay = {0, 150000000}; 
+        nanosleep(&delay, NULL);
+        show_appropriate_prompt();
+        return MSG_CONTINUE;
+    }
+    
+    return MSG_PROCESSED;
+}
+
+MessageResult handle_auth_phase_messages(const char* buffer) {
+    if (strncmp(buffer, "PHASE:EMAIL", 11) == 0) {
+        if (strstr(buffer, "AUTH_SUCCESS") && strstr(buffer, "Email token verified successfully")) {
+            printf("\nEmail verification successful! You are now fully authenticated.\n");
+            printf("SERVER: %s\n", buffer);
+            email_authenticated = 1;
+            return MSG_CONTINUE;
+        }
+        if (strstr(buffer, "Password verified")) {
+            password_authenticated = 1;
+            printf("\nPassword verified. Please check your email for a 6-digit token.\n");
+            printf("Use /token <code> to enter the token, or /newToken to request a new one.\n");
+            struct timespec delay = {0, 150000000}; 
+            nanosleep(&delay, NULL);
+            show_appropriate_prompt();
+            return MSG_CONTINUE;
+        }
+        
+        printf("\n%s", buffer);
+        return MSG_CONTINUE;
+    }
+    
+    return MSG_PROCESSED;
+}
+
+MessageResult handle_final_auth_success(const char* buffer) {
+    if (strstr(buffer, "AUTH_SUCCESS")) {
+        printf("\n%s", buffer);
+        email_authenticated = 1;
+        password_authenticated = 1;
+        rsa_completed = 1;
+        locked = 0;
+        struct timespec delay = {0, 150000000}; 
+        nanosleep(&delay, NULL);
+        show_appropriate_prompt();
+        return MSG_CONTINUE;
+    }
+    
+    return MSG_PROCESSED;
+}
+
+void show_appropriate_prompt(void) {
+    if (password_authenticated && email_authenticated) {
+        printf("> ");
+    } else {
+        printf("auth> ");
+    }
+    fflush(stdout);
 }
 
 // Function to cleanup client resources
@@ -416,6 +532,12 @@ void cleanup_client_resources(int client_socket) {
 int client_mode(int client_socket, const char* username) {
     char buffer[BUFFER_SIZE];
     pthread_t receive_thread;
+
+    // Reset authentication state variables for fresh connection
+    password_authenticated = 0;
+    rsa_completed = 0;
+    email_authenticated = 0;
+    locked = 0;
 
     printf("Connected to secure MultiFactor Authentication chat server!\n");
     printf("Starting RSA challenge-response authentication...\n");
@@ -460,8 +582,22 @@ int client_mode(int client_socket, const char* username) {
             return 0;
         } 
         else {
-            // Print any other server message (e.g., banner, info)
+            // Print any other server message (e.g., banner, authentication prompt)
             printf("%s", buffer);
+            
+            // Check for lockout status in initial messages
+            if (strstr(buffer, "AUTH_LOCKED")) {
+                locked = 1;
+                printf("\nYou are currently locked out. Please wait before trying again.\n");
+                running = 0;
+                return 0;
+            }
+            
+            // Show auth prompt after displaying server messages
+            if (!rsa_completed) {
+                printf("auth> ");
+                fflush(stdout);
+            }
         }
         
     }

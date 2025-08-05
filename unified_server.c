@@ -2,8 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
@@ -29,7 +29,7 @@ void* handle_authenticated_client(void* arg);
 #define MAX_EVENTS 100
 // Program information
 #define PROGRAM_NAME "AuthenticatedChatServer"
-char default_cwd[256] = "UserDirectory/";
+char default_cwd[256] = "UserDirectory";
 // Add a list to track client handler threads
 #define MAX_CLIENT_THREADS 1024
 pthread_t client_threads[MAX_CLIENT_THREADS];
@@ -84,17 +84,18 @@ socket_info_t* get_socket_info(int socket) {
 int check_and_handle_lockout(int account_id, int client_socket) {
     // First check persistent lockout state
     int remaining_time = check_persistent_lockout(account_id);
-    
+    char log_message[BUFFER_SIZE];
+
     if (remaining_time > 0) {
         char response[BUFFER_SIZE];
         snprintf(response, sizeof(response), 
-                 "%s[PERSISTENT] Account is locked for %d more seconds due to failed authentication attempts.\n"
-                 "This lockout persists across connections. Please wait before trying again.\n", 
+                 "%s Account is locked for %d more seconds due to failed authentication attempts.\n"
+                 "This lockout persists across connections. Please try again later.\n", 
                  AUTH_LOCKED, remaining_time);
         send(client_socket, response, strlen(response), 0);
-        
-        printf("[LOCKOUT] Account %d attempted connection while locked (%d sec remaining)\n", 
-               account_id, remaining_time);
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Account %d attempted connection while locked (%d sec remaining)\n", 
+                 account_id, account_id, remaining_time);
+        FILE_LOG(log_message);
         return 1; // Account is locked
     }
     
@@ -107,6 +108,9 @@ int check_and_handle_lockout(int account_id, int client_socket) {
                      "%s[SESSION] Account is locked for %d more seconds.\n", 
                      AUTH_LOCKED, auth_remaining);
             send(client_socket, response, strlen(response), 0);
+            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Account %d attempted connection while locked (%d sec remaining)\n", 
+                     account_id, account_id, auth_remaining);
+            FILE_LOG(log_message);
             return 1; // Account is locked
         } else {
             // Session lockout expired, send unlock message
@@ -115,6 +119,10 @@ int check_and_handle_lockout(int account_id, int client_socket) {
                      "%s Account lockout has expired. You may now login.\n", 
                      AUTH_STATUS_UNLOCKED);
             send(client_socket, response, strlen(response), 0);
+            FILE_LOG(response);
+            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Account %d lockout expired\n", 
+                     account_id, account_id);
+            FILE_LOG(log_message);
             return 0; // Account is now unlocked
         }
     }
@@ -158,6 +166,8 @@ void remove_socket_info(int socket) {
 }
 
 void broadcast_message(const char* message, int sender_socket) {
+    char log_message[BUFFER_SIZE];
+
     if (!message) return;
     
     char* message_with_newline = malloc(strlen(message) + 2);
@@ -169,7 +179,8 @@ void broadcast_message(const char* message, int sender_socket) {
     
     strncpy(message_with_newline, message, strlen(message));
     strncat(message_with_newline, "\n", 1);
-    
+    snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD] Broadcasting message: %s", message_with_newline);
+    FILE_LOG(log_message);
     pthread_mutex_lock(&clients_mutex);
     client_t *c, *tmp;
     HASH_ITER(hh, clients_map, c, tmp) {
@@ -178,10 +189,8 @@ void broadcast_message(const char* message, int sender_socket) {
             
             // Send with error checking but don't hold mutex during send
             int client_socket = c->socket;
-            pthread_mutex_unlock(&clients_mutex);
             
             if (send(client_socket, message_with_newline, strlen(message_with_newline), 0) < 0) {
-                char log_message[BUFFER_SIZE];
                 snprintf(log_message, sizeof(log_message), "[WARN][MAIN_THREAD] Failed to send to socket %d\n", client_socket);
                 FILE_LOG(log_message);
                 client_t *c = find_client_by_socket(client_socket);
@@ -190,7 +199,6 @@ void broadcast_message(const char* message, int sender_socket) {
                 }
             }
             
-            pthread_mutex_lock(&clients_mutex);
         }
     }
     pthread_mutex_unlock(&clients_mutex);
@@ -356,6 +364,7 @@ void promote_to_authenticated(int socket, int account_id) {
     if (user) {
         strncpy(new_client->username, user->username, MAX_USERNAME_LEN - 1);
         strncpy(new_client->nickname, user->username, sizeof(new_client->nickname) - 1);
+        new_client->authLevel = user->authLevel; // Copy the user's authority level
     }
     
     // Add to clients map
@@ -408,7 +417,15 @@ void promote_to_authenticated(int socket, int account_id) {
     char announcement[BUFFER_SIZE];
     snprintf(announcement, sizeof(announcement), "%s has joined the chat", new_client->nickname);
     broadcast_message(announcement, socket);
-
+    snprintf(response, sizeof(response),
+                 "Chat Commands:\n"
+                 "  /nick <name> - Change your nickname\n"
+                 "  /list - Show connected users\n"
+                 "  /help - Show this help\n"
+                 "  /file - Enter file mode\n"
+                 "  /quit - Kill the overall program\n"
+                 "Just type any message to chat with everyone!\n");
+    send(socket, response, strlen(response), 0);
 }
 
 
@@ -476,7 +493,7 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
         }
         return;
     }
-    
+
     // Handle list command
     if (strcmp(buffer, "/list") == 0) {
         snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD-ID:%d] Handling /list command from socket %d\n", c->account_id, client_socket);
@@ -524,7 +541,7 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
         snprintf(broadcast_msg, sizeof(broadcast_msg), "File mode activated\n");
         send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
         return;
-    
+    }
     // Handle unknown commands
     if (buffer[0] == '/') {
         snprintf(broadcast_msg, sizeof(broadcast_msg), 
@@ -544,7 +561,7 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
         FILE_LOG(log_message);
         return;
     }
-}
+
 }
 
 // Authentication thread function
@@ -605,6 +622,15 @@ void* auth_thread_func(void *arg) {
             FILE_LOG(log_message);
             char response[BUFFER_SIZE];
             
+            // Check for lockout expiration and send unlock message if needed
+            if (info->account_id > 0 && check_and_send_unlock_message(info->account_id, response, sizeof(response))) {
+                snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Sending unlock message to socket %d\n", info->account_id, client_socket);
+                FILE_LOG(log_message);
+                send(client_socket, response, strlen(response), 0);
+                
+                continue; // Skip further processing
+            }
+            
             // Skip processing if this is a new connection (shouldn't happen anymore, but safety check)
             if (info->state == SOCKET_STATE_NEW) {
                 snprintf(log_message, sizeof(log_message), "[WARN][AUTH_THREAD-ID:%d] WARNING: Socket %d in NEW state in epoll - should not occur\n", info->account_id, client_socket);
@@ -633,7 +659,7 @@ void* auth_thread_func(void *arg) {
                 }
             }
             
-            int result = 0;
+            auth_result_t process_result;
             if (account_id > 0) {
                 // Check for lockout before processing any auth attempt
                 if (check_and_handle_lockout(account_id, client_socket)) {
@@ -643,9 +669,13 @@ void* auth_thread_func(void *arg) {
                     check_and_handle_lockout(account_id, client_socket);
                     continue; 
                 }
-                result = process_auth_message(buffer, account_id, response, sizeof(response));
-                snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] process_auth_message returned: %d\n", info->account_id, result);
+                process_result = process_auth_message(buffer, account_id, response, sizeof(response));
+                snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] process_auth_message returned: success=%d, authenticated=%d\n", 
+                        info->account_id, process_result.success, process_result.authenticated);
                 FILE_LOG(log_message);
+                
+                // Load the response from process_result into the response buffer
+                snprintf(response, sizeof(response), "%s", process_result.response);
             } 
             else {
                 snprintf(response, sizeof(response), "Please use /login <username> <password> to authenticate\n");
@@ -653,23 +683,42 @@ void* auth_thread_func(void *arg) {
                 FILE_LOG(log_message);
             }
             
-            if (result == 1) { // Message processed successfully
+            if (process_result.success == 1) { // Message processed successfully
                 // Check if user is actually fully authenticated
                 auth_flags_t auth_status = get_auth_status(account_id);
                 snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Socket %d: auth_status=%d\n", 
                        info->account_id, client_socket, auth_status);
                 FILE_LOG(log_message);
                 
+                if(auth_status & AUTH_STATUS_LOCKED){
+                    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Account %d is locked, sending lockout message\n", info->account_id, account_id);
+                    FILE_LOG(log_message);
+                    snprintf(response, sizeof(response), "%s Account is locked for %d more seconds due to too many failed attempts.\n", AUTH_LOCKED, get_remaining_lockout_time(account_id));
+                    send(client_socket, response, strlen(response), 0);
+                    continue;
+                }
+
                 if (auth_status == AUTH_FULLY_AUTHENTICATED) {
                     snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Authentication COMPLETE for socket %d, promoting to chat...\n", info->account_id, client_socket);
                     FILE_LOG(log_message);
                     promote_to_authenticated(client_socket, account_id);
                     snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Promotion complete for socket %d\n", info->account_id, client_socket);
                     FILE_LOG(log_message);
-                } else {
-                    
+                } 
+                else {
                     snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Authentication INCOMPLETE for socket %d, sending response\n", info->account_id, client_socket);
                     FILE_LOG(log_message);
+                    snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD-ID:%d] SENDING to socket %d: '%.100s'\n", info->account_id, client_socket, response);
+                    FILE_LOG(log_message);
+                    
+                    // Sanity check: ensure socket matches the expected account_id
+                    socket_info_t *verify_info = get_socket_info(client_socket);
+                    if (!verify_info || verify_info->account_id != account_id) {
+                        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] SOCKET MISMATCH! client_socket=%d, expected_account_id=%d, actual_account_id=%d\n", 
+                                account_id, client_socket, account_id, verify_info ? verify_info->account_id : -1);
+                        FILE_LOG(log_message);
+                    }
+                    
                     send(client_socket, response, strlen(response), 0);
                 }
             } 
@@ -679,6 +728,17 @@ void* auth_thread_func(void *arg) {
                     "[ERROR][AUTH_THREAD:%d] Message processing failed, sending response to socket %d: '%s'\n", 
                     account_id, client_socket, response);
                 FILE_LOG(log_message);
+                snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD-ID:%d] SENDING to socket %d: '%.100s'\n", account_id, client_socket, response);
+                FILE_LOG(log_message);
+                
+                // Sanity check: ensure socket matches the expected account_id
+                socket_info_t *verify_info = get_socket_info(client_socket);
+                if (!verify_info || verify_info->account_id != account_id) {
+                    snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] SOCKET MISMATCH! client_socket=%d, expected_account_id=%d, actual_account_id=%d\n", 
+                            account_id, client_socket, account_id, verify_info ? verify_info->account_id : -1);
+                    FILE_LOG(log_message);
+                }
+                
                 send(client_socket, response, strlen(response), 0);
             }
         }
@@ -715,10 +775,8 @@ void* cmd_thread_func(void *arg) {
         for (int i = 0; i < nfds; i++) {
             int client_socket = events[i].data.fd;
             socket_info_t *info = get_socket_info(client_socket);
-            printf("[CMD_THREAD] Processing event for socket %d, info=%p, state=%d\n", 
-                   client_socket, info, info ? info->state : -1);
+            
             if (!info || info->state != SOCKET_STATE_AUTHENTICATED) {
-                printf("[CMD_THREAD] Skipping socket %d (no info or wrong state)\n", client_socket);
                 continue;
             }
             
@@ -741,10 +799,8 @@ void* cmd_thread_func(void *arg) {
             buffer[strcspn(buffer, "\r\n")] = 0;
             
             // Handle commands and messages using client mode
-            printf("[CMD_THREAD] Processing message from socket %d: '%s'\n", client_socket, buffer);
             client_t *client = find_client_by_socket(client_socket);
             if (client) {
-                printf("[CMD_THREAD] Found client for socket %d, mode=%d\n", client_socket, client->mode);
                 
                 // Skip empty messages
                 if (strlen(buffer) == 0) {
@@ -762,13 +818,12 @@ void* cmd_thread_func(void *arg) {
                 
                 // Dispatch based on client mode
                 if (client->mode == CLIENT_MODE_CHAT) {
-                    printf("[CMD_THREAD] Processing CHAT mode for user %s\n", client->username);
                     handle_chat_mode(client, buffer, client_socket);
                 } else if (client->mode == CLIENT_MODE_FILE) {
-                    printf("[CMD_THREAD] Processing FILE mode for user %s\n", client->username);
                     handle_file_mode(client, buffer, client_socket);
                 } else {
-                    printf("[CMD_THREAD] Unknown client mode %d for socket %d\n", client->mode, client_socket);
+                    snprintf(log_message, sizeof(log_message), "[ERROR][CMD_THREAD] Unknown client mode %d for socket %d\n", client->mode, client_socket);
+                    FILE_LOG(log_message);
                 }
             } else {
                 printf("[CMD_THREAD] ERROR: No client found for socket %d - this shouldn't happen for authenticated users\n", client_socket);
@@ -1163,8 +1218,8 @@ int setup_initial_connection(int client_socket) {
         snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Valid username received: %s \n", account_id, username);
         FILE_LOG(log_message);
         
-        // Create authentication session (chamber)
-        if (!create_auth_session(account_id)) {
+        // Create/reset authentication session (chamber) for fresh login
+        if (!reset_auth_session(account_id)) {
             snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Failed to create authentication session for %s\n", account_id, username);
             FILE_LOG(log_message);
 
@@ -1234,7 +1289,7 @@ int setup_initial_connection(int client_socket) {
                  "%s - Authentication Required\n"
                  "========================================\n"
                  "Please authenticate to access the chat:\n"
-                 "  /login <username> <password> - Login with existing account\n", PROGRAM_NAME);
+                 "  /login <username> <password> - Login with existing account\n\n", PROGRAM_NAME);
                  // will be implemented later
                  //"  /register <username> <password> - Create new account\n\n", PROGRAM_NAME);
         send(client_socket, response, strlen(response), 0);
@@ -1633,13 +1688,11 @@ int main(int argc, char *argv[]) {
                     info->last_activity = time(NULL);
                     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: initialized with state=NEW\n", client_socket);
                     FILE_LOG(log_message);
-                    printf("[MAIN_EPOLL] Socket %d: initialized with state=NEW\n", client_socket);
                 }
                 
                 // Handle initial connection setup BEFORE adding to epoll (certificate extraction, RSA challenge)
                 snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: starting initial setup\n", client_socket);
                 FILE_LOG(log_message);
-                printf("[MAIN_EPOLL] Socket %d: starting initial setup\n", client_socket);
                 
                 int setup_result = setup_initial_connection(client_socket);
                 if(setup_result != 0){
@@ -1652,7 +1705,6 @@ int main(int argc, char *argv[]) {
                     socket_info_t *updated_info = get_socket_info(client_socket);
                     if (updated_info) {
                         updated_info->state = SOCKET_STATE_AUTHENTICATING;
-                        printf("[MAIN_EPOLL] Socket %d: setup successful, state=AUTHENTICATING\n", client_socket);
                     }
                     
                     // Add to auth thread's epoll AFTER setup is complete

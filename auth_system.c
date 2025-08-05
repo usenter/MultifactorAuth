@@ -181,10 +181,11 @@ int authenticate_user(const char* username, const char* password, int account_id
     char log_message[BUFFER_SIZE];
     snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Authenticating user %s\n", account_id, username);
     FILE_LOG(log_message);
-    // Get current session
+    // Get current session with proper locking
     session_t *session = NULL;
-   
+    pthread_mutex_lock(&session_map_mutex);
     HASH_FIND_INT(session_map, &account_id, session);
+    pthread_mutex_unlock(&session_map_mutex);
    
     
     snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Authenticating user\n", account_id);
@@ -209,7 +210,9 @@ int authenticate_user(const char* username, const char* password, int account_id
     
     // Verify user exists and is active
     user_t *found_ptr = NULL;
+    pthread_mutex_lock(&user_map_mutex);
     HASH_FIND_INT(user_map, &account_id, found_ptr);
+    pthread_mutex_unlock(&user_map_mutex);
     
     if (!found_ptr || !found_ptr->active) {
         printf("User not found or inactive for account %d\n", account_id);
@@ -228,12 +231,21 @@ int authenticate_user(const char* username, const char* password, int account_id
     }
     
     // Verify password
+    snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_SYSTEM-ID:%d] Verifying password for user '%s' (found user: '%s', account_id: %d)\n", 
+             account_id, username, found_ptr->username, found_ptr->account_id);
+    FILE_LOG(log_message);
+    
     if (!verify_password(password, found_ptr->password_hash)) {
         printf("Password incorrect for user: %s from socket %d\n", username, account_id);
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Password incorrect for user: %s from socket %d\n", account_id, username, account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Password incorrect for user: %s (expected user: %s)\n", 
+                 account_id, username, found_ptr->username);
         FILE_LOG(log_message);
         return 0;
     }
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_SYSTEM-ID:%d] Password verification SUCCEEDED for user '%s'\n", 
+             account_id, username);
+    FILE_LOG(log_message);
     
     // Update session with password authentication
    
@@ -244,11 +256,13 @@ int authenticate_user(const char* username, const char* password, int account_id
     
     // Verify the session was updated correctly
     session_t *verify_session = NULL;
+    pthread_mutex_lock(&session_map_mutex);
     HASH_FIND_INT(session_map, &account_id, verify_session);
     if (verify_session) {
         snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Verified session auth_status after update: %d\n", account_id, verify_session->auth_status);
         FILE_LOG(log_message);
     }
+    pthread_mutex_unlock(&session_map_mutex);
     
     // If user has email, send verification token
     if (found_ptr->email) {
@@ -418,14 +432,18 @@ int create_auth_session(int account_id) {
     HASH_FIND_INT(session_map, &account_id, existing_session);
     
     if (existing_session) {
-        // Session already exists, don't reset auth status - just update login time
-        existing_session->login_time = time(NULL);
-        existing_session->auth_status = AUTH_NONE;
-        // Only reset email token if we're starting fresh (no auth flags set)
-        if (existing_session->auth_status == AUTH_NONE) {
-            memset(&existing_session->email_token, 0, sizeof(email_token_t));
+        // Session already exists - only reset if this is a new login attempt
+        // Check if user is trying to start fresh (by checking if they're fully authenticated)
+        if (existing_session->auth_status == AUTH_FULLY_AUTHENTICATED) {
+            // User is already authenticated, no need to reset
+            existing_session->login_time = time(NULL);
+            return 1;
+        } else {
+            // User has partial authentication - only reset if it's a completely new login
+            // Don't reset the auth status as it may have partial progress
+            existing_session->login_time = time(NULL);
+            return 1;
         }
-        return 1;
     }
     
     // Create new session
@@ -441,11 +459,39 @@ int create_auth_session(int account_id) {
     memset(session->challenge, 0, RSA_CHALLENGE_SIZE);
     memset(&session->email_token, 0, sizeof(email_token_t));
     
+    // Initialize lockout info
+    session->lockout_info.failed_attempts = 0;
+    session->lockout_info.is_locked = 0;
+    session->lockout_info.lockout_start_time = 0;
+    
     pthread_mutex_lock(&session_map_mutex);
     HASH_ADD_INT(session_map, account_id, session);
     pthread_mutex_unlock(&session_map_mutex);
     session_count++;
 
+    return 1;
+}
+
+// Reset auth session for a fresh login attempt
+int reset_auth_session(int account_id) {
+    session_t *session = NULL;
+    HASH_FIND_INT(session_map, &account_id, session);
+    
+    if (!session) {
+        // No session exists, create one
+        return create_auth_session(account_id);
+    }
+    
+    // Reset session state for fresh authentication
+    session->auth_status = AUTH_NONE;
+    session->login_time = time(NULL);
+    memset(session->challenge, 0, RSA_CHALLENGE_SIZE);
+    memset(&session->email_token, 0, sizeof(email_token_t));
+    
+    // Reset lockout info if not persistently locked
+    session->lockout_info.failed_attempts = 0;
+    session->lockout_info.is_locked = 0;
+    
     return 1;
 }
 
@@ -457,21 +503,64 @@ auth_flags_t get_auth_status(int account_id) {
     if (!session) {
         return AUTH_NONE;
     }
-    
     return session->auth_status;
 }
 
+// Check if lockout has expired and send unlock message if needed
+int check_and_send_unlock_message(int account_id, char* response, size_t response_size) {
+    session_t *session = find_session(account_id);
+    if (session && (session->auth_status & AUTH_STATUS_LOCKED)) {
+        int remaining_time = get_remaining_lockout_time(account_id);
+        if (remaining_time <= 0) {
+            // Lockout expired - unlock the account
+            session->auth_status = AUTH_RSA;
+            session->lockout_info.is_locked = 0;
+            session->lockout_info.failed_attempts = 0;
+            session->lockout_info.lockout_start_time = 0;
+            
+            user_t *user = find_user(account_id);
+            if (user) {
+                snprintf(response, response_size, "%s Account %s is unlocked. Please login with: /login <username> <password>\n", 
+                        AUTH_STATUS_UNLOCKED, user->username);
+                return 1; // Unlock message sent
+            }
+        }
+    }
+    return 0; // No unlock message needed
+}
+
 // Process authentication message based on current status
-int process_auth_message(const char* message, int account_id, char* response, size_t response_size) {
-    if (!message || !response) return 0;
+auth_result_t process_auth_message(const char* message, int account_id, char* response, size_t response_size) {
+    auth_result_t result;
+    char log_message[BUFFER_SIZE];
+    memset(&result, 0, sizeof(result)); // Initialize result struct
+    
+    if (!message || !response) {
+        result.success = 0;
+        result.authenticated = 0;
+        return result;
+    }
+    
+    // Always initialize response buffer to prevent contamination between users
+    response[0] = '\0';
+    
+    // Check for lockout expiration first
+    if (check_and_send_unlock_message(account_id, response, response_size)) {
+        result.success = 1;
+        result.authenticated = 0;
+        strncpy(result.response, response, sizeof(result.response) - 1);
+        result.response[sizeof(result.response) - 1] = '\0';
+        return result; // Unlock message sent
+    }
     
     auth_flags_t status = get_auth_status(account_id);
     
     // Check if fully authenticated
     if (status == AUTH_FULLY_AUTHENTICATED) {
-        snprintf(response, response_size, "You are already fully authenticated.");
-        
-        return 1;
+        snprintf(result.response, sizeof(result.response), "You are already fully authenticated.");
+        result.success = 1;
+        result.authenticated = 1;
+        return result;
     }
     
     // RSA authentication phase
@@ -479,14 +568,21 @@ int process_auth_message(const char* message, int account_id, char* response, si
         if (is_rsa_command(message)) {
             rsa_challenge_result_t rsa_result = process_rsa_command(message, account_id);
             if (rsa_result.success && strstr(rsa_result.response, "RSA authentication successful")) {
-                return 1;
+                snprintf(result.response, sizeof(result.response), "%s You may now login with your username and password.", rsa_result.response);
+                result.success = 1;
+                result.authenticated = 0;
+                return result;
             } else {
-                snprintf(response, response_size, "%s", rsa_result.response);
+                snprintf(result.response, sizeof(result.response), "PHASE:RSA %s", rsa_result.response);
+                result.success = 1;
+                result.authenticated = 0;
+                return result;
             }
-            return 1;
         }
-        snprintf(response, response_size, "RSA authentication required first.");
-        return 1;
+        snprintf(result.response, sizeof(result.response), "RSA authentication required first. Use /rsa_start to begin.");
+        result.success = 1;
+        result.authenticated = 0;
+        return result;
     }
 
     // Password authentication phase
@@ -494,23 +590,16 @@ int process_auth_message(const char* message, int account_id, char* response, si
         printf("DEBUG: In password phase, checking if '%s' is an auth command\n", message);
         if (is_auth_command(message)) {
             auth_result_t auth_result = process_auth_command(message, account_id);
-            if (auth_result.success && auth_result.authenticated) {
-                // Send email token
-                session_t *session = NULL;
-                HASH_FIND_INT(session_map, &account_id, session);
-                if (session) {
-                    sendEmailVerification(session);
-                }
-                
-                snprintf(response, response_size, 
-                        "Password verified. Check your email for a 6-digit token and enter it with: /token <code>");
-            } else {
-                snprintf(response, response_size, "%s", auth_result.response);
-            }
-            return 1;
+            // Use the response from process_auth_command directly - it already handles email verification
+            snprintf(result.response, sizeof(result.response), "%s", auth_result.response);
+            result.success = 1;
+            result.authenticated = 0;
+            return result;
         }
-        //snprintf(response, response_size, "Please login with: /login <username> <password>\n");
-        return 1;
+        snprintf(result.response, sizeof(result.response), "PHASE:PASSWORD Please login with: /login <username> <password>");
+        result.success = 1;
+        result.authenticated = 0;
+        return result;
     }
     // Email token authentication phase
     else if (!(status & AUTH_EMAIL)) {  // Only allow token commands after password auth
@@ -520,16 +609,18 @@ int process_auth_message(const char* message, int account_id, char* response, si
         if (status & AUTH_STATUS_LOCKED) {
             int remaining = get_remaining_lockout_time(account_id);
             if(remaining > 0){
-                snprintf(response, response_size, 
+                snprintf(result.response, sizeof(result.response), 
                         "%s Account is locked for %d more seconds due to too many failed attempts.\n", 
                         AUTH_LOCKED, remaining);
-                return 1;
+                result.success = 1;
+                result.authenticated = 0;
+                return result;
             }
             else{
-                //unlocking takes back to password auth
+                //unlocking takes back to password auth (keep RSA, remove password and email)
                 session_t *session = find_session(account_id);
                 if(session){
-                    session->auth_status = AUTH_PASSWORD & AUTH_RSA; 
+                    session->auth_status = AUTH_RSA; 
                 }
             }
         }
@@ -537,7 +628,6 @@ int process_auth_message(const char* message, int account_id, char* response, si
         // Check if this is a token command - if so, process it (lockout check already done above)
         if (is_token_command(message)) {
             if (strncmp(message, AUTH_TOKEN, strlen(AUTH_TOKEN)) == 0) {
-                printf("DEBUG: Extracting token from message: '%s'\n", message);
                 char token[EMAIL_TOKEN_LENGTH + 1];
                 const char* token_start = message + strlen(AUTH_TOKEN);
                 
@@ -550,76 +640,94 @@ int process_auth_message(const char* message, int account_id, char* response, si
                 if (strlen(token_start) != EMAIL_TOKEN_LENGTH || 
                     sscanf(token_start, "%6s", token) != 1 ||
                     strlen(token) != EMAIL_TOKEN_LENGTH) {
-                    snprintf(response, response_size, 
+                    snprintf(result.response, sizeof(result.response), 
                             "%s Invalid format. Use: /token <6-digit-code>\n", 
                             AUTH_FAILED);
-                    return 1;
+                    result.success = 1;
+                    result.authenticated = 0;
+                    return result;
                 }
                 
-                printf("verifying token: %s\n", token);
 
                 // Verify token
                 int verify_result = verify_email_token(account_id, token);
 
-                printf("DEBUG: verify_result = %d\n", verify_result);
                 if (verify_result == 1) {
-                    snprintf(response, response_size, 
+                    snprintf(result.response, sizeof(result.response), 
                             "%s Email token verified successfully! You are now fully authenticated.\n", 
                             AUTH_SUCCESS);
-                    return 1;
+                    result.success = 1;
+                    result.authenticated = 1;
+                    return result;
                 } 
                 else if (verify_result == -3) {
-                    snprintf(response, response_size, 
+                    snprintf(result.response, sizeof(result.response), 
                             "%s Token has expired. Use /newToken to request a new one.\n", 
                             AUTH_TOKEN_EXPIRED);
-                    return 1;
+                    result.success = 1;
+                    result.authenticated = 0;
+                    return result;
                 } 
                 else if (verify_result == -2) {
                     int remaining = get_remaining_lockout_time(account_id);
-                    snprintf(response, response_size, 
+                    snprintf(result.response, sizeof(result.response), 
                             "%s[AUTH System] Account locked for %d seconds due to too many failed attempts.\n", 
                             AUTH_LOCKED, remaining);
-                    return 1;
+                    result.success = 1;
+                    result.authenticated = 0;
+                    result.response[sizeof(result.response) - 1] = '\0';
+                    return result;
                 } 
                 else {
-                    snprintf(response, response_size, 
+                    snprintf(result.response, sizeof(result.response), 
                             "%s Invalid token. Please check your email and try again. %d attempts remaining.\n", 
                             AUTH_TOKEN_FAIL, MAX_TOKEN_ATTEMPTS - get_current_failed_attempts(account_id));
-                    return 1;
+                    result.success = 1;
+                    result.authenticated = 0;
+                    return result;
                 }
             } 
             else if (strncmp(message, AUTH_NEW_TOKEN, strlen(AUTH_NEW_TOKEN)) == 0) {
                 if (generate_new_token(account_id)) {
-                    snprintf(response, response_size, 
-                            "%s A new token has been sent to your email.\n", 
-                            AUTH_TOKEN_GEN_SUCCESS);
+                    snprintf(result.response, sizeof(result.response), 
+                            "%s A new token has been sent to your email. You have %d attempts remaining.\n", 
+                            AUTH_TOKEN_GEN_SUCCESS, MAX_TOKEN_ATTEMPTS - get_current_failed_attempts(account_id));
                 } else {
-                    snprintf(response, response_size, 
+                    snprintf(result.response, sizeof(result.response), 
                             "%s Failed to generate new token.\n", 
                             AUTH_FAILED);
                 }
-                return 1;
+                result.success = 1;
+                result.authenticated = 0;
+                return result;
+            }
+            else if(strstr(message, "/login") != NULL){
+                snprintf(result.response, sizeof(result.response), "PHASE:EMAIL Password verified.");
+                result.success = 1;
+                result.authenticated = 0;
+                return result;
             }
             else{
-                printf("DEBUG: Command '%s' is not recognized as a token command\n", message);
-                snprintf(response, response_size, 
-                        "Please enter your email token with: /token <code> or request a new one with: /newToken\n");
-                return 1;
+                snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM-ID:%d] Command '%s' is not recognized as a token command\n", account_id, message);
+                FILE_LOG(log_message);
+                snprintf(result.response, sizeof(result.response), 
+                        "PHASE:EMAIL Please enter your email token with: /token <code> or request a new one with: /newToken");
+                result.success = 1;
+                result.authenticated = 0;
+                return result;
             }
         }
-        printf("DEBUG: Command '%s' is not recognized as a token command\n", message);
-        snprintf(response, response_size, 
-                "Please enter your email token with: /token <code> or request a new one with: /newToken\n");
-        return 1;
+        snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM-ID:%d] Command '%s' is not recognized as a token command\n", account_id, message);
+        FILE_LOG(log_message);
+        snprintf(result.response, sizeof(result.response), 
+                "PHASE:EMAIL Please enter your email token with: /token <code> or request a new one with: /newToken");
+        result.success = 1;
+        result.authenticated = 0;
+        return result;
     }
     else{
-        printf("DEBUG: Not in email token auth phase\n!(status&auth_email) = %d\nstatus&password = %d\n", !(status & AUTH_EMAIL), (status & AUTH_PASSWORD));
-        printf("DEBUG: status = %d\n", status);
-        printf("DEBUG: looking at session %d\n", account_id);
-        session_t *session = find_session(account_id);
-        if (session) {
-            printf("DEBUG: Session auth_status: %d\n", session->auth_status);
-        }
+        snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM-ID:%d] Not in email token auth phase\n!(status&auth_email) = %d\nstatus&password = %d\n", account_id, !(status & AUTH_EMAIL), (status & AUTH_PASSWORD));
+        FILE_LOG(log_message);
     }
     
     
@@ -633,12 +741,27 @@ int process_auth_message(const char* message, int account_id, char* response, si
         missing_step = "email verification";
     }
     
+    user_t *found_ptr = NULL;
+    HASH_FIND_INT(user_map, &account_id, found_ptr);
+    char username[MAX_USERNAME_LEN];
+    strcpy(username, found_ptr->username);
+    
     if (missing_step) {
-        snprintf(response, response_size, "%s Please complete %s first.\n", AUTH_FAILED, missing_step);
-        return 1;
+        if (!(status & AUTH_RSA)) {
+            snprintf(response, response_size, "PHASE:RSA %s Please complete %s first.", AUTH_FAILED, missing_step);
+        } else if (!(status & AUTH_PASSWORD)) {
+            snprintf(response, response_size, "PHASE:PASSWORD %s Please complete %s first.", AUTH_FAILED, missing_step);
+        } else if (!(status & AUTH_EMAIL)) {
+            snprintf(response, response_size, "PHASE:EMAIL %s Please complete %s first.", AUTH_FAILED, missing_step);
+        }
+        result.success = 1;
+        result.authenticated = 0;
+        return result;
     }
-    snprintf(response, response_size, "Authentication error occurred.\n");
-    return 0;
+    snprintf(result.response, sizeof(result.response), "Authentication error occurred.\n");
+    result.success = 1;
+    result.authenticated = 0;
+    return result;
 }
 
 // Generate new email token
@@ -667,10 +790,12 @@ int get_remaining_lockout_time(int account_id) {
     if (!session) return 0;
     
     time_t now = time(NULL);
-    if (session->lockout_info.lockout_start_time > now) {
-        return (int)(session->lockout_info.lockout_start_time - now);
+    time_t lockout_end_time = session->lockout_info.lockout_start_time + LOCKOUT_DURATION;
+    
+    if (now < lockout_end_time) {
+        return (int)(lockout_end_time - now);
     }
-    return 0;
+    return 0; // Lockout expired
 }
 
 // Handle failed token attempt and return whether user is now locked out
@@ -678,19 +803,23 @@ int handle_failed_token_attempt(int account_id) {
     record_failed_attempt(account_id);
     char response[BUFFER_SIZE];
     char log_message[BUFFER_SIZE];
-    // Check if this failure caused a lockout
-    int remaining_time = check_persistent_lockout(account_id);
-    if (remaining_time > 0) {
+    
+    // Get current failed attempts count
+    int current_attempts = get_current_failed_attempts(account_id);
+    
+    // Check if this failure caused a lockout (should happen at 3 attempts)
+    if (current_attempts >= 3) {
+        int remaining_time = check_persistent_lockout(account_id);
         snprintf(response, sizeof(response), 
                  "%s Account locked for %d seconds due to too many failed attempts.\n", 
                  AUTH_LOCKED, remaining_time);
-        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Account locked for %d seconds due to too many failed attempts.\n", account_id, remaining_time);
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Account locked for %d seconds due to too many failed attempts (attempts: %d).\n", account_id, remaining_time, current_attempts);
         FILE_LOG(log_message);
         return 0; // Authentication failed
     } else {
         snprintf(response, sizeof(response), 
                  "AUTH_TOKEN_FAIL Invalid token. You have %d attempts remaining before lockout.\n", 
-                 3 - get_current_failed_attempts(account_id));
+                 3 - current_attempts);
         return 0;
     }
 }
@@ -720,21 +849,24 @@ int verify_email_token(int account_id, const char* token) {
     
     session_t *session = find_session(account_id);
     if (!session) {
-        printf("No session found for account %d\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] No session found\n", account_id);
+        FILE_LOG(log_message);
         return 0;
     }
     
     // Check if token has expired (1 minute)
     time_t now = time(NULL);
     if (now - session->email_token.created_time > TOKEN_EXPIRY_TIME) {
-        printf("Token expired for account %d\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Token expired\n", account_id);
+        FILE_LOG(log_message);
         return -3; // Token expired
     }
     
     // Convert string token to integer
     int token_value;
     if (sscanf(token, "%d", &token_value) != 1) {
-        printf("Invalid token format for account %d\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Invalid token format\n", account_id);
+        FILE_LOG(log_message);
         if (handle_failed_token_attempt(account_id)) {
             return -2; // User is now locked out
         }
@@ -751,18 +883,13 @@ int verify_email_token(int account_id, const char* token) {
         session->lockout_info.failed_attempts = 0;
         session->lockout_info.lockout_start_time = 0;
         session->lockout_info.is_locked = 0;
-        session->auth_status &= ~AUTH_STATUS_LOCKED; 
-        session->auth_status |= AUTH_EMAIL;
-        
-        printf("Token verified successfully for account %d\n", account_id);
-        clear_failed_attempts(account_id);
+        session->auth_status = AUTH_FULLY_AUTHENTICATED; 
         snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Token verified successfully\n", account_id);
         FILE_LOG(log_message);
         return 1;
     }
     
     // Token is incorrect
-    printf("Invalid token provided for account %d\n", account_id);
     snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Invalid token provided for account %d\n", account_id, account_id);
     FILE_LOG(log_message);
     if (handle_failed_token_attempt(account_id)) {
@@ -1038,7 +1165,7 @@ auth_result_t process_auth_command(const char* message, int account_id) {
             result.success = 1;
             result.authenticated = 0;  // Not fully authenticated yet
             snprintf(result.response, sizeof(result.response), 
-                    "%s Password verified. Please check your email for a 6-digit token and enter it with: /token <code>", 
+                    "PHASE:EMAIL %s Password verified. Please check your email for a 6-digit token and enter it with: /token <code>", 
                     AUTH_SUCCESS);
         } else {
             // Authentication failed
@@ -1297,7 +1424,10 @@ rsa_challenge_result_t start_rsa_challenge_for_client(int account_id, EVP_PKEY* 
     }
     //if existing session has ran out of lockout time, unlock it, and tell client
     else if(session && session->auth_status & AUTH_STATUS_LOCKED && get_remaining_lockout_time(account_id) <= 0){
-        session->auth_status = AUTH_NONE;
+        session->auth_status &= ~AUTH_STATUS_LOCKED;
+        session->lockout_info.is_locked = 0;
+        session->lockout_info.failed_attempts = 0;
+        session->lockout_info.lockout_start_time = time(NULL);
         snprintf(result.response, sizeof(result.response), "%s Account %s is unlocked. Please login with: /login <username> <password>\n", 
                 AUTH_STATUS_UNLOCKED, user->username);
     }
@@ -1532,7 +1662,7 @@ void load_lockout_state(void) {
                 
                 // Check if lockout has expired
                 time_t now = time(NULL);
-                if (is_locked && (now - lockout_start) >= 600) {
+                if (is_locked && (now - lockout_start) >= LOCKOUT_DURATION) {
                     // Lockout expired, don't load this entry
                     continue;
                 }
@@ -1543,6 +1673,10 @@ void load_lockout_state(void) {
                     entry->lockout_info.lockout_start_time = lockout_start;
                     entry->lockout_info.failed_attempts = failed_attempts;
                     entry->lockout_info.is_locked = is_locked;
+                    entry->auth_status = AUTH_NONE; // Initialize auth status
+                    if (is_locked) {
+                        entry->auth_status |= AUTH_STATUS_LOCKED; // Set lockout flag if locked
+                    }
                     HASH_ADD_INT(session_map, account_id, entry);
                 }
             }
@@ -1559,8 +1693,35 @@ int check_persistent_lockout(unsigned int account_id) {
     HASH_FIND_INT(session_map, &account_id, entry);
     
     if (!entry) {
-    pthread_mutex_unlock(&session_map_mutex);
-        return 0; // Not locked
+        // No session in memory - check persistent file
+        pthread_mutex_unlock(&session_map_mutex);
+        
+        // Load from persistent storage
+        FILE *fp = fopen("lockout_state.dat", "r");
+        if (!fp) {
+            return 0; // No lockout file
+        }
+        
+        char line[256];
+        time_t now = time(NULL);
+        int result = 0;
+        
+        while (fgets(line, sizeof(line), fp)) {
+            unsigned int file_account_id, lockout_start, failed_attempts, is_locked;
+            if (sscanf(line, "%u,%lu,%d,%d", &file_account_id, 
+                      (unsigned long*)&lockout_start, &failed_attempts, &is_locked) == 4) {
+                
+                if (file_account_id == account_id && is_locked) {
+                    time_t elapsed = now - lockout_start;
+                    if (elapsed < LOCKOUT_DURATION) {
+                        result = LOCKOUT_DURATION - elapsed;
+                        break;
+                    }
+                }
+            }
+        }
+        fclose(fp);
+        return result;
     }
     
     if (!entry->lockout_info.is_locked) {
@@ -1571,17 +1732,18 @@ int check_persistent_lockout(unsigned int account_id) {
     time_t now = time(NULL);
     time_t elapsed = now - entry->lockout_info.lockout_start_time;
     
-    if (elapsed >= 600) {
+    if (elapsed >= LOCKOUT_DURATION) {
         // Lockout expired
         entry->lockout_info.is_locked = 0;
         entry->lockout_info.failed_attempts = 0;
+        entry->auth_status = AUTH_RSA;
     pthread_mutex_unlock(&session_map_mutex);
         save_lockout_state(); // Persist the unlock
         return 0; // No longer locked
     }
     
 pthread_mutex_unlock(&session_map_mutex);
-    return (600 - elapsed); // Return remaining lockout time
+    return (LOCKOUT_DURATION - elapsed); // Return remaining lockout time
 }
 
 void record_failed_attempt(unsigned int account_id) {
@@ -1591,14 +1753,10 @@ void record_failed_attempt(unsigned int account_id) {
     HASH_FIND_INT(session_map, &account_id, entry);
     
     if (!entry) {
-        entry = malloc(sizeof(persistent_lockout_t));
-        if (entry) {
-            entry->account_id = account_id;
-            entry->lockout_info.lockout_start_time = 0;
-            entry->lockout_info.failed_attempts = 0;
-            entry->lockout_info.is_locked = 0;
-            HASH_ADD_INT(session_map, account_id, entry);
-        }
+        // Don't create a session here - sessions should be created by create_auth_session
+        // Just return without recording the attempt if no session exists
+        pthread_mutex_unlock(&session_map_mutex);
+        return;
     }
     
     if (entry) {
@@ -1607,29 +1765,17 @@ void record_failed_attempt(unsigned int account_id) {
         if (entry->lockout_info.failed_attempts >= 3) {
             entry->lockout_info.is_locked = 1;
             entry->lockout_info.lockout_start_time = time(NULL);
+            entry->auth_status |= AUTH_STATUS_LOCKED; // Set the lockout flag
             printf("[LOCKOUT] Account %u locked due to %d failed attempts\n", 
                    account_id, entry->lockout_info.failed_attempts);
         }
     }
     
-pthread_mutex_unlock(&session_map_mutex);
+    pthread_mutex_unlock(&session_map_mutex);
     save_lockout_state(); // Persist immediately
 }
 
-void clear_failed_attempts(unsigned int account_id) {
-    pthread_mutex_lock(&session_map_mutex);
-    
-    session_t *entry = NULL;
-    HASH_FIND_INT(session_map, &account_id, entry);
-    
-    if (entry) {
-        entry->lockout_info.failed_attempts = 0;
-        entry->lockout_info.is_locked = 0;
-    }
-    
-pthread_mutex_unlock(&session_map_mutex);
-    save_lockout_state();
-}
+
 
 void init_persistent_lockout_system(void) {
     load_lockout_state();
