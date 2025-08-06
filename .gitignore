@@ -7,15 +7,21 @@ simple_test_client
 user_encryptor
 encryptionTools_test
 generate_rsa_keys
+rest_client
+
 RSA_AUTH_SETUP.md
 
 *.o
 *.obj
 *.out
 *.pem
+*.sh
 
 emailConfig.json
 userStatus.txt
+lockout_state.dat
+
+
 
 # Build directories
 build/
