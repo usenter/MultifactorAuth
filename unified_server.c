@@ -75,9 +75,7 @@ char* emailPassword = NULL; // Fill this in if you disable useJSON parameter in 
 // Socket management functions
 socket_info_t* get_socket_info(int socket) {
     socket_info_t *info = NULL;
-    pthread_mutex_lock(&socket_map_mutex);
     HASH_FIND_INT(socket_map, &socket, info);
-    pthread_mutex_unlock(&socket_map_mutex);
     return info;
 }
 
@@ -205,7 +203,9 @@ void broadcast_message(const char* message, int sender_socket) {
     free(message_with_newline);
 }
 void remove_client(int client_socket) {
-    printf("[CLEANUP] Starting cleanup for socket %d\n", client_socket);
+    char log_message[BUFFER_SIZE];
+    snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Starting cleanup for socket %d\n", client_socket);
+    FILE_LOG(log_message);
     
     pthread_mutex_lock(&clients_mutex);
     
@@ -213,7 +213,8 @@ void remove_client(int client_socket) {
     HASH_FIND_INT(clients_map, &client_socket, c);
     if (!c) {
         pthread_mutex_unlock(&clients_mutex);
-        printf("[CLEANUP] No client found for socket %d\n", client_socket);
+        snprintf(log_message, sizeof(log_message), "[WARN][CLEANUP] No client found for socket %d\n", client_socket);
+        FILE_LOG(log_message);
         return; // Client not found
     }
     
@@ -230,13 +231,13 @@ void remove_client(int client_socket) {
     strncpy(nickname_copy, c->nickname, sizeof(nickname_copy) - 1);
     nickname_copy[sizeof(nickname_copy) - 1] = '\0';
     
-    printf("[CLEANUP] User '%s' (%s) left the chat (Total clients: %d)\n", 
-           username_copy, nickname_copy, client_count - 1);
-    
-    // Remove from hash table
-    pthread_mutex_lock(&clients_mutex);
+    // Remove from hash table while holding mutex
     HASH_DEL(clients_map, c);
     client_count--;
+    
+    snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] User '%s' (%s) left the chat (Total clients: %d)\n", 
+           username_copy, nickname_copy, client_count);
+    FILE_LOG(log_message);
     pthread_mutex_unlock(&clients_mutex);
     
     // Remove from socket tracking
@@ -260,13 +261,15 @@ void remove_client(int client_socket) {
     
     // Remove session BEFORE freeing the client structure
     if (account_id != 0) {
-        printf("[CLEANUP] Removing session for account_id %d\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Removing session for account_id %d\n", account_id);
+        FILE_LOG(log_message);
         remove_session(account_id);
     }
     
     // Free the client structure AFTER removing session
     free(c);
-    printf("[CLEANUP] Cleanup complete for socket %d\n", client_socket);
+    snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Cleanup complete for socket %d\n", client_socket);
+    FILE_LOG(log_message);
 }
 
 void update_socket_state(int socket, socket_state_t new_state) {
@@ -341,7 +344,7 @@ void promote_to_authenticated(int socket, int account_id) {
     char log_message[BUFFER_SIZE];
     snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE-ID:%d] Starting promotion for socket %d\n", account_id, socket);
     FILE_LOG(log_message);
-    
+    printf("Added authenticated client %d to chat\n", account_id);
     // Create client structure
     client_t *new_client = malloc(sizeof(client_t));
     if (!new_client) {
@@ -744,7 +747,8 @@ void* auth_thread_func(void *arg) {
         }
     }
     
-    printf("Authentication thread exiting\n");
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD] Authentication thread exiting\n");
+    FILE_LOG(log_message);
     return NULL;
 }
 
@@ -826,20 +830,23 @@ void* cmd_thread_func(void *arg) {
                     FILE_LOG(log_message);
                 }
             } else {
-                printf("[CMD_THREAD] ERROR: No client found for socket %d - this shouldn't happen for authenticated users\n", client_socket);
+                snprintf(log_message, sizeof(log_message), "[ERROR][CMD_THREAD] No client found for socket %d - this shouldn't happen for authenticated users\n", client_socket);
+                FILE_LOG(log_message);
                 // Try to find the client in the hash table for debugging
                 pthread_mutex_lock(&clients_mutex);
                 client_t *c, *tmp;
                 HASH_ITER(hh, clients_map, c, tmp) {
-                    printf("[CMD_THREAD] DEBUG: Client in map - socket=%d, active=%d, username=%s\n", 
+                    snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD] Client in map - socket=%d, active=%d, username=%s\n", 
                            c->socket, c->active, c->username);
+                    FILE_LOG(log_message);
                 }
                 pthread_mutex_unlock(&clients_mutex);
             }
         }
     }
     
-    printf("Command handler thread exiting\n");
+    snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD] Command handler thread exiting\n");
+    FILE_LOG(log_message);
     return NULL;
 }
 
@@ -1016,7 +1023,22 @@ void* handle_authenticated_client(void* arg) {
 X509* extract_client_cert(int client_socket) {
     uint32_t net_cert_len;
     char log_message[BUFFER_SIZE];
-    client_t *c = find_client_by_socket(client_socket);
+    socket_info_t *socket_info = get_socket_info(client_socket);
+    
+    // If socket_info is missing, this indicates an initialization failure
+    // Add it on the spot to prevent crashes
+    if (!socket_info) {
+        snprintf(log_message, sizeof(log_message), "[WARN][AUTH_THREAD] Socket info missing for socket %d, creating it now\n", client_socket);
+        FILE_LOG(log_message);
+        add_socket_info(client_socket);
+        socket_info = get_socket_info(client_socket);
+        if (!socket_info) {
+            snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD] Failed to create socket info for socket %d\n", client_socket);
+            FILE_LOG(log_message);
+            return NULL;
+        }
+    }
+    
     // Read certificate length with retry logic
     unsigned long total_read = 0;
     while (total_read < sizeof(net_cert_len)) {
@@ -1028,7 +1050,7 @@ X509* extract_client_cert(int client_socket) {
                 nanosleep(&delay, NULL);
                 continue;
             }
-            snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Failed to receive certificate length from client.\n", c->account_id);
+            snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Failed to receive certificate length from client socket %d.\n", socket_info->account_id, client_socket);
             FILE_LOG(log_message);
             return NULL;
         }
@@ -1037,14 +1059,14 @@ X509* extract_client_cert(int client_socket) {
     
     uint32_t cert_len = ntohl(net_cert_len);
     if (cert_len == 0 || cert_len > 8192) {
-        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Invalid certificate length received: %u\n", c->account_id, cert_len);
+        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Invalid certificate length received: %u from socket %d\n", socket_info->account_id, cert_len, client_socket);
         FILE_LOG(log_message);
         return NULL;
     }
     
     char* cert_buf = malloc(cert_len + 1);
     if (!cert_buf) {
-        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Memory allocation failed for certificate buffer.\n", c->account_id);
+        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Memory allocation failed for certificate buffer from socket %d.\n", socket_info->account_id, client_socket);
         FILE_LOG(log_message);
         return NULL;
     }
@@ -1060,7 +1082,7 @@ X509* extract_client_cert(int client_socket) {
                 nanosleep(&delay, NULL);
                 continue;
             }
-            snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Failed to receive certificate data from client.\n", c->account_id);
+            snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Failed to receive certificate data from client socket %d.\n", socket_info->account_id, client_socket);
             FILE_LOG(log_message);
             free(cert_buf);
             return NULL;
@@ -1075,7 +1097,7 @@ X509* extract_client_cert(int client_socket) {
     free(cert_buf);
     
     if (!client_cert) {
-        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Failed to parse client certificate.\n", c->account_id);
+        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Failed to parse client certificate from socket %d.\n", socket_info->account_id, client_socket);
         FILE_LOG(log_message);
         return NULL;
     }
@@ -1235,9 +1257,7 @@ int setup_initial_connection(int client_socket) {
         // Update socket info with account_id
         socket_info_t *info = get_socket_info(client_socket);
         if (info) {
-            pthread_mutex_lock(&socket_map_mutex);
             info->account_id = account_id;
-            pthread_mutex_unlock(&socket_map_mutex);
         }
         else{
             snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD-ID:%d] Failed to get socket info for %s\n", account_id, username);
@@ -1286,10 +1306,10 @@ int setup_initial_connection(int client_socket) {
         snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD-ID:%d] Sending authentication prompt to %s\n", account_id, username);
         FILE_LOG(log_message);
         snprintf(response, sizeof(response),
-                 "%s - Authentication Required\n"
+                 "%s - LOGIN PHASE\n"
                  "========================================\n"
                  "Please authenticate to access the chat:\n"
-                 "  /login <username> <password> - Login with existing account\n\n", PROGRAM_NAME);
+                 "  /login <username> <password> - Login with existing account\n", PROGRAM_NAME);
                  // will be implemented later
                  //"  /register <username> <password> - Create new account\n\n", PROGRAM_NAME);
         send(client_socket, response, strlen(response), 0);
@@ -1671,6 +1691,19 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 
+                // Check if we've reached the maximum number of clients
+                pthread_mutex_lock(&clients_mutex);
+                if (client_count >= MAX_CLIENTS) {
+                    snprintf(log_message, sizeof(log_message), "[WARN][MAIN_THREAD] Maximum clients (%d) reached, rejecting connection from %s:%d\n", 
+                           MAX_CLIENTS, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+                    FILE_LOG(log_message);
+                    send(client_socket, "Server is full, please try again later\n", 38, 0);
+                    close(client_socket);
+                    pthread_mutex_unlock(&clients_mutex);
+                    continue;
+                }
+                pthread_mutex_unlock(&clients_mutex);
+                
                 snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] New connection from %s:%d (socket=%d)\n", 
                        inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), client_socket);
                 FILE_LOG(log_message);
@@ -1687,8 +1720,7 @@ int main(int argc, char *argv[]) {
                     info->state = SOCKET_STATE_NEW;
                     info->last_activity = time(NULL);
                     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: initialized with state=NEW\n", client_socket);
-                    FILE_LOG(log_message);
-                }
+                    FILE_LOG(log_message);                }
                 
                 // Handle initial connection setup BEFORE adding to epoll (certificate extraction, RSA challenge)
                 snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: starting initial setup\n", client_socket);
@@ -1705,6 +1737,8 @@ int main(int argc, char *argv[]) {
                     socket_info_t *updated_info = get_socket_info(client_socket);
                     if (updated_info) {
                         updated_info->state = SOCKET_STATE_AUTHENTICATING;
+                        snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: setup successful, state=AUTHENTICATING\n", client_socket);
+                        FILE_LOG(log_message);
                     }
                     
                     // Add to auth thread's epoll AFTER setup is complete
@@ -1721,7 +1755,6 @@ int main(int argc, char *argv[]) {
                     
                     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: added to auth thread epoll\n", client_socket);
                     FILE_LOG(log_message);
-                    printf("[MAIN_EPOLL] Socket %d: added to auth thread epoll\n", client_socket);
                 }
                 else {
                     // Setup failed, socket is already cleaned up
@@ -1755,7 +1788,7 @@ int main(int argc, char *argv[]) {
     pthread_mutex_destroy(&clients_mutex);
     pthread_mutex_destroy(&thread_count_mutex);
     pthread_mutex_destroy(&server_socket_mutex);
-    printf("Server Cleanup Succesful!\n");
+    printf("Server Cleanup Succesful...\n");
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] %s shutdown complete\n", PROGRAM_NAME);
     FILE_LOG(log_message);
     return 0;

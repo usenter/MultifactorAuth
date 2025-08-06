@@ -129,7 +129,7 @@ int handle_rsa_challenge(int socket, const char* hex_challenge) {
         return 0;
     }
     
-    printf("Authenticating with server...\n");
+    //printf("Authenticating with server...\n");
     
     // Convert hex challenge back to binary
     size_t challenge_len = strlen(hex_challenge) / 2;
@@ -231,7 +231,7 @@ int handle_rsa_challenge(int socket, const char* hex_challenge) {
         return 0;
     }
     
-    printf("RSA response sent successfully\n");
+    //printf("RSA response sent successfully\n");
     
     // Clear sensitive data
     memset(decrypted_challenge, 0, sizeof(decrypted_challenge));
@@ -539,8 +539,8 @@ int client_mode(int client_socket, const char* username) {
     email_authenticated = 0;
     locked = 0;
 
-    printf("Connected to secure MultiFactor Authentication chat server!\n");
-    printf("Starting RSA challenge-response authentication...\n");
+    printf("Connected to secure MultiFactor Authentication chat server! Beginning RSA challenge-response authentication...\n");
+    //printf("Starting RSA challenge-response authentication...\n");
 
     // Synchronously wait for and handle RSA challenge before starting receive thread
     int rsa_ok = 0;
@@ -551,18 +551,18 @@ int client_mode(int client_socket, const char* username) {
             running = 0;
             return 0;
         }
-        printf("[CLIENT_DEBUG] Parsing server input...\n");
+        //printf("[CLIENT_DEBUG] Parsing server input...\n");
         buffer[bytes_received] = '\0';
         if (strstr(buffer, "RSA_CHALLENGE:") && !rsa_completed) {
             char* challenge_start = strstr(buffer, "RSA_CHALLENGE:") + 14;
             char* challenge_end = strchr(challenge_start, '\n');
             if (challenge_end) *challenge_end = '\0';
-            printf("[RSA] Performing RSA mutual authentication...\n");
+            //printf("[RSA] Performing RSA mutual authentication...\n");
             if (handle_rsa_challenge(client_socket, challenge_start)) {
                 rsa_completed = 1;
                 rsa_ok = 1;
                 printf("[RSA] SUCCESS: RSA mutual authentication completed!\n");
-                printf("[RSA] You may now login with your username and password.\n");
+                //printf("[RSA] You may now login with your username and password.\n");
             } 
             else {
                 printf("[RSA] FAILED: RSA authentication failed! Connection may be terminated.\n");
@@ -571,13 +571,13 @@ int client_mode(int client_socket, const char* username) {
             }
         }
         else if (strstr(buffer, "RSA_FAILED")) {
-            printf("\nRSA authentication failed - connection may be terminated by server.\n");
+            printf("\n[RSA] RSA authentication failed - connection may be terminated by server.\n");
             running = 0;
             return 0;
         } 
         else if (strstr(buffer, "SECURITY_ERROR")) {
-            printf("\nSECURITY ERROR: RSA authentication is required but failed.\n");
-            printf("Make sure you have the correct RSA keys for your client.\n");
+            printf("\n[RSA] SECURITY ERROR: RSA authentication is required but failed.\n");
+            printf("[RSA] Make sure you have the correct RSA keys for your client.\n");
             running = 0;
             return 0;
         } 
@@ -588,7 +588,7 @@ int client_mode(int client_socket, const char* username) {
             // Check for lockout status in initial messages
             if (strstr(buffer, "AUTH_LOCKED")) {
                 locked = 1;
-                printf("\nYou are currently locked out. Please wait before trying again.\n");
+                printf("\n[AUTH] You are currently locked out. Please wait before trying again.\n");
                 running = 0;
                 return 0;
             }
@@ -601,13 +601,13 @@ int client_mode(int client_socket, const char* username) {
         }
         
     }
-    printf("[CLIENT_DEBUG] RSA challenge completed\n");
+    //printf("[CLIENT_DEBUG] RSA challenge completed\n");
     // Now start the receive thread for chat and further messages
     if (pthread_create(&receive_thread, NULL, receive_messages, &client_socket) != 0) {
         printf("Failed to create receive thread\n");
         return 0;
     }
-    printf("[CLIENT_DEBUG] started receive thread\n");
+    //printf("[CLIENT_DEBUG] started receive thread\n");
 
     // Main loop to send messages
     while (running && fgets(buffer, BUFFER_SIZE, stdin)) {
@@ -625,7 +625,7 @@ int client_mode(int client_socket, const char* username) {
             }
             if (!password_authenticated) {
                 if (strncmp(buffer, "/login", 6) == 0)  {
-                    printf("[CLIENT_DEBUG] Sending auth command to server: '%s'\n", buffer);
+                    //printf("[CLIENT_DEBUG] Sending auth command to server: '%s'\n", buffer);
                     
                     if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
                         printf("Failed to send message\n");
@@ -643,7 +643,7 @@ int client_mode(int client_socket, const char* username) {
             }
             else if(!email_authenticated) {
                 if(strncmp(buffer, "/token", 6) == 0 || strncmp(buffer, "/newToken", 9) == 0){
-                    printf("[CLIENT_DEBUG] Sending token command to server: '%s'\n", buffer);
+                    //printf("[CLIENT_DEBUG] Sending token command to server: '%s'\n", buffer);
                     if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
                         printf("Failed to send message\n");
                         running = 0;
@@ -656,7 +656,7 @@ int client_mode(int client_socket, const char* username) {
                     continue;
                 }
             } else {
-                printf("[CLIENT_DEBUG] Sending chat message to server: '%s'\n", buffer);
+                //printf("[CLIENT_DEBUG] Sending chat message to server: '%s'\n", buffer);
                 if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
                     printf("Failed to send message\n");
                     running = 0;
@@ -804,10 +804,10 @@ int main(int argc, char *argv[]) {
     server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
     
     if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Connection failed");
+        printf("Connection failed\n");
         return 1;
     }
-    printf("Connected to server. Sending certificate...\n");
+    //printf("Connected to server. Sending certificate...\n");
     
     // Clear any leftover data in the socket buffer
     char clear_buf[1024];
@@ -842,7 +842,7 @@ int main(int argc, char *argv[]) {
         close(sock);
         return 1;
     }
-    printf("Certificate sent to server. Starting authentication...\n");
+    //printf("Certificate sent to server. Starting authentication...\n");
     // Send username after certificate
     char id_msg[BUFFER_SIZE];
     snprintf(id_msg, sizeof(id_msg), "USERNAME:%s\n", username);

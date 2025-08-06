@@ -76,7 +76,7 @@ typedef struct {
 // Email token authentication constants
 #define EMAIL_TOKEN_LENGTH 6
 #define MAX_TOKEN_ATTEMPTS 3
-#define LOCKOUT_DURATION 30  // 10 minutes in seconds
+#define LOCKOUT_DURATION 300  // 5 minutes in seconds
 #define TOKEN_EXPIRY_TIME 60  // 1 minute in seconds
 
 // Email token structure
