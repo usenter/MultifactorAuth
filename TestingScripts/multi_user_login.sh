@@ -7,7 +7,7 @@ SERVER_IP=${1:-127.0.0.1}
 PORT=12345
 USER_FILE="decrypted_users.txt"
 LOG_FILE="multi_user_login_$(date +%Y%m%d_%H%M%S).log"
-MAX_USERS=20
+MAX_USERS=500
 
 echo "=== Multi-User Login Stress Test ==="
 echo "Server: $SERVER_IP:$PORT"
@@ -111,23 +111,25 @@ expect {
             ">" {
                 log_message "User $username is now in chat mode"
                 
-                # Send a few commands to simulate real usage
-                send "/list\r"
-                expect ">"
+                # Send confirmation message to verify successful login
                 send "Hello from $username\r"
                 expect ">"
+                log_message "User $username confirmed successful login"
                 
-                # Stay connected indefinitely until parent script is killed
-                log_message "User $username staying connected indefinitely (until script termination)"
+                # Stay connected with periodic commands during wait phase
+                log_message "User $username staying connected with periodic activity"
                 
-                # Removed trap and signal handler here
-                
-                # Wait indefinitely, but check for signals periodically
+                # Wait with periodic activity instead of indefinitely
+                set activity_counter 0
                 while {1} {
                     expect {
                         ">" {
-                            # Keep connection alive by occasionally sending a heartbeat
-                            # Do nothing, just continue waiting
+                            # Send periodic commands to simulate real usage
+                            incr activity_counter
+                            if {$activity_counter % 10 == 0} {
+                                send "/list\r"
+                                expect ">"
+                            }
                         }
                         eof {
                             log_message "Connection lost for $username"
@@ -285,7 +287,7 @@ for user_info in "${users[@]}"; do
     client_pids+=($pid)
     
     # Small delay to avoid overwhelming the server
-    sleep 2
+    sleep 0.01
 done
 
 # Wait for all login attempts to complete (just the initial login, not the indefinite connection)
@@ -294,10 +296,10 @@ user_index=0
 for pid in "${client_pids[@]}"; do
     IFS=':' read -r username password user_id <<< "${users[$user_index]}"
     
-    # Wait a reasonable time for initial login (not indefinite)
-    timeout 60 bash -c "
+    # Wait a short time for initial login verification (reduced from 60s)
+    timeout 0.1 bash -c "
         while kill -0 $pid 2>/dev/null; do
-            sleep 1
+            sleep 0.01
         done
     " &
     wait $!
@@ -372,7 +374,7 @@ echo "Use Ctrl+C or kill this script to disconnect all clients gracefully"
 # Keep the main script running until terminated
 log_message "Script now waiting indefinitely. Connected clients will stay active until script termination."
 while true; do
-    sleep 10
+    sleep 1
     
     # Check if any client processes have died unexpectedly
     active_clients=0

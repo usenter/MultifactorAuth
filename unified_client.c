@@ -121,7 +121,7 @@ int load_server_public_key(void) {
 
     return 1;
 }
-
+int generate_self_signed_cert(const char* username);
 // Handle RSA challenge automatically
 int handle_rsa_challenge(int socket, const char* hex_challenge) {
     if (!client_private_key || !server_public_key) {
@@ -582,21 +582,33 @@ int client_mode(int client_socket, const char* username) {
             return 0;
         } 
         else {
-            // Print any other server message (e.g., banner, authentication prompt)
-            printf("%s", buffer);
-            
+            // Check for immediate authentication success (when all auth methods disabled)
+            if (strstr(buffer, "AUTH_SUCCESS")) {
+                printf("%s", buffer);
+                // Set all authentication flags
+                email_authenticated = 1;
+                password_authenticated = 1;
+                rsa_completed = 1;
+                locked = 0;
+                rsa_ok = 1; // Exit the authentication loop
+                printf("[AUTH] Auto-authentication successful! You are now fully authenticated.\n");
+            }
             // Check for lockout status in initial messages
-            if (strstr(buffer, "AUTH_LOCKED")) {
+            else if (strstr(buffer, "AUTH_LOCKED")) {
                 locked = 1;
                 printf("\n[AUTH] You are currently locked out. Please wait before trying again.\n");
                 running = 0;
                 return 0;
             }
-            
-            // Show auth prompt after displaying server messages
-            if (!rsa_completed) {
-                printf("auth> ");
-                fflush(stdout);
+            else {
+                // Print any other server message (e.g., banner, authentication prompt)
+                printf("%s", buffer);
+                
+                // Show auth prompt after displaying server messages
+                if (!rsa_completed) {
+                    printf("auth> ");
+                    fflush(stdout);
+                }
             }
         }
         
@@ -741,54 +753,73 @@ int main(int argc, char *argv[]) {
     
     struct sockaddr_in server_addr;
     
-    // Parse command line arguments - client_id is REQUIRED
-    if (argc != 2) {
-        printf("Usage: %s <username>\n", argv[0]);
-        printf("Example: %s alice\n", argv[0]);
+    // Parse command line arguments
+    int skip_rsa = 0;
+    const char* username = NULL;
+    
+    if (argc == 2) {
+        username = argv[1];
+    } else if (argc == 3 && strcmp(argv[1], "--no-rsa") == 0) {
+        skip_rsa = 1;
+        username = argv[2];
+    } else {
+        printf("Usage: %s [--no-rsa] <username>\n", argv[0]);
+        printf("Examples:\n");
+        printf("  %s alice                    # Normal mode (generate RSA keys)\n", argv[0]);
+        printf("  %s --no-rsa alice           # Skip RSA key generation (for RSA-disabled servers)\n", argv[0]);
         return 1;
     }
     
-    const char* username = argv[1];
+    // Set global client_id for use in RSA functions
+    strncpy(client_id, username, sizeof(client_id) - 1);
+    client_id[sizeof(client_id) - 1] = '\0';
     
-    // Automatically generate RSA keys if they do not exist
-    char key_file[MAX_FILE_PATH_LEN];
-    snprintf(key_file, sizeof(key_file), "RSAkeys/client_%s_private.pem", username);
-    FILE* fp = fopen(key_file, "r");
-    if (!fp) {
-        printf("Private key not found for user '%s'. Generating new RSA keys...\n", username);
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "./generate_rsa_keys client %s", username);
-        int ret = system(cmd);
-        if (ret != 0) {
-            printf("Failed to generate RSA keys for user '%s'!\n", username);
-            return 1;
+    if (!skip_rsa) {
+        // Check if RSA keys exist, generate if needed
+        char key_file[MAX_FILE_PATH_LEN];
+        snprintf(key_file, sizeof(key_file), "RSAkeys/client_%s_private.pem", username);
+        FILE* fp = fopen(key_file, "r");
+        if (!fp) {
+            printf("Private key not found for user '%s'. Generating new RSA keys...\n", username);
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "./generate_rsa_keys client %s", username);
+            int ret = system(cmd);
+            if (ret != 0) {
+                printf("Failed to generate RSA keys for user '%s'!\n", username);
+                return 1;
+            }
+        } else {
+            fclose(fp);
         }
-    } else {
-        fclose(fp);
-    }
-    
-    // After key generation, check for certificate
-    char cert_file[MAX_FILE_PATH_LEN];
-    snprintf(cert_file, sizeof(cert_file), "RSAkeys/client_%s_cert.pem", username);
-    FILE* cert_fp = fopen(cert_file, "r");
-    if (!cert_fp) {
-        printf("Certificate not found for user '%s'. Generating self-signed certificate...\n", username);
-        if (!generate_self_signed_cert(username)) {
-            printf("Failed to generate self-signed certificate for user '%s'!\n", username);
-            return 1;
+        
+        // Check for certificate, generate if needed
+        char cert_file[MAX_FILE_PATH_LEN];
+        snprintf(cert_file, sizeof(cert_file), "RSAkeys/client_%s_cert.pem", username);
+        FILE* cert_fp = fopen(cert_file, "r");
+        if (!cert_fp) {
+            printf("Certificate not found for user '%s'. Generating self-signed certificate...\n", username);
+            if (!generate_self_signed_cert(username)) {
+                printf("Failed to generate self-signed certificate for user '%s'!\n", username);
+                return 1;
+            }
+        } else {
+            fclose(cert_fp);
         }
-    } else {
-        fclose(cert_fp);
     }
     
     // Initialize OpenSSL
     OpenSSL_add_all_algorithms();
     ERR_load_crypto_strings();
     
-    // Load RSA keys
-    if (!load_client_private_key(username) || !load_server_public_key()) {
-        printf("Failed to load RSA keys\n");
-        return 1;
+    if (!skip_rsa) {
+        // Load RSA keys
+        if (!load_client_private_key(username) || !load_server_public_key()) {
+            printf("Failed to load RSA keys\n");
+            return 1;
+        }
+        printf("RSA keys loaded. Connecting to server...\n");
+    } else {
+        printf("Connecting to server... (RSA disabled)\n");
     }
     
     // Connect to server
@@ -815,18 +846,30 @@ int main(int argc, char *argv[]) {
         recv(sock, clear_buf, sizeof(clear_buf), 0);
     }
     
-    // Send certificate as first message
-    cert_fp = fopen(cert_file, "r");
-    if (!cert_fp) {
-        printf("ERROR: Could not open certificate file for sending.\n");
-        close(sock);
-        return 1;
-    }
+    // Send certificate (or placeholder) as first message
     char cert_buf[8192];
-    memset(cert_buf, 0, sizeof(cert_buf)); // Clear buffer
-    size_t cert_len = fread(cert_buf, 1, sizeof(cert_buf) - 1, cert_fp);
-    fclose(cert_fp);
-    cert_buf[cert_len] = '\0';
+    size_t cert_len = 0;
+    
+    if (!skip_rsa) {
+        // Send real certificate
+        char cert_file[MAX_FILE_PATH_LEN];
+        snprintf(cert_file, sizeof(cert_file), "RSAkeys/client_%s_cert.pem", username);
+        FILE* cert_fp = fopen(cert_file, "r");
+        if (!cert_fp) {
+            printf("ERROR: Could not open certificate file for sending.\n");
+            close(sock);
+            return 1;
+        }
+        memset(cert_buf, 0, sizeof(cert_buf));
+        cert_len = fread(cert_buf, 1, sizeof(cert_buf) - 1, cert_fp);
+        fclose(cert_fp);
+        cert_buf[cert_len] = '\0';
+    } else {
+        // Send placeholder certificate
+        strcpy(cert_buf, "NO_RSA_CERTIFICATE");
+        cert_len = strlen(cert_buf);
+    }
+    
     // Send certificate length first (as 4-byte int, network order)
     uint32_t net_cert_len = htonl(cert_len);
     if (send(sock, &net_cert_len, sizeof(net_cert_len), 0) != sizeof(net_cert_len)) {

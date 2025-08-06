@@ -12,7 +12,7 @@ const char* emailConfigFile = "emailConfig.json";
 const char* emailFrom = "noreply@example.com";
 
 // Global email configuration (loaded once and cached)
-email_config_t email_config = {NULL, NULL, NULL, NULL, 465, 1, 1, 600, 1, 0};
+email_config_t email_config = {NULL, NULL, NULL, NULL, 465, 1, 600, 1, 0};
 // Define all email lines
 const char *payload_text[] = {
     "To: recipient@example.com\r\n",
@@ -104,8 +104,8 @@ int read_credentials_json(const char *filename, emailContent_t* payload) {
     return 0;
 }
 
-int read_credentials_json_full(const char *filename, char** from_email, char** to_email, char** password, int* useJSON, char** bcc, int* requireEmail, int* emailTokenExpiry, char** smtpServer, int* smtpPort, int* useSSL) {
-    if (!from_email || !to_email || !password) return 1;
+int read_credentials_json_full(const char *filename, char** from_email, char** password, int* useJSON, char** bcc, int* emailTokenExpiry, char** smtpServer, int* smtpPort, int* useSSL) {
+    if (!from_email ||  !password) return 1;
     
     FILE *file = fopen(filename, "rb");
     if (!file) return 1;
@@ -130,7 +130,6 @@ int read_credentials_json_full(const char *filename, char** from_email, char** t
     const cJSON *js_password = cJSON_GetObjectItemCaseSensitive(json, "password");
     const cJSON *js_useJSON = cJSON_GetObjectItemCaseSensitive(json, "useJSON");
     const cJSON *js_bcc = cJSON_GetObjectItemCaseSensitive(json, "bcc");
-    const cJSON *js_requireEmail = cJSON_GetObjectItemCaseSensitive(json, "requireEmail");
     const cJSON *js_emailTokenExpiry = cJSON_GetObjectItemCaseSensitive(json, "emailTokenExpiry");
     const cJSON *js_smtpServer = cJSON_GetObjectItemCaseSensitive(json, "smtpServer");
     const cJSON *js_smtpPort = cJSON_GetObjectItemCaseSensitive(json, "smtpPort");
@@ -149,7 +148,6 @@ int read_credentials_json_full(const char *filename, char** from_email, char** t
     
     // Populate the email credentials
     *from_email = strdup(js_sender->valuestring);
-    *to_email = strdup(js_receiver->valuestring);
     *password = strdup(js_password->valuestring);
     
     // Handle useJSON setting (optional, defaults to 1)
@@ -166,12 +164,7 @@ int read_credentials_json_full(const char *filename, char** from_email, char** t
         *bcc = NULL; // No BCC if not specified
     }
     
-    // Handle requireEmail setting (optional, defaults to true)
-    if (requireEmail && cJSON_IsBool(js_requireEmail)) {
-        *requireEmail = js_requireEmail->valueint;
-    } else if (requireEmail) {
-        *requireEmail = 1; // Default to requiring email
-    }
+
     
     // Handle emailTokenExpiry setting (optional, defaults to 600 seconds)
     if (emailTokenExpiry && cJSON_IsNumber(js_emailTokenExpiry)) {
@@ -268,7 +261,6 @@ char* send_email(emailContent_t* payload) {
     // Use cached credentials based on useJSON setting
     char* from_email = NULL;
     char* password = strdup(email_config.password);
-    char* to_email = strdup(payload->TO);
     
     if (email_config.useJSON) {
         // Use sender from config file
@@ -282,7 +274,6 @@ char* send_email(emailContent_t* payload) {
     char* email_content = format_email_content(payload, from_email);
     if (!email_content) {
         free(from_email);
-        free(to_email);
         free(password);
         return ("[ERROR]Failed to format email content\n");
     }
@@ -308,7 +299,7 @@ char* send_email(emailContent_t* payload) {
         curl_easy_setopt(curl, CURLOPT_URL, smtp_url);
         curl_easy_setopt(curl, CURLOPT_USE_SSL, (long)CURLUSESSL_ALL);
        
-        recipients = curl_slist_append(recipients, to_email);
+        recipients = curl_slist_append(recipients, payload->TO);
         
         // Add BCC recipient if configured
         if (email_config.bcc && strlen(email_config.bcc) > 0) {
@@ -334,7 +325,6 @@ char* send_email(emailContent_t* payload) {
     // Clean up all allocated memory
     free(email_content);
     free(from_email);
-    free(to_email);
     free(password);    
     return ("[INFO]Email sent successfully!\n");
 
@@ -366,20 +356,20 @@ int init_email_config() {
     // Load credentials from JSON file
     char* from_email = NULL;
     char* password = NULL;
-    char* to_email = NULL; // Not used for config
     int useJSON_setting = 1;
     char* bcc_email = NULL;
-    int requireEmail_setting = 1;
     int emailTokenExpiry_setting = 600;
     char* smtpServer_setting = NULL;
     int smtpPort_setting = 465;
     int useSSL_setting = 1;
     
-    int result = read_credentials_json_full(emailConfigFile, &from_email, &to_email, &password, &useJSON_setting, &bcc_email, &requireEmail_setting, &emailTokenExpiry_setting, &smtpServer_setting, &smtpPort_setting, &useSSL_setting);
+    int result = read_credentials_json_full(emailConfigFile, &from_email,  &password, &useJSON_setting, &bcc_email, &emailTokenExpiry_setting, &smtpServer_setting, &smtpPort_setting, &useSSL_setting);
     if (result != 0) {
         printf("[ERROR] Failed to load email config from %s\n", emailConfigFile);
         return 0;
     }
+    
+  
     
     // Store in global config
     email_config.from_email = from_email;
@@ -388,7 +378,6 @@ int init_email_config() {
     email_config.smtp_server = smtpServer_setting;
     email_config.smtp_port = smtpPort_setting;
     email_config.useSSL = useSSL_setting;
-    email_config.requireEmail = requireEmail_setting;
     email_config.emailTokenExpiry = emailTokenExpiry_setting;
     email_config.useJSON = useJSON_setting;
     email_config.initialized = 1;
@@ -421,7 +410,12 @@ int is_email_config_loaded(void) {
 }
 
 int is_email_required(void) {
-    return email_config.initialized && email_config.requireEmail;
+    // Check if email is disabled in server config
+    extern int is_email_disabled(void);
+    if (is_email_disabled()) {
+        return 0;
+    }
+    return email_config.initialized;
 }
 
 int get_email_token_expiry(void) {

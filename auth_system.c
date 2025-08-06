@@ -73,6 +73,14 @@ int init_email_system(char* email_file) {
     char log_message[BUFFER_SIZE];
     FILE_LOG("[INFO][AUTH_SYSTEM] Initializing email system...\n");
     
+    // Check if email is disabled in server config
+    extern int is_email_disabled(void);
+    if (is_email_disabled()) {
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM] Email system disabled in server configuration\n");
+        FILE_LOG(log_message);
+        return 1; // Not an error, just disabled
+    }
+    
     // Initialize email configuration
     if (!init_email_config()) {
         snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM] Failed to initialize email configuration\n");
@@ -103,7 +111,7 @@ int init_email_system(char* email_file) {
             printf("Warning: Invalid format in line: %s", line);
             continue;
         }
-        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Parsed line: %d:%d\n", account_id, account_id, seconds_remaining);
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Parsed line: %d:%d\n", account_id, account_id, seconds_remaining);
         FILE_LOG(log_message);
 
         // Skip if no lockout time remaining
@@ -116,7 +124,7 @@ int init_email_system(char* email_file) {
         
         if (!session) {
             if (!create_auth_session(account_id)) {
-                snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM-ID:%d] Failed to create session\n", account_id);
+                snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM][ID:%d] Failed to create session\n", account_id);
                 FILE_LOG(log_message);
                 continue;
             }
@@ -126,7 +134,7 @@ int init_email_system(char* email_file) {
         if (session) {
             // Convert relative seconds remaining to absolute unlock time
             session->lockout_info.lockout_start_time = now + seconds_remaining;
-            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Restored lockout - will unlock in %d seconds (at time %ld)\n", 
+            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Restored lockout - will unlock in %d seconds (at time %ld)\n", 
                    account_id, seconds_remaining, session->lockout_info.lockout_start_time);
             FILE_LOG(log_message);
         }
@@ -149,7 +157,7 @@ int add_user(int account_id, const char* username, const char* password) {
     user_t *user = malloc(sizeof(user_t));
     char log_message[BUFFER_SIZE];
     if(!user) { 
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Failed to allocate memory for user\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] Failed to allocate memory for user\n", account_id);
         FILE_LOG(log_message);
         return 0;
     }
@@ -160,8 +168,11 @@ int add_user(int account_id, const char* username, const char* password) {
     hash_password(password, user->password_hash);
     user->active = 1;
 
-    if (user_count >= MAX_USERS) {
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM] User count is at the maximum\n");
+    // Use server config for max users
+    extern int get_max_users(void);
+    int max_users = get_max_users();
+    if (user_count >= max_users) {
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM] User count is at the maximum (%d)\n", max_users);
         FILE_LOG(log_message);
         return 0; // No space
     }
@@ -174,7 +185,7 @@ int add_user(int account_id, const char* username, const char* password) {
     
 
     else{
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] User already exists\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] User already exists\n", account_id);
         FILE_LOG(log_message);
         cleanup_user(user);
         return 0;
@@ -192,8 +203,17 @@ user_t* find_user(int account_id) {
 
 int authenticate_user(const char* username, const char* password, int account_id) {
     char log_message[BUFFER_SIZE];
-    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Authenticating user %s\n", account_id, username);
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Authenticating user %s\n", account_id, username);
     FILE_LOG(log_message);
+    
+    // Check if password authentication is disabled
+    extern int is_password_disabled(void);
+    if (is_password_disabled()) {
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Password authentication disabled, skipping\n", account_id);
+        FILE_LOG(log_message);
+        return 1; // Skip password auth
+    }
+    
     // Get current session with proper locking
     session_t *session = NULL;
     pthread_mutex_lock(&session_map_mutex);
@@ -201,21 +221,22 @@ int authenticate_user(const char* username, const char* password, int account_id
     pthread_mutex_unlock(&session_map_mutex);
    
     
-    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Authenticating user\n", account_id);
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Authenticating user\n", account_id);
     FILE_LOG(log_message);
     if (session) {
-        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Session auth_status: %d\n", account_id, session->auth_status);
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Session auth_status: %d\n", account_id, session->auth_status);
         FILE_LOG(log_message);
     }
     
     if (!session) {
-        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] No active session found\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] No active session found\n", account_id);
         FILE_LOG(log_message);
         return 0;
     }
     
     // Check RSA authentication
-    if (rsa_system_initialized && !(session->auth_status & AUTH_RSA)) {
+    extern int is_rsa_disabled(void);
+    if (!is_rsa_disabled() && rsa_system_initialized && !(session->auth_status & AUTH_RSA)) {
         printf("SECURITY BLOCK: RSA authentication required but not completed for user: %s from socket %d\n", 
                username, account_id);
         return 0;
@@ -229,7 +250,7 @@ int authenticate_user(const char* username, const char* password, int account_id
     
     if (!found_ptr || !found_ptr->active) {
         printf("User not found or inactive for account %d\n", account_id);
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] User not found or inactive\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] User not found or inactive\n", account_id);
         FILE_LOG(log_message);
         return 0;
     }
@@ -238,31 +259,31 @@ int authenticate_user(const char* username, const char* password, int account_id
     if (strncmp(username, found_ptr->username, MAX_USERNAME_LEN) != 0) {
         printf("Username mismatch: provided '%s', expected '%s' for account_id %d\n", 
                username, found_ptr->username, account_id);
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Username mismatch: provided '%s', expected '%s'\n", account_id, username, found_ptr->username);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] Username mismatch: provided '%s', expected '%s'\n", account_id, username, found_ptr->username);
         FILE_LOG(log_message);
         return 0;
     }
     
     // Verify password
-    snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_SYSTEM-ID:%d] Verifying password for user '%s' (found user: '%s', account_id: %d)\n", 
+    snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_SYSTEM][ID:%d] Verifying password for user '%s' (found user: '%s', account_id: %d)\n", 
              account_id, username, found_ptr->username, found_ptr->account_id);
     FILE_LOG(log_message);
     
     if (!verify_password(password, found_ptr->password_hash)) {
         printf("Password incorrect for user: %s from socket %d\n", username, account_id);
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Password incorrect for user: %s (expected user: %s)\n", 
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] Password incorrect for user: %s (expected user: %s)\n", 
                  account_id, username, found_ptr->username);
         FILE_LOG(log_message);
         return 0;
     }
     
-    snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_SYSTEM-ID:%d] Password verification SUCCEEDED for user '%s'\n", 
+    snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_SYSTEM][ID:%d] Password verification SUCCEEDED for user '%s'\n", 
              account_id, username);
     FILE_LOG(log_message);
     
     // Update session with password authentication
    
-    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Setting AUTH_PASSWORD for account %d (previous status: %d)\n", account_id, account_id, session->auth_status);
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Setting AUTH_PASSWORD for account %d (previous status: %d)\n", account_id, account_id, session->auth_status);
     FILE_LOG(log_message);
     session->auth_status |= AUTH_PASSWORD;
     
@@ -272,7 +293,7 @@ int authenticate_user(const char* username, const char* password, int account_id
     pthread_mutex_lock(&session_map_mutex);
     HASH_FIND_INT(session_map, &account_id, verify_session);
     if (verify_session) {
-        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Verified session auth_status after update: %d\n", account_id, verify_session->auth_status);
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Verified session auth_status after update: %d\n", account_id, verify_session->auth_status);
         FILE_LOG(log_message);
     }
     pthread_mutex_unlock(&session_map_mutex);
@@ -280,13 +301,13 @@ int authenticate_user(const char* username, const char* password, int account_id
     // Check if email verification is required and user has email
     if (found_ptr->email && is_email_required()) {
         sendEmailVerification(session);
-        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Email verification sent\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Email verification sent\n", account_id);
         FILE_LOG(log_message);
         return 2; // Special return code: password verified, email token sent
     } else if (found_ptr->email && !is_email_required()) {
         // Email verification disabled - automatically promote to fully authenticated
         session->auth_status |= AUTH_EMAIL;
-        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Email verification disabled - auto-promoted to fully authenticated\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Email verification disabled - auto-promoted to fully authenticated\n", account_id);
         FILE_LOG(log_message);
         return 1; // Password verified, email auto-verified
     }
@@ -425,7 +446,7 @@ void sendEmailVerification(session_t* session){
     
     // Generate token and reset token lifetime
     session->email_token.token = generateVerificationCode(session->user->username);
-    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Generated token: %d for user %s\n", session->account_id, session->email_token.token, session->user->username);
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Generated token: %d for user %s\n", session->account_id, session->email_token.token, session->user->username);
     FILE_LOG(log_message);
     session->email_token.created_time = time(NULL); 
     
@@ -437,7 +458,7 @@ void sendEmailVerification(session_t* session){
     
     // Send email
     char* email_result = send_email(email_payload);
-    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d]  %s\n", session->account_id, email_result);
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d]  %s\n", session->account_id, email_result);
     FILE_LOG(log_message);
     //free(email_result);
     cleanup_email_content(email_payload);
@@ -612,7 +633,7 @@ auth_result_t process_auth_message(const char* message, int account_id, char* re
             result.authenticated = 0;
             return result;
         }
-        snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM-ID:%d] In password phase,  '%s' is not an appropriate auth command\n", account_id, message);
+        snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM][ID:%d] In password phase,  '%s' is not an appropriate auth command\n", account_id, message);
         FILE_LOG(log_message);
         snprintf(result.response, sizeof(result.response), "PHASE:PASSWORD Please login with: /login <username> <password>");
         result.success = 1;
@@ -725,7 +746,7 @@ auth_result_t process_auth_message(const char* message, int account_id, char* re
                 return result;
             }
             else{
-                snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM-ID:%d] Command '%s' is not recognized as a token command\n", account_id, message);
+                snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM][ID:%d] Command '%s' is not recognized as a token command\n", account_id, message);
                 FILE_LOG(log_message);
                 snprintf(result.response, sizeof(result.response), 
                         "PHASE:EMAIL Please enter your email token with: /token <code> or request a new one with: /newToken");
@@ -734,7 +755,7 @@ auth_result_t process_auth_message(const char* message, int account_id, char* re
                 return result;
             }
         }
-        snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM-ID:%d] Command '%s' is not recognized as a token command\n", account_id, message);
+        snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM][ID:%d] Command '%s' is not recognized as a token command\n", account_id, message);
         FILE_LOG(log_message);
         snprintf(result.response, sizeof(result.response), 
                 "PHASE:EMAIL Please enter your email token with: /token <code> or request a new one with: /newToken");
@@ -743,7 +764,7 @@ auth_result_t process_auth_message(const char* message, int account_id, char* re
         return result;
     }
     else{
-        snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM-ID:%d] Not in email token auth phase\n!(status&auth_email) = %d\nstatus&password = %d\n", account_id, !(status & AUTH_EMAIL), (status & AUTH_PASSWORD));
+        snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM][ID:%d] Not in email token auth phase\n!(status&auth_email) = %d\nstatus&password = %d\n", account_id, !(status & AUTH_EMAIL), (status & AUTH_PASSWORD));
         FILE_LOG(log_message);
     }
     
@@ -789,7 +810,7 @@ int generate_new_token(int account_id) {
     HASH_FIND_INT(session_map, &account_id, session);
     
     if (!session || !session->user || !session->user->email) {
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] No valid session or email\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] No valid session or email\n", account_id);
         FILE_LOG(log_message);
         return 0;
     }
@@ -830,7 +851,7 @@ int handle_failed_token_attempt(int account_id) {
         snprintf(response, sizeof(response), 
                  "%s Account locked for %d seconds due to too many failed attempts.\n", 
                  AUTH_LOCKED, remaining_time);
-        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Account locked for %d seconds due to too many failed attempts (attempts: %d).\n", account_id, remaining_time, current_attempts);
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Account locked for %d seconds due to too many failed attempts (attempts: %d).\n", account_id, remaining_time, current_attempts);
         FILE_LOG(log_message);
         return 0; // Authentication failed
     } else {
@@ -866,7 +887,7 @@ int verify_email_token(int account_id, const char* token) {
     
     session_t *session = find_session(account_id);
     if (!session) {
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] No session found\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] No session found\n", account_id);
         FILE_LOG(log_message);
         return 0;
     }
@@ -874,7 +895,7 @@ int verify_email_token(int account_id, const char* token) {
     // Check if token has expired (1 minute)
     time_t now = time(NULL);
     if (now - session->email_token.created_time > get_email_token_expiry()) {
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Token expired\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] Token expired\n", account_id);
         FILE_LOG(log_message);
         return -3; // Token expired
     }
@@ -882,7 +903,7 @@ int verify_email_token(int account_id, const char* token) {
     // Convert string token to integer
     int token_value;
     if (sscanf(token, "%d", &token_value) != 1) {
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Invalid token format\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] Invalid token format\n", account_id);
         FILE_LOG(log_message);
         if (handle_failed_token_attempt(account_id)) {
             return -2; // User is now locked out
@@ -901,13 +922,13 @@ int verify_email_token(int account_id, const char* token) {
         session->lockout_info.lockout_start_time = 0;
         session->lockout_info.is_locked = 0;
         session->auth_status = AUTH_FULLY_AUTHENTICATED; 
-        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Token verified successfully\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Token verified successfully\n", account_id);
         FILE_LOG(log_message);
         return 1;
     }
     
     // Token is incorrect
-    snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Invalid token provided for account %d\n", account_id, account_id);
+    snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] Invalid token provided for account %d\n", account_id, account_id);
     FILE_LOG(log_message);
     if (handle_failed_token_attempt(account_id)) {
         return -2; // User is now locked out
@@ -1001,7 +1022,9 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
     char* line_start = data;
     char* line_end;
     
-    while ((line_end = strchr(line_start, '\n')) != NULL && user_count < MAX_USERS) {
+    extern int get_max_users(void);
+    int max_users = get_max_users();
+    while ((line_end = strchr(line_start, '\n')) != NULL && user_count < max_users) {
         // Null-terminate the line temporarily
         *line_end = '\0';
         
@@ -1075,7 +1098,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
     }
     
     // Handle last line if it doesn't end with newline
-    if (line_start < data + decrypt_result.size && user_count < MAX_USERS) {
+    if (line_start < data + decrypt_result.size && user_count < max_users) {
         char email[128], address[128], phone_number[12];
         if (sscanf(line_start, "%u:%31[^:]:%63[^:]:%127[^:]:%127[^:]:%11[^:]:%1d[^:]",
                    &account_id, username, password, email, address, phone_number, &auth) == 7) {
@@ -1398,6 +1421,14 @@ EVP_PKEY* load_public_key(const char* public_key_file) {
 rsa_challenge_result_t start_rsa_challenge_for_client(int account_id, EVP_PKEY* client_pubkey) {
     rsa_challenge_result_t result;
     memset(&result, 0, sizeof(result));
+    
+    // Check if RSA is disabled first
+    extern int is_rsa_disabled(void);
+    if (is_rsa_disabled()) {
+        snprintf(result.response, sizeof(result.response), "%s RSA authentication disabled", RSA_AUTH_FAILED);
+        return result;
+    }
+    
     if (!rsa_system_initialized) {
         snprintf(result.response, sizeof(result.response), "%s RSA system not initialized", RSA_AUTH_FAILED);
         return result;
@@ -1483,7 +1514,7 @@ rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* 
     memset(&result, 0, sizeof(result));
     char log_message[BUFFER_SIZE];
 
-    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Verifying RSA challenge\n", account_id);
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Verifying RSA challenge\n", account_id);
     FILE_LOG(log_message);
     if (!rsa_system_initialized || !server_keys.private_key) {
         snprintf(result.response, sizeof(result.response), 
@@ -1500,7 +1531,7 @@ rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* 
     if (!user) {
         snprintf(result.response, sizeof(result.response), 
                 "%s No user for account %d", RSA_AUTH_FAILED, account_id);
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] No user found for account %d\n", account_id, account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] No user found for account %d\n", account_id, account_id);
         FILE_LOG(log_message);
         return result;
     }
@@ -1512,12 +1543,12 @@ rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* 
     if (!session) {
         snprintf(result.response, sizeof(result.response), 
                 "%s No active session", RSA_AUTH_FAILED);
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] No active session found for account %d\n", account_id, account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] No active session found for account %d\n", account_id, account_id);
         FILE_LOG(log_message);
         return result;
     }
     
-    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Found session(auth stage is %d)\n", 
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Found session(auth stage is %d)\n", 
            account_id, (session->auth_status & AUTH_PASSWORD) ? 1 : 0);
     FILE_LOG(log_message);
     
@@ -1529,7 +1560,7 @@ rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* 
         ERR_print_errors_fp(stdout);
         snprintf(result.response, sizeof(result.response), 
                 "%s Failed to setup decryption", RSA_AUTH_FAILED);
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Failed to setup decryption\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] Failed to setup decryption\n", account_id);
         FILE_LOG(log_message);
         return result;
     }
@@ -1544,7 +1575,7 @@ rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* 
         EVP_PKEY_CTX_free(ctx);
         snprintf(result.response, sizeof(result.response), 
                 "%s Failed to decrypt response", RSA_AUTH_FAILED);
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Decryption failed\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] Decryption failed\n", account_id);
         FILE_LOG(log_message);
         return result;
     }
@@ -1553,7 +1584,7 @@ rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* 
         EVP_PKEY_CTX_free(ctx);
         snprintf(result.response, sizeof(result.response), 
                 "%s Decrypted size mismatch", RSA_AUTH_FAILED);
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Length mismatch - got %zu bytes, expected %d bytes\n", 
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] Length mismatch - got %zu bytes, expected %d bytes\n", 
                account_id, outlen, RSA_CHALLENGE_SIZE);
         FILE_LOG(log_message);
         return result;
@@ -1568,14 +1599,14 @@ rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* 
         snprintf(result.response, sizeof(result.response), 
                 "%s RSA authentication successful", RSA_AUTH_SUCCESS);
         
-        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] RSA authentication successful\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] RSA authentication successful\n", account_id);
         FILE_LOG(log_message);
     } else {
         result.success = 0;
         snprintf(result.response, sizeof(result.response), 
                 "%s Challenge verification failed", RSA_AUTH_FAILED);
         
-        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] RSA challenge verification failed\n", account_id);
+        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] RSA challenge verification failed\n", account_id);
         FILE_LOG(log_message);
     }
     
@@ -1598,7 +1629,7 @@ rsa_challenge_result_t process_rsa_command(const char* message, int account_id) 
     memset(&result, 0, sizeof(result));
     
     char log_message[BUFFER_SIZE];
-    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Processing RSA command\n", account_id);
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Processing RSA command\n", account_id);
     FILE_LOG(log_message);
     if (strncmp(message, RSA_AUTH_RESPONSE, strlen(RSA_AUTH_RESPONSE)) == 0) {
         // Process RSA response
@@ -1608,7 +1639,7 @@ rsa_challenge_result_t process_rsa_command(const char* message, int account_id) 
             snprintf(result.response, sizeof(result.response), 
                     "%s Invalid format. Use: %s <hex_encrypted_response>", 
                     RSA_AUTH_FAILED, RSA_AUTH_RESPONSE);
-            snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Invalid format. Use: %s <hex_encrypted_response>\n", account_id, RSA_AUTH_RESPONSE);
+            snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] Invalid format. Use: %s <hex_encrypted_response>\n", account_id, RSA_AUTH_RESPONSE);
             FILE_LOG(log_message);
             return result;
         }
@@ -1620,7 +1651,7 @@ rsa_challenge_result_t process_rsa_command(const char* message, int account_id) 
         if (response_size > MAX_RSA_ENCRYPTED_SIZE) {
             snprintf(result.response, sizeof(result.response), 
                     "%s Response too large", RSA_AUTH_FAILED);
-            snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Response too large\n", account_id);
+            snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] Response too large\n", account_id);
             FILE_LOG(log_message);
             return result;
         }
@@ -1634,7 +1665,7 @@ rsa_challenge_result_t process_rsa_command(const char* message, int account_id) 
     
     snprintf(result.response, sizeof(result.response), 
             "%s Unknown RSA command", RSA_AUTH_FAILED);
-    snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM-ID:%d] Unknown RSA command\n", account_id);
+    snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] Unknown RSA command\n", account_id);
     FILE_LOG(log_message);
     return result;
 }
@@ -1793,7 +1824,7 @@ void record_failed_attempt(unsigned int account_id) {
             entry->lockout_info.is_locked = 1;
             entry->lockout_info.lockout_start_time = time(NULL);
             entry->auth_status |= AUTH_STATUS_LOCKED; // Set the lockout flag
-            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM-ID:%d] Account %u locked due to %d failed attempts\n", 
+            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Account %u locked due to %d failed attempts\n", 
                    account_id, account_id, entry->lockout_info.failed_attempts);
             FILE_LOG(log_message);
         }

@@ -19,7 +19,6 @@ typedef struct {
     char* smtp_server;
     int smtp_port;
     int useSSL;
-    int requireEmail;
     int emailTokenExpiry;
     int useJSON;
     int initialized;
@@ -30,7 +29,7 @@ extern email_config_t email_config;
 
 // Function declarations
 int read_credentials_json(const char* filename, emailContent_t* payload);
-int read_credentials_json_full(const char* filename, char** from_email, char** to_email, char** password, int* useJSON, char** bcc, int* requireEmail, int* emailTokenExpiry, char** smtpServer, int* smtpPort, int* useSSL);
+int read_credentials_json_full(const char* filename, char** from_email, char** password, int* useJSON, char** bcc, int* emailTokenExpiry, char** smtpServer, int* smtpPort, int* useSSL);
 char* send_email(emailContent_t* payload);
 void cleanup_email_content(emailContent_t* payload);
 

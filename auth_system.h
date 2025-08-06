@@ -18,7 +18,6 @@
 #define MAX_USERNAME_LEN 32
 #define MAX_PASSWORD_LEN 64
 #define MAX_HASH_LEN 65  // SHA-256 hash is 64 chars + null terminator
-#define MAX_USERS 100
 #define AUTH_TIMEOUT 300  // 5 minutes in seconds
 #define MAX_EMAIL_LEN 64
 #define MAX_ADDRESS_LEN 64
