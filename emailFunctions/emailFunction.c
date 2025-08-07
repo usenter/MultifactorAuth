@@ -6,9 +6,6 @@
 #include <time.h>
 #include "emailFunction.h"
 
-int useJSON = 1;  // If this is not set to 1, you need to define the emailFrom variable
-#define log_message_size 1024
-const char* emailConfigFile = "emailConfig.json";
 const char* emailFrom = "noreply@example.com";
 
 // Global email configuration (loaded once and cached)
@@ -135,7 +132,7 @@ int read_credentials_json_full(const char *filename, char** from_email, char** p
     const cJSON *js_smtpPort = cJSON_GetObjectItemCaseSensitive(json, "smtpPort");
     const cJSON *js_useSSL = cJSON_GetObjectItemCaseSensitive(json, "useSSL");
     
-    char log_message[log_message_size];
+    char log_message[BUFFER_SIZE];
     snprintf(log_message, sizeof(log_message), "[INFO][EMAIL_FUNCTION] js_sender: %s\n", js_sender->valuestring);
     snprintf(log_message, sizeof(log_message), "[INFO][EMAIL_FUNCTION] js_receiver: %s\n", js_receiver->valuestring);
     snprintf(log_message, sizeof(log_message), "[INFO][EMAIL_FUNCTION] js_password: %s\n", js_password->valuestring);
@@ -345,7 +342,7 @@ int generate_email_token(char* token) {
 // Email configuration management functions
 
 int init_email_config() {
-    if (!emailConfigFile) {
+    if (!EMAIL_CONFIG_PATH) {
         printf("[ERROR] Invalid config file path\n");
         return 0;
     }
@@ -363,9 +360,9 @@ int init_email_config() {
     int smtpPort_setting = 465;
     int useSSL_setting = 1;
     
-    int result = read_credentials_json_full(emailConfigFile, &from_email,  &password, &useJSON_setting, &bcc_email, &emailTokenExpiry_setting, &smtpServer_setting, &smtpPort_setting, &useSSL_setting);
+    int result = read_credentials_json_full(EMAIL_CONFIG_PATH, &from_email,  &password, &useJSON_setting, &bcc_email, &emailTokenExpiry_setting, &smtpServer_setting, &smtpPort_setting, &useSSL_setting);
     if (result != 0) {
-        printf("[ERROR] Failed to load email config from %s\n", emailConfigFile);
+        printf("[ERROR] Failed to load email config from %s\n", EMAIL_CONFIG_PATH);
         return 0;
     }
     

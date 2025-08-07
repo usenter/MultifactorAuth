@@ -14,6 +14,9 @@ typedef struct {
     int disableRSA;
     int disablePassword;
     int initialized;
+    char* serverIPaddress;
+    int serverPort;
+    int restServerPort;
 } server_config_t;
 
 // Global server configuration
@@ -28,5 +31,8 @@ int get_max_events(void);
 int is_email_disabled(void);
 int is_rsa_disabled(void);
 int is_password_disabled(void);
+char* get_server_ip(void);
+int get_server_port(void);
+int get_rest_server_port(void);
 
 #endif // SERVER_CONFIG_H 

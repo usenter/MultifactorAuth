@@ -4,6 +4,10 @@
 #ifndef EMAIL_FUNCTION_H
 #define EMAIL_FUNCTION_H
 
+
+#define BUFFER_SIZE 1024
+#define EMAIL_CONFIG_PATH "configTools/emailConfig.json"
+
 typedef struct {
     char* TO;        // Always set by caller
     char* subject;   // Always set by caller  

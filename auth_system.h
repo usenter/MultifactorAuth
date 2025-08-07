@@ -228,4 +228,14 @@ void record_failed_attempt(unsigned int account_id);
 int get_current_failed_attempts(unsigned int account_id);
 //rsa_challenge_result_t start_rsa_challenge_with_pubkey(EVP_PKEY* pubkey);
 
+extern user_t *user_map;
+extern username_t *username_map;
+extern session_t *session_map;
+
+extern pthread_mutex_t user_map_mutex;
+extern pthread_mutex_t session_map_mutex;
+extern pthread_mutex_t username_map_mutex;
+
+
+
 #endif // AUTH_SYSTEM_H 

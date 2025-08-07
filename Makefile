@@ -4,7 +4,7 @@ CFLAGS = -Wall -Wextra -std=c17 -pthread -D_POSIX_C_SOURCE=200809L
 LIBS = -lssl -lcrypto -lcurl -lcjson -lmicrohttpd
 
 # Object files
-OBJS = encryptionTools.o auth_system.o fileOperations.o emailFunction.o serverConfig.o
+OBJS = encryptionTools.o auth_system.o fileOperations.o emailFunction.o serverConfig.o socketHandling.o serverRest.o
 
 # Targets
 all: unified_server unified_client encryptionTools_test user_encryptor generate_rsa_keys rest_client
@@ -16,7 +16,7 @@ encryptionTools.o: decryptionFunctions/encryptionTools.c decryptionFunctions/enc
 auth_system.o: auth_system.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-fileOperations.o: fileOperations.c fileOperations.h
+fileOperations.o: fileOperationTools/fileOperations.c fileOperationTools/fileOperations.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Email test executable
@@ -24,12 +24,20 @@ emailFunction.o: emailFunctions/emailFunction.c emailFunctions/emailFunction.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Server configuration
-serverConfig.o: serverConfig.c serverConfig.h
+serverConfig.o: configTools/serverConfig.c configTools/serverConfig.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Socket handling
+socketHandling.o: socketHandling/socketHandling.c socketHandling/socketHandling.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# REST API handling
+serverRest.o: REST_tools/serverRest.c REST_tools/serverRest.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # REST client program
-rest_client: rest_client.c
-	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
+rest_client: REST_tools/rest_client.c serverConfig.o
+	$(CC) $(CFLAGS) -o $@ $< serverConfig.o $(LIBS)
 
 # Standalone file encryption/decryption tool
 user_encryptor: userEncryptionTools/user_encryptor.c

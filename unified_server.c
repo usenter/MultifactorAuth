@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,46 +17,23 @@
 #include "hashmap/uthash.h"
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
-#include "fileOperations.h" // File mode operations
-#include "socketHandling/socketHandling.h"
-#include "serverConfig.h"
-#include <microhttpd.h>
+#include "fileOperationTools/fileOperations.h" // File mode operations
+#include "configTools/serverConfig.h"
+#include "REST_tools/serverRest.h"
 
 
 int setup_initial_connection(int client_socket);
 void* handle_authenticated_client(void* arg);
-char* get_client_status_by_account_id(unsigned int account_id);
-char* get_client_status_by_username(const char *username);
+
 #define PORT 12345
 #define REST_PORT 8080
-#define BUFFER_SIZE 1024
 #define DEFAULT_USER_FILE "encrypted_users.txt"
-// Program information
+#define SERVER_CONFIG_PATH "configTools/serverConf.json"
 #define PROGRAM_NAME "AuthenticatedChatServer"
 char default_cwd[256] = "UserDirectory";
-// Add a list to track client handler threads
-#define MAX_CLIENT_THREADS 1024
-pthread_t client_threads[MAX_CLIENT_THREADS];
-int client_thread_count = 0;
-int overrideBroadcast = 0; // when true, messages are broadcast to all clients, not just chat mode clients
-// Socket state tracking
-typedef enum {
-    SOCKET_STATE_NEW,           // Just connected, needs auth
-    SOCKET_STATE_AUTHENTICATING,// In authentication process
-    SOCKET_STATE_AUTHENTICATED  // Fully authenticated
-} socket_state_t;
+int server_socket = -1;
+pthread_mutex_t server_socket_mutex = PTHREAD_MUTEX_INITIALIZER; // NEW: protect server socket
 
-typedef struct {
-    int socket;
-    socket_state_t state;
-    time_t last_activity;
-    unsigned int account_id;            // Set after successful auth
-    UT_hash_handle hh;        // For hash table
-} socket_info_t;
-
-// Global socket state tracking
-socket_info_t *socket_map = NULL;
-pthread_mutex_t socket_map_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Thread communication
 typedef struct {
@@ -67,113 +45,22 @@ typedef struct {
 thread_context_t auth_thread_ctx;
 thread_context_t cmd_thread_ctx;
 
-// REST API server
+// REST API server (now handled by serverRest.c)
 struct MHD_Daemon *rest_daemon = NULL;
 
 // External declarations for auth system
 extern user_t *user_map;
 extern pthread_mutex_t user_map_mutex;
 
-// Global variables with proper mutex protection
-client_t *clients_map = NULL; // Hashmap root
-int client_count = 0;
-pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t thread_count_mutex = PTHREAD_MUTEX_INITIALIZER; // NEW: protect thread array
+
 volatile int server_running = 1;
 char* user_file = DEFAULT_USER_FILE;
 char* emailPassword = NULL; // Fill this in if you disable useJSON parameter in emailTest.c
-// Socket management functions
-socket_info_t* get_socket_info(int socket) {
-    socket_info_t *info = NULL;
-    HASH_FIND_INT(socket_map, &socket, info);
-    return info;
-}
 
-int check_and_handle_lockout(unsigned int account_id, int client_socket) {
-    // First check persistent lockout state
-    int remaining_time = check_persistent_lockout(account_id);
-    char log_message[BUFFER_SIZE];
 
-    if (remaining_time > 0) {
-        char response[BUFFER_SIZE];
-        snprintf(response, sizeof(response), 
-                 "%s Account is locked for %d more seconds due to failed authentication attempts.\n"
-                 "This lockout persists across connections. Please try again later.\n", 
-                 AUTH_LOCKED, remaining_time);
-        send(client_socket, response, strlen(response), 0);
-        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Account %d attempted connection while locked (%d sec remaining)\n", 
-                 account_id, account_id, remaining_time);
-        FILE_LOG(log_message);
-        return 1; // Account is locked
-    }
-    
-    // Also check the existing auth system lockout
-    if (get_auth_status(account_id) & AUTH_STATUS_LOCKED) {
-        int auth_remaining = get_remaining_lockout_time(account_id);
-        if (auth_remaining > 0) {
-            char response[BUFFER_SIZE];
-            snprintf(response, sizeof(response), 
-                     "%s[SESSION] Account is locked for %d more seconds.\n", 
-                     AUTH_LOCKED, auth_remaining);
-            send(client_socket, response, strlen(response), 0);
-            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Account %d attempted connection while locked (%d sec remaining)\n", 
-                     account_id, account_id, auth_remaining);
-            FILE_LOG(log_message);
-            return 1; // Account is locked
-        } else {
-            // Session lockout expired, send unlock message
-            char response[BUFFER_SIZE];
-            snprintf(response, sizeof(response), 
-                     "%s Account lockout has expired. You may now login.\n", 
-                     AUTH_STATUS_UNLOCKED);
-            send(client_socket, response, strlen(response), 0);
-            FILE_LOG(response);
-            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Account %d lockout expired\n", 
-                     account_id, account_id);
-            FILE_LOG(log_message);
-            return 0; // Account is now unlocked
-        }
-    }
-    
-    return 0; // Account is not locked
-}
-void add_socket_info(int socket) {
-    socket_info_t *info = malloc(sizeof(socket_info_t));
-    if (!info) return;
-    
-    info->socket = socket;
-    info->state = SOCKET_STATE_NEW;
-    info->last_activity = time(NULL);
-    info->account_id = -1;
-    
-    pthread_mutex_lock(&socket_map_mutex);
-    HASH_ADD_INT(socket_map, socket, info);
-    pthread_mutex_unlock(&socket_map_mutex);
-}
-// Function to find client by socket - IMPROVED
-client_t* find_client_by_socket(int client_socket) {
-    client_t *c = NULL;
-    pthread_mutex_lock(&clients_mutex);
-    HASH_FIND_INT(clients_map, &client_socket, c);
-    // Only return active clients to prevent accessing freed memory
-    if (c && !c->active) {
-        c = NULL;
-    }
-    pthread_mutex_unlock(&clients_mutex);
-    return c;
-}
-void remove_socket_info(int socket) {
-    socket_info_t *info = NULL;
-    pthread_mutex_lock(&socket_map_mutex);
-    HASH_FIND_INT(socket_map, &socket, info);
-    if (info) {
-        HASH_DEL(socket_map, info);
-        free(info);
-    }
-    pthread_mutex_unlock(&socket_map_mutex);
-}
 
-void broadcast_message(const char* message, int sender_socket) {
+
+void broadcast_message(const char* message, int sender_socket, int overrideBroadcast) {
     char log_message[BUFFER_SIZE];
 
     if (!message) return;
@@ -264,9 +151,12 @@ void remove_client(int client_socket) {
     snprintf(departure_msg, sizeof(departure_msg), 
              "%s has left the chat", nickname_copy);
     
-    overrideBroadcast = 1;
-    broadcast_message(departure_msg, client_socket);
-    overrideBroadcast = 0;
+    broadcast_message(departure_msg, client_socket, 1);
+    
+    // Remove account_id to socket mapping
+    if (account_id != 0) {
+        remove_account_socket_mapping(account_id);
+    }
     
     // Remove session BEFORE freeing the client structure
     if (account_id != 0) {
@@ -283,31 +173,16 @@ void remove_client(int client_socket) {
 
 void update_socket_state(int socket, socket_state_t new_state) {
     socket_info_t *info = NULL;
-    pthread_mutex_lock(&socket_map_mutex);
-    HASH_FIND_INT(socket_map, &socket, info);
+    pthread_mutex_lock(&socket_info_map_mutex);
+    HASH_FIND_INT(socket_info_map, &socket, info);
     if (info) {
         printf("[SOCKET_STATE] Socket %d: %d -> %d\n", socket, info->state, new_state);
         info->state = new_state;
         info->last_activity = time(NULL);
     }
-    pthread_mutex_unlock(&socket_map_mutex);
+    pthread_mutex_unlock(&socket_info_map_mutex);
 }
 
-// Debug function to dump all socket states
-/*void dump_socket_states(void) {
-    printf("[SOCKET_DUMP] Current socket states:\n");
-    pthread_mutex_lock(&socket_map_mutex);
-    socket_info_t *info, *tmp;
-    HASH_ITER(hh, socket_map, info, tmp) {
-        const char* state_str = (info->state == SOCKET_STATE_NEW) ? "NEW" :
-                               (info->state == SOCKET_STATE_AUTHENTICATING) ? "AUTHENTICATING" :
-                               (info->state == SOCKET_STATE_AUTHENTICATED) ? "AUTHENTICATED" : "UNKNOWN";
-        printf("[SOCKET_DUMP]   Socket %d: state=%s, account_id=%d, last_activity=%ld\n", 
-               info->socket, state_str, info->account_id, info->last_activity);
-    }
-    pthread_mutex_unlock(&socket_map_mutex);
-}*/
-// Function to find client by nickname - IMPROVED
 client_t* find_client_by_nickname(const char* nickname) {
     client_t *c, *tmp, *result = NULL;
     
@@ -322,10 +197,6 @@ client_t* find_client_by_nickname(const char* nickname) {
     return result;
 }
 
-
-// Function to remove a client - COMPLETELY REWRITTEN for thread safety
-
-// Function to get list of connected clients - FIXED
 void get_client_list(char* list_buffer, size_t buffer_size) {
     pthread_mutex_lock(&clients_mutex);
     
@@ -346,7 +217,6 @@ void get_client_list(char* list_buffer, size_t buffer_size) {
     
     pthread_mutex_unlock(&clients_mutex);
 }
-
 
 // Move socket from auth thread to command thread
 void promote_to_authenticated(int socket, unsigned int account_id) {
@@ -399,16 +269,17 @@ void promote_to_authenticated(int socket, unsigned int account_id) {
     
     // Update socket state
     socket_info_t *info = NULL;
-    pthread_mutex_lock(&socket_map_mutex);
-    HASH_FIND_INT(socket_map, &socket, info);
+    pthread_mutex_lock(&socket_info_map_mutex);
+    HASH_FIND_INT(socket_info_map, &socket, info);
     if (info) {
         info->state = SOCKET_STATE_AUTHENTICATED;
         info->account_id = account_id;
         info->last_activity = time(NULL);
+        add_account_socket_mapping(account_id, socket);
         snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE][ID:%d] Updated socket %d state to AUTHENTICATED\n", account_id, socket);
         FILE_LOG(log_message);
     }
-    pthread_mutex_unlock(&socket_map_mutex);
+    pthread_mutex_unlock(&socket_info_map_mutex);
     
     // Add to command thread epoll
     struct epoll_event event;
@@ -434,7 +305,7 @@ void promote_to_authenticated(int socket, unsigned int account_id) {
     // Announce new user
     char announcement[BUFFER_SIZE];
     snprintf(announcement, sizeof(announcement), "%s has joined the chat", new_client->nickname);
-    broadcast_message(announcement, socket);
+    broadcast_message(announcement, socket, 0);
     snprintf(response, sizeof(response),
                  "Chat Commands:\n"
                  "  /nick <name> - Change your nickname\n"
@@ -446,8 +317,6 @@ void promote_to_authenticated(int socket, unsigned int account_id) {
     send(socket, response, strlen(response), 0);
 }
 
-
-// Chat mode handler - IMPROVED with better error checking
 void handle_chat_mode(client_t *c, char *buffer, int client_socket){
     char broadcast_msg[BUFFER_SIZE];
     char log_message[BUFFER_SIZE];
@@ -503,7 +372,7 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
             
             snprintf(broadcast_msg, sizeof(broadcast_msg), 
                      "%s is now known as %s", old_nick, new_nick);
-            broadcast_message(broadcast_msg, client_socket);
+            broadcast_message(broadcast_msg, client_socket, 0);
             snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD][ID:%d] Nickname changed to '%s' for socket %d\n", c->account_id, new_nick, client_socket);
             FILE_LOG(log_message);
         } else {
@@ -572,7 +441,7 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
     if (strlen(buffer) > 0) {
         snprintf(broadcast_msg, sizeof(broadcast_msg), 
                  "%s: %s", c->nickname, buffer);
-        broadcast_message(broadcast_msg, client_socket);
+        broadcast_message(broadcast_msg, client_socket, 0);
         
         // Log the message
         snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD][ID:%d] CHAT [%s] %s: %s\n", c->account_id, c->username, c->nickname, buffer);
@@ -582,7 +451,6 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
 
 }
 
-// Authentication thread function
 void* auth_thread_func(void *arg) {
     thread_context_t *ctx = (thread_context_t *)arg;
     int max_events = get_max_events();
@@ -768,7 +636,6 @@ void* auth_thread_func(void *arg) {
     return NULL;
 }
 
-// Command handling thread function
 void* cmd_thread_func(void *arg) {
     thread_context_t *ctx = (thread_context_t *)arg;
     int max_events = get_max_events();
@@ -869,19 +736,6 @@ void* cmd_thread_func(void *arg) {
 }
 
 
-
-
-
-
-
-
-
-// Make server_socket global for signal handler access
-int server_socket = -1;
-pthread_mutex_t server_socket_mutex = PTHREAD_MUTEX_INITIALIZER; // NEW: protect server socket
-
-// Removed unused work queue functions and thread functions
-
 // Signal handler for graceful shutdown
 void signal_handler(int sig) {
     (void)sig; // Suppress unused parameter warning
@@ -941,15 +795,6 @@ void add_authenticated_client(client_t *new_client) {
     pthread_mutex_unlock(&clients_mutex);
 }
 
-
-
-
-
-// Function to broadcast message to all authenticated clients except sender - FIXED
-
-
-
-// Function to handle individual authenticated client - IMPROVED
 void* handle_authenticated_client(void* arg) {
     int client_socket = *(int*)arg;
     free(arg); // Free the allocated memory for the socket
@@ -980,7 +825,7 @@ void* handle_authenticated_client(void* arg) {
     // Announce new user to everyone
     snprintf(broadcast_msg, sizeof(broadcast_msg), 
              "%s joined the chat", c->nickname);
-    broadcast_message(broadcast_msg, client_socket);
+    broadcast_message(broadcast_msg, client_socket, 0);
     
     // Main message handling loop
     while (server_running) {
@@ -1035,9 +880,6 @@ void* handle_authenticated_client(void* arg) {
     return NULL;
 }
 
-
-
-// Extract client certificate - IMPROVED error handling
 X509* extract_client_cert(int client_socket) {
     uint32_t net_cert_len;
     char log_message[BUFFER_SIZE];
@@ -1131,7 +973,7 @@ X509* extract_client_cert(int client_socket) {
     return client_cert;
 }
 
-// implemennts initial connection setup for epoll architecture
+// implements initial connection setup for epoll architecture
 int setup_initial_connection(int client_socket) {
     char log_message[BUFFER_SIZE];
     char response[BUFFER_SIZE];
@@ -1302,6 +1144,7 @@ int setup_initial_connection(int client_socket) {
         socket_info_t *info = get_socket_info(client_socket);
         if (info) {
             info->account_id = account_id;
+            add_account_socket_mapping(account_id, client_socket);
         }
         else{
             snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD][ID:%d] Failed to get socket info for %s\n", account_id, username);
@@ -1420,8 +1263,6 @@ int setup_initial_connection(int client_socket) {
     return 0; // Success
 }
 
-
-// Function to broadcast shutdown message to all authenticated clients - IMPROVED
 void broadcast_shutdown_message(void) {
     char shutdown_msg[BUFFER_SIZE];
     char log_message[BUFFER_SIZE];
@@ -1434,11 +1275,8 @@ void broadcast_shutdown_message(void) {
     client_t *c, *tmp;
     HASH_ITER(hh, clients_map, c, tmp) {
         if (c->active) {
-            // Send without holding mutex to prevent deadlock
             int client_socket = c->socket;
-            pthread_mutex_unlock(&clients_mutex);
             send(client_socket, shutdown_msg, strlen(shutdown_msg), 0);
-            pthread_mutex_lock(&clients_mutex);
         }
     }
     pthread_mutex_unlock(&clients_mutex);
@@ -1446,7 +1284,6 @@ void broadcast_shutdown_message(void) {
     FILE_LOG(log_message);
 }
 
-// Print usage information
 void print_usage(const char *program_name) {
     char log_message[BUFFER_SIZE];
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Printing usage information\n");
@@ -1481,7 +1318,6 @@ void print_usage(const char *program_name) {
     printf("  - Graceful shutdown with Ctrl+C\n");
 }
 
-// Print version information
 void print_version(void) {
     char log_message[BUFFER_SIZE];
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Printing version information\n");
@@ -1493,242 +1329,6 @@ void print_version(void) {
     FILE_LOG(log_message);
 }
 
-// REST API handler functions
-static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *connection,
-                                          const char *url, const char *method,
-                                          const char *version, const char *upload_data,
-                                          size_t *upload_data_size, void **con_cls) {
-    (void)cls; (void)version; (void)upload_data;
-    static int dummy;
-    struct MHD_Response *response;
-    int ret;
-    
-    if (&dummy != *con_cls) {
-        *con_cls = &dummy;
-        return MHD_YES;
-    }
-    
-    if (0 != *upload_data_size)
-        return MHD_NO;
-    
-    // Handle only GET requests
-    if (strcmp(method, "GET") != 0) {
-        const char *error_msg = "{\"error\": \"Method not allowed\"}";
-        response = MHD_create_response_from_buffer(strlen(error_msg),
-                                                 (void*)error_msg,
-                                                 MHD_RESPMEM_PERSISTENT);
-        MHD_add_response_header(response, "Content-Type", "application/json");
-        ret = MHD_queue_response(connection, MHD_HTTP_METHOD_NOT_ALLOWED, response);
-        MHD_destroy_response(response);
-        return ret;
-    }
-    
-    // Handle /status endpoint
-    if (strncmp(url, "/status", 7) == 0) {
-        const char *account_id_param = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "account_id");
-        const char *username_param = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "username");
-        
-        char *json_response = NULL;
-        
-        if (account_id_param) {
-            unsigned int account_id = atoi(account_id_param);
-            json_response = get_client_status_by_account_id(account_id);
-        } else if (username_param) {
-            json_response = get_client_status_by_username(username_param);
-        } else {
-            json_response = strdup("{\"error\": \"Missing parameter. Use account_id or username\"}");
-        }
-        
-        if (json_response) {
-            response = MHD_create_response_from_buffer(strlen(json_response),
-                                                     (void*)json_response,
-                                                     MHD_RESPMEM_MUST_FREE);
-            MHD_add_response_header(response, "Content-Type", "application/json");
-            MHD_add_response_header(response, "Access-Control-Allow-Origin", "*");
-            ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
-            MHD_destroy_response(response);
-            return ret;
-        }
-    }
-    
-    // 404 for unknown endpoints
-    const char *error_msg = "{\"error\": \"Not found\"}";
-    response = MHD_create_response_from_buffer(strlen(error_msg),
-                                             (void*)error_msg,
-                                             MHD_RESPMEM_PERSISTENT);
-    MHD_add_response_header(response, "Content-Type", "application/json");
-    ret = MHD_queue_response(connection, MHD_HTTP_NOT_FOUND, response);
-    MHD_destroy_response(response);
-    return ret;
-}
-
-// Function to get client status by account ID
-char* get_client_status_by_account_id(unsigned int account_id) {
-    char *json = malloc(1024);
-    if (!json) return strdup("{\"error\": \"Memory allocation failed\"}");
-    
-    // Find user
-    user_t *user = find_user(account_id);
-    if (!user) {
-        snprintf(json, 1024, "{\"error\": \"User not found\", \"account_id\": %d}", account_id);
-        return json;
-    }
-    
-    // First check for fully authenticated client
-    client_t *client = NULL;
-    pthread_mutex_lock(&clients_mutex);
-    client_t *c, *tmp;
-    HASH_ITER(hh, clients_map, c, tmp) {
-        if (c->active && c->account_id == account_id) {
-            client = c;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&clients_mutex);
-    
-    if (client) {
-        // Client is fully authenticated and connected
-        snprintf(json, 1024, 
-                "{\"account_id\": %d, \"username\": \"%s\", \"status\": \"connected\", "
-                "\"nickname\": \"%s\", \"socket\": %d, \"auth_level\": %d, "
-                "\"mode\": \"%s\", \"connect_time\": %ld}",
-                account_id, user->username, client->nickname, client->socket, 
-                client->authLevel, 
-                (client->mode == CLIENT_MODE_CHAT) ? "chat" : "file",
-                client->connect_time);
-        return json;
-    }
-    
-    // Check for clients in authentication phase
-    pthread_mutex_lock(&socket_map_mutex);
-    socket_info_t *socket_info, *tmp_socket;
-    HASH_ITER(hh, socket_map, socket_info, tmp_socket) {
-        if (socket_info->account_id == account_id) {
-            const char *state_str;
-            switch (socket_info->state) {
-                case SOCKET_STATE_NEW:
-                    state_str = "new_connection";
-                    break;
-                case SOCKET_STATE_AUTHENTICATING:
-                    state_str = "authenticating";
-                    break;
-                case SOCKET_STATE_AUTHENTICATED:
-                    state_str = "authenticated";
-                    break;
-                default:
-                    state_str = "unknown";
-                    break;
-            }
-            
-            snprintf(json, 1024, 
-                    "{\"account_id\": %d, \"username\": \"%s\", \"status\": \"%s\", "
-                    "\"socket\": %d, \"auth_level\": %d, \"last_activity\": %ld}",
-                    account_id, user->username, state_str, socket_info->socket, 
-                    user->authLevel, socket_info->last_activity);
-            pthread_mutex_unlock(&socket_map_mutex);
-            return json;
-        }
-    }
-    pthread_mutex_unlock(&socket_map_mutex);
-    
-    // Client is not connected at all
-    snprintf(json, 1024, 
-            "{\"account_id\": %d, \"username\": \"%s\", \"status\": \"disconnected\", "
-            "\"auth_level\": %d}",
-            account_id, user->username, user->authLevel);
-    
-    return json;
-}
-
-// Function to get client status by username
-char* get_client_status_by_username(const char *username) {
-    char *json = malloc(1024);
-    if (!json) return strdup("{\"error\": \"Memory allocation failed\"}");
-    
-    // Find user by username
-    user_t *user = NULL;
-    pthread_mutex_lock(&user_map_mutex);
-    user_t *u, *tmp_user;
-    HASH_ITER(hh, user_map, u, tmp_user) {
-        if (strcmp(u->username, username) == 0) {
-            user = u;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&user_map_mutex);
-    
-    if (!user) {
-        snprintf(json, 1024, "{\"error\": \"User not found\", \"username\": \"%s\"}", username);
-        return json;
-    }
-    
-    // First check for fully authenticated client
-    client_t *client = NULL;
-    pthread_mutex_lock(&clients_mutex);
-    client_t *c, *tmp;
-    HASH_ITER(hh, clients_map, c, tmp) {
-        if (c->active && c->account_id == user->account_id) {
-            client = c;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&clients_mutex);
-    
-    if (client) {
-        // Client is fully authenticated and connected
-        snprintf(json, 1024, 
-                "{\"account_id\": %d, \"username\": \"%s\", \"status\": \"connected\", "
-                "\"nickname\": \"%s\", \"socket\": %d, \"auth_level\": %d, "
-                "\"mode\": \"%s\", \"connect_time\": %ld}",
-                user->account_id, username, client->nickname, client->socket, 
-                client->authLevel, 
-                (client->mode == CLIENT_MODE_CHAT) ? "chat" : "file",
-                client->connect_time);
-        return json;
-    }
-    
-    // Check for clients in authentication phase
-    pthread_mutex_lock(&socket_map_mutex);
-    socket_info_t *socket_info, *tmp_socket;
-    HASH_ITER(hh, socket_map, socket_info, tmp_socket) {
-        if (socket_info->account_id == user->account_id) {
-            const char *state_str;
-            switch (socket_info->state) {
-                case SOCKET_STATE_NEW:
-                    state_str = "new_connection";
-                    break;
-                case SOCKET_STATE_AUTHENTICATING:
-                    state_str = "authenticating";
-                    break;
-                case SOCKET_STATE_AUTHENTICATED:
-                    state_str = "authenticated";
-                    break;
-                default:
-                    state_str = "unknown";
-                    break;
-            }
-            
-            snprintf(json, 1024, 
-                    "{\"account_id\": %d, \"username\": \"%s\", \"status\": \"%s\", "
-                    "\"socket\": %d, \"auth_level\": %d, \"last_activity\": %ld}",
-                    user->account_id, username, state_str, socket_info->socket, 
-                    user->authLevel, socket_info->last_activity);
-            pthread_mutex_unlock(&socket_map_mutex);
-            return json;
-        }
-    }
-    pthread_mutex_unlock(&socket_map_mutex);
-    
-    // Client is not connected at all
-    snprintf(json, 1024, 
-            "{\"account_id\": %d, \"username\": \"%s\", \"status\": \"disconnected\", "
-            "\"auth_level\": %d}",
-            user->account_id, username, user->authLevel);
-    
-    return json;
-}
-
-// Cleanup function for graceful shutdown - COMPLETELY REWRITTEN
 void cleanup_server(void) {
     char log_message[BUFFER_SIZE];
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Cleaning up server resources...\n");
@@ -1773,13 +1373,13 @@ void cleanup_server(void) {
     socket_info_t *current, *temp_socket;
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Cleaning up socket map...\n");
     FILE_LOG(log_message);
-    pthread_mutex_lock(&socket_map_mutex);
-    HASH_ITER(hh, socket_map, current, temp_socket) {
-        HASH_DEL(socket_map, current);
+    pthread_mutex_lock(&socket_info_map_mutex);
+    HASH_ITER(hh, socket_info_map, current, temp_socket) {
+        HASH_DEL(socket_info_map, current);
         close(current->socket);
         free(current);
     }
-    pthread_mutex_unlock(&socket_map_mutex);
+    pthread_mutex_unlock(&socket_info_map_mutex);
     
     // Now safely free all remaining clients
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Freeing remaining client map...\n");
@@ -1799,10 +1399,22 @@ void cleanup_server(void) {
         rest_daemon = NULL;
     }
     
+    // Clean up account socket map
+    account_socket_t *current_account, *temp_account;
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Cleaning up account socket map...\n");
+    FILE_LOG(log_message);
+    pthread_mutex_lock(&account_socket_map_mutex);
+    HASH_ITER(hh, account_socket_map, current_account, temp_account) {
+        HASH_DEL(account_socket_map, current_account);
+        free(current_account);
+    }
+    pthread_mutex_unlock(&account_socket_map_mutex);
+    
     // Destroy mutexes
     pthread_mutex_destroy(&clients_mutex);
-    pthread_mutex_destroy(&thread_count_mutex);
     pthread_mutex_destroy(&server_socket_mutex);
+    pthread_mutex_destroy(&socket_info_map_mutex);
+    pthread_mutex_destroy(&account_socket_map_mutex);
     
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Server cleanup complete\n");
     FILE_LOG(log_message);
@@ -1842,7 +1454,7 @@ int main(int argc, char *argv[]) {
     // Initialize server configuration
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Loading server configuration...\n");
     FILE_LOG(log_message);
-    if (!init_server_config("serverConf.json")) {
+    if (!init_server_config(SERVER_CONFIG_PATH)) {
         snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Failed to initialize server configuration\n");
         FILE_LOG(log_message);
         return 1;
@@ -1951,14 +1563,14 @@ int main(int argc, char *argv[]) {
     printf("Maximum clients: %d\n", get_max_users());
     
     // Start REST API server
-    rest_daemon = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, REST_PORT, NULL, NULL,
-                                   &rest_request_handler, NULL, MHD_OPTION_END);
+    int rest_port = get_rest_server_port();
+    rest_daemon = start_rest_server(rest_port);
     if (rest_daemon == NULL) {
-        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Failed to start REST API server on port %d\n", REST_PORT);
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Failed to start REST API server on port %d\n", rest_port);
         FILE_LOG(log_message);
         return 1;
     }
-    printf("REST API server listening on port %d\n", REST_PORT);
+    printf("REST API server listening on port %d\n", rest_port);
     printf("Server ready! Press Ctrl+C to exit\n");
     printf("========================================================================\n");
     
@@ -2137,11 +1749,10 @@ int main(int argc, char *argv[]) {
     
     cleanup_auth_system(); // Clean up authentication system hashmaps
     OPENSSL_cleanup();
-    pthread_mutex_destroy(&clients_mutex);
-    pthread_mutex_destroy(&thread_count_mutex);
-    pthread_mutex_destroy(&server_socket_mutex);
+    
     printf("Server Cleanup Succesful...\n");
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] %s shutdown complete\n", PROGRAM_NAME);
     FILE_LOG(log_message);
     return 0;
 }    
+
