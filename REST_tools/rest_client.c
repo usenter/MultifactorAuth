@@ -12,19 +12,27 @@
 #define REST_SERVER_PORT 8080
 #define BUFFER_SIZE 4096
 
+// Function declarations
+void print_response_in_chunks(const char *response, const char *prefix, int chunk_size);
+
 // Callback function for CURL to write response data
 size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     char **response_ptr = (char **)userp;
     
-    *response_ptr = realloc(*response_ptr, realsize + 1);
+    // Get current length of response
+    size_t current_len = *response_ptr ? strlen(*response_ptr) : 0;
+    
+    // Reallocate to accommodate new data
+    *response_ptr = realloc(*response_ptr, current_len + realsize + 1);
     if (*response_ptr == NULL) {
         printf("Error: Failed to allocate memory for response\n");
         return 0;
     }
     
-    memcpy(*response_ptr, contents, realsize);
-    (*response_ptr)[realsize] = 0;
+    // Append new data to existing response
+    memcpy(*response_ptr + current_len, contents, realsize);
+    (*response_ptr)[current_len + realsize] = 0;
     
     return realsize;
 }
@@ -192,9 +200,14 @@ int query_logs_by_account_id(const char *server_ip, int account_id, time_t start
         return -1;
     }
     
-    // Print response
+    // Print response in chunks if it's large
     if (response) {
-        printf("Logs for Account ID %d:\n%s\n", account_id, response);
+        int response_len = strlen(response);
+        if (response_len > 1000) {
+            print_response_in_chunks(response, "Logs for Account ID", 1000);
+        } else {
+            printf("Logs for Account ID %d:\n%s\n", account_id, response);
+        }
         free(response);
     }
     
@@ -224,22 +237,29 @@ int query_logs_by_username(const char *server_ip, const char *username, time_t s
     
     // Build the query string in the new format
     if (start_time > 0 && end_time > 0) {
-        // FIX: Copy the struct tm values to avoid overwriting
-        struct tm start_tm_copy;
-        struct tm end_tm_copy;
+        // More robust approach: format each timestamp separately
+        char start_str[32];
+        char end_str[32];
         
+        // Format start time
         struct tm *temp_tm = localtime(&start_time);
-        start_tm_copy = *temp_tm;  // Copy the struct
+        snprintf(start_str, sizeof(start_str), "%04d-%02d-%02d %02d:%02d",
+                temp_tm->tm_year + 1900, temp_tm->tm_mon + 1, temp_tm->tm_mday, 
+                temp_tm->tm_hour, temp_tm->tm_min);
         
+        // Format end time
         temp_tm = localtime(&end_time);
-        end_tm_copy = *temp_tm;    // Copy the struct
+        snprintf(end_str, sizeof(end_str), "%04d-%02d-%02d %02d:%02d",
+                temp_tm->tm_year + 1900, temp_tm->tm_mon + 1, temp_tm->tm_mday, 
+                temp_tm->tm_hour, temp_tm->tm_min);
         
-        snprintf(query, sizeof(query), "logs username %s start=\"%04d-%02d-%02d %02d:%02d\" end=\"%04d-%02d-%02d %02d:%02d\"",
-                username,
-                start_tm_copy.tm_year + 1900, start_tm_copy.tm_mon + 1, start_tm_copy.tm_mday, 
-                start_tm_copy.tm_hour, start_tm_copy.tm_min,
-                end_tm_copy.tm_year + 1900, end_tm_copy.tm_mon + 1, end_tm_copy.tm_mday, 
-                end_tm_copy.tm_hour, end_tm_copy.tm_min);
+        // Debug output
+
+        
+        // Build final query using the pre-formatted strings
+        snprintf(query, sizeof(query), "logs username %s start=\"%s\" end=\"%s\"",
+                username, start_str, end_str);
+                
     } else if (start_time > 0) {
         struct tm *start_tm = localtime(&start_time);
         snprintf(query, sizeof(query), "logs username %s start=\"%04d-%02d-%02d %02d:%02d\"",
@@ -256,15 +276,17 @@ int query_logs_by_username(const char *server_ip, const char *username, time_t s
         snprintf(query, sizeof(query), "logs username %s", username);
     }
     
-    // Rest of your code remains the same...
+    
+    // URL encode the query
     encoded_query = curl_easy_escape(curl, query, 0);
     snprintf(url, sizeof(url), "http://%s:%d/logs?q=%s", server_ip, REST_SERVER_PORT, encoded_query);
-    
+    printf("this is the curl request sent %s\n", url);
+
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-    printf("this is the curl request sent %s\n", url);
+    
     
     res = curl_easy_perform(curl);
     
@@ -277,7 +299,12 @@ int query_logs_by_username(const char *server_ip, const char *username, time_t s
     }
     
     if (response) {
-        printf("Logs for Username '%s':\n%s\n", username, response);
+        int response_len = strlen(response);
+        if (response_len > 1000) {
+            print_response_in_chunks(response, "Logs for Username", 1000);
+        } else {
+            printf("Logs for Username '%s':\n%s\n", username, response);
+        }
         free(response);
     }
     
@@ -286,6 +313,27 @@ int query_logs_by_username(const char *server_ip, const char *username, time_t s
     return 0;
 }
 
+// Function to print large responses in chunks
+void print_response_in_chunks(const char *response, const char *prefix, int chunk_size) {
+    if (!response) return;
+    
+    int len = strlen(response);
+    printf("%s (Total length: %d characters):\n", prefix, len);
+    
+    for (int i = 0; i < len; i += chunk_size) {
+        int remaining = len - i;
+        int current_chunk = (remaining < chunk_size) ? remaining : chunk_size;
+        
+        printf("--- Chunk %d-%d ---\n", i + 1, i + current_chunk);
+        printf("%.*s\n", current_chunk, response + i);
+        
+        if (i + current_chunk < len) {
+            printf("Press Enter to continue...");
+            getchar();
+        }
+    }
+    printf("--- End of response ---\n");
+}
 
 void print_help(void) {
     printf("\n=== Interactive REST Client ===\n");

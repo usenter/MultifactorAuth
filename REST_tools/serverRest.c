@@ -218,30 +218,45 @@ char* search_logs_by_account_id(unsigned int account_id, time_t start_time, time
     }
     fclose(log_file);
     // Add time range info if specified
+    // Add time range info if specified
     char time_info[256] = "";
     if (start_time > 0 || end_time > 0) {
-        struct tm *start_tm = (start_time > 0) ? localtime(&start_time) : NULL;
-        struct tm *end_tm = (end_time > 0) ? localtime(&end_time) : NULL;
-        
-        if (start_tm && end_tm) {
+        if (start_time > 0 && end_time > 0) {
+            // Format each timestamp separately to avoid static buffer conflicts
+            char start_str[32];
+            char end_str[32];
+            
+            // Format start time
+            struct tm *temp_tm = localtime(&start_time);
+            snprintf(start_str, sizeof(start_str), "%04d-%02d-%02d %02d:%02d:%02d",
+                    temp_tm->tm_year + 1900, temp_tm->tm_mon + 1, temp_tm->tm_mday,
+                    temp_tm->tm_hour, temp_tm->tm_min, temp_tm->tm_sec);
+            
+            // Format end time
+            temp_tm = localtime(&end_time);
+            snprintf(end_str, sizeof(end_str), "%04d-%02d-%02d %02d:%02d:%02d",
+                    temp_tm->tm_year + 1900, temp_tm->tm_mon + 1, temp_tm->tm_mday,
+                    temp_tm->tm_hour, temp_tm->tm_min, temp_tm->tm_sec);
+            
             snprintf(time_info, sizeof(time_info), 
-                ", \"time_range\": {\"start\": \"%04d-%02d-%02d %02d:%02d:%02d\", \"end\": \"%04d-%02d-%02d %02d:%02d:%02d\"}",
-                start_tm->tm_year + 1900, start_tm->tm_mon + 1, start_tm->tm_mday,
-                start_tm->tm_hour, start_tm->tm_min, start_tm->tm_sec,
-                end_tm->tm_year + 1900, end_tm->tm_mon + 1, end_tm->tm_mday,
-                end_tm->tm_hour, end_tm->tm_min, end_tm->tm_sec);
-        } else if (start_tm) {
+                ", \"time_range\": {\"start\": \"%s\", \"end\": \"%s\"}", 
+                start_str, end_str);
+                
+        } else if (start_time > 0) {
+            struct tm *start_tm = localtime(&start_time);
             snprintf(time_info, sizeof(time_info), 
                 ", \"time_range\": {\"start\": \"%04d-%02d-%02d %02d:%02d:%02d\", \"end\": \"now\"}",
                 start_tm->tm_year + 1900, start_tm->tm_mon + 1, start_tm->tm_mday,
                 start_tm->tm_hour, start_tm->tm_min, start_tm->tm_sec);
-        } else if (end_tm) {
+        } else if (end_time > 0) {
+            struct tm *end_tm = localtime(&end_time);
             snprintf(time_info, sizeof(time_info), 
                 ", \"time_range\": {\"start\": \"beginning\", \"end\": \"%04d-%02d-%02d %02d:%02d:%02d\"}",
                 end_tm->tm_year + 1900, end_tm->tm_mon + 1, end_tm->tm_mday,
                 end_tm->tm_hour, end_tm->tm_min, end_tm->tm_sec);
         }
     }
+
     
     snprintf(json + json_len, 1024*1024 - json_len, 
         "\n], \"entry_count\": %d%s}", entry_count, time_info);
@@ -262,7 +277,6 @@ char* search_logs_by_username(const char *username, time_t start_time, time_t en
         snprintf(error, 128, "{\"error\": \"User not found\", \"username\": \"%s\"}", username);
         return error;
     }
-    printf( "DEBUG: Searching logs for username: %s, start_time: %ld, end_time: %ld\n", username, start_time, end_time);
     // Now search logs by account_id (more efficient)
     char *result = search_logs_by_account_id(username_entry->account_id, start_time, end_time);
     
@@ -482,19 +496,16 @@ log_query_t parse_log_query(const char *query) {
         } else if (strncmp(current_pos, "start=", 6) == 0) {
             current_pos += 6;
             current_pos = parse_quoted_value(current_pos, &result.start_time);
-            printf("DEBUG: Parsed start_time: %ld\n", result.start_time);
             current_pos = skip_whitespace(current_pos);
             
         } else if (strncmp(current_pos, "end=", 4) == 0) {
             current_pos += 4;
             current_pos = parse_quoted_value(current_pos, &result.end_time);
-            printf("DEBUG: Parsed end_time: %ld\n", result.end_time);
         } else {
             // Skip unknown token
             while (*current_pos && *current_pos != ' ') current_pos++;
         }
     }
-    printf("Query parsed - Start: %ld, End: %ld\n", result.start_time, result.end_time);
     free(query_copy);
     return result;
 }
@@ -577,9 +588,7 @@ static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *co
     
     // Handle /logs endpoint with command-line style query
     if (strncmp(url, "/logs", 5) == 0) {
-        printf("DEBUG: Handling /logs endpoint\n");
         const char *query_param = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "q");
-        printf("DEBUG: Query parameter: %s\n", query_param);
         if (!query_param) {
             const char *help_msg = "{"
                 "\"error\": \"Missing query parameter\","
@@ -609,8 +618,7 @@ static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *co
         
         log_query_t query = parse_log_query(query_param);
         
-        printf("DEBUG: Parsed query - username: '%s', account_id: %u, start_time: %ld, end_time: %ld\n", 
-               query.username, query.account_id, query.start_time, query.end_time);
+     
         
         if (!query.valid || (query.use_account_id == 0 && strlen(query.username) == 0) || 
             (query.use_account_id == 1 && query.account_id == 0)) {
@@ -628,7 +636,6 @@ static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *co
         if (query.use_account_id) {
             json_response = search_logs_by_account_id(query.account_id, query.start_time, query.end_time);
         } else {
-            printf("DEBUG: Searching logs by username: %s with following times: start=%ld, end=%ld\n", query.username, query.start_time, query.end_time);
             json_response = search_logs_by_username(query.username, query.start_time, query.end_time);
         }
         

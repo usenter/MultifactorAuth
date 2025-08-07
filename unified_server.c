@@ -1031,7 +1031,7 @@ int setup_initial_connection(int client_socket) {
         X509_NAME* subj = X509_get_subject_name(client_cert);
         char cn[256];
         X509_NAME_get_text_by_NID(subj, NID_commonName, cn, sizeof(cn));
-        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD] Received client certificate. Subject CN: %s\n", cn);
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][SOCKET-%d] Received client certificate. Subject CN: %s\n", client_socket, cn);
         FILE_LOG(log_message);
     }
 

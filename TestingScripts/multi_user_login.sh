@@ -7,7 +7,7 @@ SERVER_IP=${1:-127.0.0.1}
 PORT=12345
 USER_FILE="decrypted_users.txt"
 LOG_FILE="multi_user_login_$(date +%Y%m%d_%H%M%S).log"
-MAX_USERS=500
+MAX_USERS=999
 
 echo "=== Multi-User Login Stress Test ==="
 echo "Server: $SERVER_IP:$PORT"
@@ -54,7 +54,7 @@ attempt_login() {
     local expect_script="/tmp/expect_${username}_$$.exp"
     cat > "$expect_script" << 'EOF'
 #!/usr/bin/expect -f
-set timeout 30
+set timeout 100
 set username [lindex $argv 0]
 set password [lindex $argv 1]
 set user_id [lindex $argv 2]
@@ -229,7 +229,7 @@ while IFS= read -r line && [ $user_count -lt $MAX_USERS ]; do
         if [[ -n "$username" && -n "$password" ]]; then
             users+=("$username:$password:$account_id")
             ((user_count++))
-            log_message "Parsed user: $username (Account: $account_id, Authority: $authority)"
+            #log_message "Parsed user: $username (Account: $account_id, Authority: $authority)"
         else
             log_message "Skipping line with empty username or password: $line"
         fi
@@ -239,6 +239,7 @@ while IFS= read -r line && [ $user_count -lt $MAX_USERS ]; do
 done < "$USER_FILE"
 
 log_message "Found $user_count users to test"
+sleep 1
 
 # Store PIDs for cleanup
 client_pids=()
