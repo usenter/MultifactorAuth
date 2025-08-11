@@ -41,7 +41,7 @@
 #endif
 
 
-#define SERVER_LOG_FILE "server.log"
+#define SERVER_LOG_FILE "logs/server.log"
 
 
 

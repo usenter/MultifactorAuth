@@ -7,7 +7,7 @@ LIBS = -lssl -lcrypto -lcurl -lcjson -lmicrohttpd
 OBJS = encryptionTools.o auth_system.o fileOperations.o emailFunction.o serverConfig.o socketHandling.o serverRest.o
 
 # Targets
-all: unified_server unified_client encryptionTools_test user_encryptor generate_rsa_keys rest_client
+all: unified_server unified_client encryptionTools user_encryptor generate_rsa_keys rest_client
 
 # Object file rules with header dependencies
 encryptionTools.o: decryptionFunctions/encryptionTools.c decryptionFunctions/encryptionTools.h
@@ -47,7 +47,7 @@ user_encryptor: userEncryptionTools/user_encryptor.c
 unified_server: unified_server.c $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
-encryptionTools_test: decryptionFunctions/encryptionTools.c decryptionFunctions/encryptionTools.h
+encryptionTools: decryptionFunctions/encryptionTools.c decryptionFunctions/encryptionTools.h
 	$(CC) $(CFLAGS) -DTEST_MAIN -o $@ $< $(LIBS)
 
 # Unified client with authentication support (includes RSA authentication)
@@ -60,6 +60,6 @@ generate_rsa_keys: generate_rsa_keys.c $(OBJS)
 
 # Clean
 clean:
-	rm -f *.o unified_server unified_client encryptionTools_test user_encryptor generate_rsa_keys rest_client
+	rm -f *.o unified_server unified_client encryptionTools user_encryptor generate_rsa_keys rest_client
 
 .PHONY: all clean 

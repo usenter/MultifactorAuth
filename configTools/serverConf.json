@@ -1,7 +1,7 @@
 {
   "maxUsers": 1000,
   "maxEvents": 100,
-  "disableEmail": true,
+  "disableEmail": false,
   "disableRSA": false,
   "disablePassword": false,
   "serverIPaddress": "127.0.0.1",

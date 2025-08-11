@@ -21,6 +21,149 @@
 #include "configTools/serverConfig.h"
 #include "REST_tools/serverRest.h"
 
+// Optional: Apply basic iptables mitigation at server start and remove at shutdown
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+
+// Async-signal-safe shutdown signaling
+static volatile sig_atomic_t shutdown_flag = 0;
+static int shutdown_pipe[2] = { -1, -1 }; // [0]=read, [1]=write
+
+// Tunables
+    // Tuneable iptables parameters; you can adjust for lower aggressiveness if seeing ECONNRESET (104)
+    const char *syn_rate = "1000/second";   // Increased from 500/second
+    const int syn_burst = 200;              // Increased from 100
+    const int per_ip_limit = 500;           // Increased from 200
+
+
+static int run_shell_command(const char *cmd) {
+    char log_message[BUFFER_SIZE];
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Running shell command: %s\n", cmd);
+    FILE_LOG(log_message);
+    int rc = system(cmd);
+    if (rc == -1) {
+        FILE_LOG("[ERROR][MAIN_THREAD] system() returned -1\n");
+        return -1;
+    }
+    if (WIFEXITED(rc)) {
+        int status = WEXITSTATUS(rc);
+        snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Command exit status: %d\n", status);
+        FILE_LOG(log_message);
+        return status;
+    }
+    FILE_LOG("[ERROR][MAIN_THREAD] Command did not exit normally\n");
+    return -1;
+}
+
+// Remove ALL iptables rules relevant to a specific service port to avoid stacking
+static void clear_iptables_rules_for_port(int service_port) {
+    if (geteuid() != 0) return;
+    char log_message[BUFFER_SIZE];
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Clearing existing iptables rules for tcp/%d (avoid stacking)\n", service_port);
+    FILE_LOG(log_message);
+
+    char cmd[512];
+    
+    // Remove ALL connlimit rules for this port by numeric index (descending) - IMPROVED
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Removing connlimit rules for port %d\n", service_port);
+    FILE_LOG(log_message);
+    snprintf(cmd, sizeof(cmd),
+             "bash -c \"for n in \\$(iptables -L INPUT -n --line-numbers | awk '/REJECT.*tcp.*dpt:%d.*conn.*src/ {print \\$1}' | sort -nr); do [ -n \\\"\\$n\\\" ] && echo \\\"Removing rule \\$n\\\" && iptables -w 2 -D INPUT \\$n; done\"",
+             service_port);
+    run_shell_command(cmd);
+    
+    // Also try removing by exact pattern matching for any remaining rules
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Attempting pattern-based connlimit removal for port %d\n", service_port);
+    FILE_LOG(log_message);
+    for (int limit = 50; limit <= 1000; limit += 50) {
+        snprintf(cmd, sizeof(cmd),
+                 "iptables -w 2 -D INPUT -p tcp --dport %d -m connlimit --connlimit-above %d --connlimit-mask 32 -j REJECT --reject-with tcp-reset 2>/dev/null || true",
+                 service_port, limit);
+        run_shell_command(cmd);
+    }
+
+    // Detach all INPUT hooks to SYN_FLOOD for this port (repeat until none)
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Removing SYN_FLOOD hooks for port %d\n", service_port);
+    FILE_LOG(log_message);
+    snprintf(cmd, sizeof(cmd),
+             "bash -lc 'while iptables -w 2 -C INPUT -p tcp --syn --dport %d -j SYN_FLOOD 2>/dev/null; do iptables -w 2 -D INPUT -p tcp --syn --dport %d -j SYN_FLOOD; done'",
+             service_port, service_port);
+    run_shell_command(cmd);
+
+    // Flush and delete custom chain if present
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Cleaning up SYN_FLOOD chain\n");
+    FILE_LOG(log_message);
+    run_shell_command("iptables -w 2 -F SYN_FLOOD 2>/dev/null || true");
+    run_shell_command("iptables -w 2 -X SYN_FLOOD 2>/dev/null || true");
+
+    // Verify cleanup by listing remaining rules for this port
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Verifying cleanup - checking for remaining rules on port %d\n", service_port);
+    FILE_LOG(log_message);
+    snprintf(cmd, sizeof(cmd), "iptables -L INPUT -n --line-numbers | grep -E \"dpt:%d|SYN_FLOOD\" || echo \"No remaining rules found for port %d\"", service_port, service_port);
+    run_shell_command(cmd);
+    
+    FILE_LOG("[INFO][MAIN_THREAD] iptables rules cleared for service port\n");
+}
+
+
+
+static int apply_iptables_protection(int service_port) {
+    char log_message[BUFFER_SIZE];
+    if (geteuid() != 0) {
+        snprintf(log_message, sizeof(log_message), "[WARN][MAIN_THREAD] Skipping iptables mitigation: server not running as root\n");
+        FILE_LOG(log_message);
+        return 0;
+    }
+
+    // Always begin from a clean state to avoid stacking rules
+    clear_iptables_rules_for_port(service_port);
+
+    
+    // Kernel hardening
+    run_shell_command("sysctl -w net.ipv4.tcp_syncookies=1 >/dev/null 2>&1");
+    run_shell_command("sysctl -w net.ipv4.tcp_max_syn_backlog=4096 >/dev/null 2>&1");
+    run_shell_command("sysctl -w net.ipv4.tcp_synack_retries=3 >/dev/null 2>&1");
+
+    char cmd[512];
+    // Create/flush chain (fail fast if xtables lock is held)
+    run_shell_command("iptables -w 2 -N SYN_FLOOD 2>/dev/null || true");
+    run_shell_command("iptables -w 2 -F SYN_FLOOD >/dev/null 2>&1");
+
+    // Add hashlimit RETURN and then DROP
+    snprintf(cmd, sizeof(cmd),
+             "iptables -w 2 -A SYN_FLOOD -m hashlimit --hashlimit-name syn_%d --hashlimit-mode srcip --hashlimit-upto %s --hashlimit-burst %d -j RETURN",
+             service_port, syn_rate, syn_burst);
+    run_shell_command(cmd);
+    run_shell_command("iptables -w 2 -A SYN_FLOOD -j DROP");
+
+    // Hook for SYN packets to this port
+    snprintf(cmd, sizeof(cmd),
+             "iptables -w 2 -C INPUT -p tcp --syn --dport %d -j SYN_FLOOD 2>/dev/null || iptables -w 2 -A INPUT -p tcp --syn --dport %d -j SYN_FLOOD",
+             service_port, service_port);
+    run_shell_command(cmd);
+
+    // Per-IP concurrent connection limit
+    snprintf(cmd, sizeof(cmd),
+             "iptables -w 2 -C INPUT -p tcp --dport %d -m connlimit --connlimit-above %d --connlimit-mask 32 -j REJECT --reject-with tcp-reset 2>/dev/null || iptables -w 2 -A INPUT -p tcp --dport %d -m connlimit --connlimit-above %d --connlimit-mask 32 -j REJECT --reject-with tcp-reset",
+             service_port, per_ip_limit, service_port, per_ip_limit);
+    run_shell_command(cmd);
+
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] iptables mitigation applied for tcp/%d\n", service_port);
+    FILE_LOG(log_message);
+    return 0;
+}
+
+static void remove_iptables_protection(int service_port) {
+    if (geteuid() != 0) return;
+    char log_message[BUFFER_SIZE];
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Removing iptables mitigation for tcp/%d\n", service_port);
+    FILE_LOG(log_message);
+    clear_iptables_rules_for_port(service_port);
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] iptables mitigation removal complete for tcp/%d\n", service_port);
+    FILE_LOG(log_message);
+}
+
 
 int setup_initial_connection(int client_socket);
 void* handle_authenticated_client(void* arg);
@@ -86,7 +229,7 @@ void broadcast_message(const char* message, int sender_socket, int overrideBroad
             int client_socket = c->socket;
             
             if (send(client_socket, message_with_newline, strlen(message_with_newline), 0) < 0) {
-                snprintf(log_message, sizeof(log_message), "[WARN][MAIN_THREAD] Failed to send to socket %d\n", client_socket);
+                snprintf(log_message, sizeof(log_message), "[WARN][MAIN_THREAD] Failed to send to socket %d: errno=%d (%s)\n", client_socket, errno, strerror(errno));
                 FILE_LOG(log_message);
                 // We already have the client pointer 'c' and clients_mutex is locked
                 c->active = 0;
@@ -460,9 +603,20 @@ void* auth_thread_func(void *arg) {
     FILE_LOG("[INFO][AUTH_THREAD] Authentication thread started\n");
     
     while (ctx->running) {
+        // Check running flag before each epoll_wait
+        if (!ctx->running) {
+            snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD] Running flag is 0, exiting main loop\n");
+            FILE_LOG(log_message);
+            break;
+        }
+        
         int nfds = epoll_wait(ctx->epoll_fd, events, max_events, 100);
         if (nfds == -1) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD] epoll_wait interrupted by signal (EINTR), checking running flag\n");
+                FILE_LOG(log_message);
+                continue;
+            }
             snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD] epoll_wait in auth thread: %s\n", strerror(errno));
             FILE_LOG(log_message);
             break;
@@ -490,10 +644,14 @@ void* auth_thread_func(void *arg) {
             
             ssize_t bytes_read = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
             if (bytes_read <= 0) {
-                snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD][ID:%d] Socket %d disconnected (bytes_read=%zd)\n", info->account_id, client_socket, bytes_read);
+                if (bytes_read == 0) {
+                    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Socket %d closed by peer (orderly shutdown)\n", info->account_id, client_socket);
+                } else {
+                    snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD][ID:%d] Socket %d recv error (bytes_read=%zd, errno=%d:%s)\n", info->account_id, client_socket, bytes_read, errno, strerror(errno));
+                }
                 FILE_LOG(log_message);
                 remove_socket_info(client_socket);
-                close(client_socket);
+                remove_client(client_socket);
                 continue;
             }
             
@@ -647,9 +805,20 @@ void* cmd_thread_func(void *arg) {
     FILE_LOG(log_message);
     
     while (ctx->running) {
+        // Check running flag before each epoll_wait
+        if (!ctx->running) {
+            snprintf(log_message, sizeof(log_message), "[DEBUG][CMD_THREAD] Running flag is 0, exiting main loop\n");
+            FILE_LOG(log_message);
+            break;
+        }
+        
         int nfds = epoll_wait(ctx->epoll_fd, events, max_events, 100);
         if (nfds == -1) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                snprintf(log_message, sizeof(log_message), "[DEBUG][CMD_THREAD] epoll_wait interrupted by signal (EINTR), checking running flag\n");
+                FILE_LOG(log_message);
+                continue;
+            }
             snprintf(log_message, sizeof(log_message), "[ERROR][CMD_THREAD] epoll_wait in cmd thread: %s\n", strerror(errno));
             FILE_LOG(log_message);
             break;
@@ -670,11 +839,14 @@ void* cmd_thread_func(void *arg) {
             
             ssize_t bytes_read = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
             if (bytes_read <= 0) {
-                snprintf(log_message, sizeof(log_message), "[ERROR][CMD_THREAD][ID:%d] Socket %d disconnected (bytes_read=%zd)\n", info->account_id, client_socket, bytes_read);
+                if (bytes_read == 0) {
+                    snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD][ID:%d] Socket %d closed by peer (orderly shutdown)\n", info->account_id, client_socket);
+                } else {
+                    snprintf(log_message, sizeof(log_message), "[ERROR][CMD_THREAD][ID:%d] Socket %d recv error (bytes_read=%zd, errno=%d:%s)\n", info->account_id, client_socket, bytes_read, errno, strerror(errno));
+                }
                 FILE_LOG(log_message);
                 remove_socket_info(client_socket);
                 remove_client(client_socket);
-                close(client_socket);
                 continue;
             }
             
@@ -736,21 +908,46 @@ void* cmd_thread_func(void *arg) {
 }
 
 
-// Signal handler for graceful shutdown
+// Signal handler for graceful shutdown (async-signal-safe)
 void signal_handler(int sig) {
     (void)sig; // Suppress unused parameter warning
     char log_message[BUFFER_SIZE];
+    snprintf(log_message, sizeof(log_message), "[DEBUG][SIGNAL] Signal handler called with signal %d\n", sig);
+    FILE_LOG(log_message);
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Server shutdown requested...\n");
     FILE_LOG(log_message);
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][SIGNAL] Setting shutdown_flag=1, server_running=0\n");
+    FILE_LOG(log_message);
+    shutdown_flag = 1;
     server_running = 0;
     
-    // Close server socket to unblock accept() - with proper synchronization
-    pthread_mutex_lock(&server_socket_mutex);
-    if (server_socket != -1) {
-        close(server_socket);
-        server_socket = -1;
+    // Best-effort wake any epoll_wait via self-pipe
+    snprintf(log_message, sizeof(log_message), "[DEBUG][SIGNAL] Attempting to wake epoll via shutdown pipe\n");
+    FILE_LOG(log_message);
+    snprintf(log_message, sizeof(log_message), "[DEBUG][SIGNAL] shutdown_pipe[1]=%d, shutdown_pipe[0]=%d\n", shutdown_pipe[1], shutdown_pipe[0]);
+    FILE_LOG(log_message);
+    if (shutdown_pipe[1] != -1) {
+        const char byte = 'x';
+        ssize_t written = write(shutdown_pipe[1], &byte, 1);
+        snprintf(log_message, sizeof(log_message), "[DEBUG][SIGNAL] Wrote %zd bytes to shutdown pipe (fd=%d)\n", written, shutdown_pipe[1]);
+        FILE_LOG(log_message);
+        
+        if (written == -1) {
+            snprintf(log_message, sizeof(log_message), "[ERROR][SIGNAL] Failed to write to shutdown pipe: %s (errno=%d)\n", strerror(errno), errno);
+            FILE_LOG(log_message);
+        }
+        
+        // Force a flush to ensure the write goes through
+        fsync(shutdown_pipe[1]);
+        snprintf(log_message, sizeof(log_message), "[DEBUG][SIGNAL] Flushed shutdown pipe\n");
+        FILE_LOG(log_message);
+    } else {
+        snprintf(log_message, sizeof(log_message), "[WARN][SIGNAL] Shutdown pipe write end is closed!\n");
+        FILE_LOG(log_message);
     }
-    pthread_mutex_unlock(&server_socket_mutex);
+    snprintf(log_message, sizeof(log_message), "[DEBUG][SIGNAL] Signal handler completed\n");
+    FILE_LOG(log_message);
 }
 
 // Function to add a new authenticated client - FIXED
@@ -1271,14 +1468,28 @@ void broadcast_shutdown_message(void) {
     snprintf(shutdown_msg, sizeof(shutdown_msg), 
              "Server is shutting down. Goodbye!\n");
     
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Acquiring clients_mutex for shutdown broadcast\n");
+    FILE_LOG(log_message);
     pthread_mutex_lock(&clients_mutex);
+    
     client_t *c, *tmp;
+    int broadcast_count = 0;
     HASH_ITER(hh, clients_map, c, tmp) {
         if (c->active) {
             int client_socket = c->socket;
-            send(client_socket, shutdown_msg, strlen(shutdown_msg), 0);
+            snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Broadcasting shutdown to client socket %d (user: %s)\n", client_socket, c->username);
+            FILE_LOG(log_message);
+            ssize_t sent = send(client_socket, shutdown_msg, strlen(shutdown_msg), 0);
+            snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Sent %zd bytes to socket %d\n", sent, client_socket);
+            FILE_LOG(log_message);
+            broadcast_count++;
         }
     }
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Broadcasted shutdown message to %d clients\n", broadcast_count);
+    FILE_LOG(log_message);
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Releasing clients_mutex after shutdown broadcast\n");
+    FILE_LOG(log_message);
     pthread_mutex_unlock(&clients_mutex);
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Shutdown message broadcasted to all authenticated clients\n");
     FILE_LOG(log_message);
@@ -1333,41 +1544,93 @@ void cleanup_server(void) {
     char log_message[BUFFER_SIZE];
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Cleaning up server resources...\n");
     FILE_LOG(log_message);
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Step 1: Broadcasting shutdown message to clients\n");
+    FILE_LOG(log_message);
     broadcast_shutdown_message();
     
     // Wait for clients to receive the shutdown message
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Step 2: Waiting 100ms for clients to receive shutdown message\n");
+    FILE_LOG(log_message);
     struct timespec delay = {0, 100000000}; 
     nanosleep(&delay, NULL);
     
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Step 3: Closing all client sockets\n");
+    FILE_LOG(log_message);
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Closing all client sockets...\n");
     FILE_LOG(log_message);
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Acquiring clients_mutex for socket cleanup\n");
+    FILE_LOG(log_message);
     pthread_mutex_lock(&clients_mutex);
+    
     client_t *c, *tmp;
+    int closed_count = 0;
     HASH_ITER(hh, clients_map, c, tmp) {
         if (c->active) {
+            snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Closing client socket %d (user: %s)\n", c->socket, c->username);
+            FILE_LOG(log_message);
             close(c->socket); 
-            c->active = 0;    
+            c->active = 0;
+            closed_count++;
         }
     }
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Closed %d client sockets\n", closed_count);
+    FILE_LOG(log_message);
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Releasing clients_mutex after socket cleanup\n");
+    FILE_LOG(log_message);
     pthread_mutex_unlock(&clients_mutex);
     
-    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Step 4: Stopping worker threads\n");
+    FILE_LOG(log_message);
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Stopping worker threads...\n");
     FILE_LOG(log_message);
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Setting auth_thread_ctx.running = 0\n");
+    FILE_LOG(log_message);
     auth_thread_ctx.running = 0;
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Setting cmd_thread_ctx.running = 0\n");
+    FILE_LOG(log_message);
     cmd_thread_ctx.running = 0;
     
     // Wait for threads to finish
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Step 5: Closing epoll fds to wake threads\n");
+    FILE_LOG(log_message);
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Closing thread epoll fds to wake them...\n");
+    FILE_LOG(log_message);
+    
+    // Close epoll fds to wake threads from epoll_wait
+    if (auth_thread_ctx.epoll_fd != -1) {
+        snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Closing auth thread epoll fd %d\n", auth_thread_ctx.epoll_fd);
+        FILE_LOG(log_message);
+        close(auth_thread_ctx.epoll_fd);
+        auth_thread_ctx.epoll_fd = -1;
+    }
+    
+    if (cmd_thread_ctx.epoll_fd != -1) {
+        snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Closing cmd thread epoll fd %d\n", cmd_thread_ctx.epoll_fd);
+        FILE_LOG(log_message);
+        close(cmd_thread_ctx.epoll_fd);
+        cmd_thread_ctx.epoll_fd = -1;
+    }
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Step 6: Waiting for auth thread to join\n");
+    FILE_LOG(log_message);
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Waiting for auth thread...\n");
     FILE_LOG(log_message);
     pthread_join(auth_thread_ctx.thread_id, NULL);
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Auth thread joined successfully\n");
+    FILE_LOG(log_message);
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Step 7: Waiting for command thread to join\n");
+    FILE_LOG(log_message);
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Waiting for command thread...\n");
     FILE_LOG(log_message);
     pthread_join(cmd_thread_ctx.thread_id, NULL);
-    
-    // Close epoll fds
-    close(auth_thread_ctx.epoll_fd);
-    close(cmd_thread_ctx.epoll_fd);
+    snprintf(log_message, sizeof(log_message), "[DEBUG][CLEANUP] Command thread joined successfully\n");
+    FILE_LOG(log_message);
     
     // Clean up socket map
     socket_info_t *current, *temp_socket;
@@ -1422,6 +1685,12 @@ void cleanup_server(void) {
 
 int main(int argc, char *argv[]) {
     char log_message[BUFFER_SIZE];
+    FILE* log_file = fopen(SERVER_LOG_FILE, "w");
+    if (log_file) {
+        fclose(log_file);
+        snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Server log file created\n");
+        FILE_LOG(log_message);
+    }
 
     // Handle special arguments
     if (argc == 2) {
@@ -1548,7 +1817,7 @@ int main(int argc, char *argv[]) {
     }
     
     // Listen for connections
-    if (listen(server_socket, 10) < 0) {
+    if (listen(server_socket, 128) < 0) {
         snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Listen failed\n");
         FILE_LOG(log_message);
         close(server_socket);
@@ -1561,6 +1830,10 @@ int main(int argc, char *argv[]) {
     
     printf("Server listening on port %d\n", PORT);
     printf("Maximum clients: %d\n", get_max_users());
+
+    // Apply iptables mitigation if possible (no-op if not root or script missing)
+    // Note: IPtables protection may limit connections during testing
+    apply_iptables_protection(PORT);
     
     // Start REST API server
     int rest_port = get_rest_server_port();
@@ -1601,8 +1874,31 @@ int main(int argc, char *argv[]) {
     // Add server socket to main epoll
     struct epoll_event server_event;
     server_event.events = EPOLLIN;
-    server_event.data.ptr = NULL; // Server socket marker
+    server_event.data.fd = server_socket; // Store server socket fd
     epoll_ctl(main_epoll_fd, EPOLL_CTL_ADD, server_socket, &server_event);
+    
+    // Create self-pipe and add read end to epoll to wake on signals
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Creating shutdown pipe\n");
+    FILE_LOG(log_message);
+    if (pipe(shutdown_pipe) == 0) {
+        snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Shutdown pipe created: read_fd=%d, write_fd=%d\n", shutdown_pipe[0], shutdown_pipe[1]);
+        FILE_LOG(log_message);
+        
+        int flags_r = fcntl(shutdown_pipe[0], F_GETFL, 0);
+        int flags_w = fcntl(shutdown_pipe[1], F_GETFL, 0);
+        fcntl(shutdown_pipe[0], F_SETFL, flags_r | O_NONBLOCK);
+        fcntl(shutdown_pipe[1], F_SETFL, flags_w | O_NONBLOCK);
+        
+        struct epoll_event pipe_event;
+        pipe_event.events = EPOLLIN;
+        pipe_event.data.fd = shutdown_pipe[0];  // Store fd directly instead of pointer
+        int epoll_add_result = epoll_ctl(main_epoll_fd, EPOLL_CTL_ADD, shutdown_pipe[0], &pipe_event);
+        snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Added shutdown pipe to epoll, result: %d\n", epoll_add_result);
+        FILE_LOG(log_message);
+    } else {
+        snprintf(log_message, sizeof(log_message), "[ERROR][MAIN_THREAD] Failed to create shutdown pipe: %s\n", strerror(errno));
+        FILE_LOG(log_message);
+    }
     
     // Start worker threads
     auth_thread_ctx.running = 1;
@@ -1623,17 +1919,74 @@ int main(int argc, char *argv[]) {
     // Main accept loop
     int max_events = get_max_events();
     struct epoll_event events[max_events];
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Entering main accept loop with server_running=%d\n", server_running);
+    FILE_LOG(log_message);
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] About to enter main loop, shutdown_pipe[0]=%d, shutdown_pipe[1]=%d\n", shutdown_pipe[0], shutdown_pipe[1]);
+    FILE_LOG(log_message);
+    
     while (server_running) {
+        if (!server_running) {
+            snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] server_running is 0, exiting main loop\n");
+            FILE_LOG(log_message);
+            break;
+        }
+        
+        snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] About to call epoll_wait, server_running=%d, shutdown_pipe[0]=%d\n", server_running, shutdown_pipe[0]);
+        FILE_LOG(log_message);
+        
         int nfds = epoll_wait(main_epoll_fd, events, max_events, 100);
+        
+        snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] epoll_wait returned %d, server_running=%d\n", nfds, server_running);
+        FILE_LOG(log_message);
+        
+        // Check shutdown flag immediately after epoll_wait
+        if (!server_running) {
+            snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] server_running=0 detected after epoll_wait, exiting main loop\n");
+            FILE_LOG(log_message);
+            break;
+        }
+        
         if (nfds == -1) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Main epoll_wait interrupted by signal (EINTR), checking server_running flag\n");
+                FILE_LOG(log_message);
+                continue;
+            }
             snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] epoll_wait (main) failed\n");
             FILE_LOG(log_message);
             break;
         }
         
+        if (nfds == 0) {
+            //snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] epoll_wait timeout (100ms), server_running=%d\n", server_running);
+            //FILE_LOG(log_message);
+        } 
+        else {
+            snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Processing %d epoll events\n", nfds);
+            FILE_LOG(log_message);
+        }
+        if (events[0].data.fd == shutdown_pipe[0]) {
+            // Drain the pipe and break to exit loop
+            snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] SHUTDOWN PIPE EVENT DETECTED! Processing shutdown...\n");
+            FILE_LOG(log_message);
+            char buf[16];
+            int bytes_read = 0;
+            while ((bytes_read = read(shutdown_pipe[0], buf, sizeof(buf))) > 0) {
+                snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Drained %d bytes from shutdown pipe\n", bytes_read);
+                FILE_LOG(log_message);
+            }
+            snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Setting server_running=0 and breaking from main loop\n");
+            FILE_LOG(log_message);
+            server_running = 0;
+            break;
+        }
         for (int i = 0; i < nfds; i++) {
-            if (events[i].data.ptr == NULL) {
+            snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Event %d: data.fd=%d, shutdown_pipe[0]=%d\n", i, events[i].data.fd, shutdown_pipe[0]);
+            FILE_LOG(log_message);
+            
+            
+            if (events[i].data.fd == server_socket) {
                 // New connection
                 struct sockaddr_in client_addr;
                 socklen_t client_addr_len = sizeof(client_addr);
@@ -1730,28 +2083,80 @@ int main(int argc, char *argv[]) {
         }
     }
     
+    // We are exiting main accept loop
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Main accept loop exited, beginning cleanup\n");
+    FILE_LOG(log_message);
+    FILE_LOG("[INFO][MAIN_THREAD] Main accept loop exited\n");
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Closing main epoll and shutdown pipes\n");
+    FILE_LOG(log_message);
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Closing main epoll fd...\n");
+    FILE_LOG(log_message);
     // Cleanup
     close(main_epoll_fd);
+    if (shutdown_pipe[0] != -1) {
+        snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Closing shutdown_pipe[0]\n");
+        FILE_LOG(log_message);
+        close(shutdown_pipe[0]);
+    }
+    if (shutdown_pipe[1] != -1) {
+        snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Closing shutdown_pipe[1]\n");
+        FILE_LOG(log_message);
+        close(shutdown_pipe[1]);
+    }
     
     // Cleanup and shutdown
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Acquiring server_socket_mutex to close server socket\n");
+    FILE_LOG(log_message);
     pthread_mutex_lock(&server_socket_mutex);
     if (server_socket != -1) {
+        snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Closing server socket %d\n", server_socket);
+        FILE_LOG(log_message);
         close(server_socket);
         server_socket = -1;
     }
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Releasing server_socket_mutex\n");
+    FILE_LOG(log_message);
     pthread_mutex_unlock(&server_socket_mutex);
+
+    // Remove iptables mitigation on shutdown
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Starting iptables mitigation removal\n");
+    FILE_LOG(log_message);
+    FILE_LOG("[INFO][MAIN_THREAD] Removing iptables mitigation...\n");
+    remove_iptables_protection(PORT);
+    FILE_LOG("[INFO][MAIN_THREAD] iptables mitigation removal complete\n");
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] About to call cleanup_server()\n");
+    FILE_LOG(log_message);
     cleanup_server();
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] cleanup_server() completed\n");
+    FILE_LOG(log_message);
     
     // Add a small delay to ensure all threads have completely finished
     // before cleaning up the auth system to prevent deadlock
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Waiting 500ms for threads to fully complete\n");
+    FILE_LOG(log_message);
     struct timespec delay = {0, 500000000}; // 500ms in nanoseconds
     nanosleep(&delay, NULL);
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] 500ms delay completed\n");
+    FILE_LOG(log_message);
     
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Cleaning up authentication system\n");
+    FILE_LOG(log_message);
     cleanup_auth_system(); // Clean up authentication system hashmaps
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Authentication system cleanup completed\n");
+    FILE_LOG(log_message);
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Cleaning up OpenSSL\n");
+    FILE_LOG(log_message);
     OPENSSL_cleanup();
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] OpenSSL cleanup completed\n");
+    FILE_LOG(log_message);
     
     printf("Server Cleanup Succesful...\n");
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] %s shutdown complete\n", PROGRAM_NAME);
+    FILE_LOG(log_message);
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] About to return 0 and exit\n");
     FILE_LOG(log_message);
     return 0;
 }    
