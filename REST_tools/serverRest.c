@@ -8,6 +8,11 @@
 #include "../auth_system.h"
 #include "../socketHandling/socketHandling.h"
 
+// Function declarations
+void enable_enhanced_logging_by_account_id(unsigned int account_id);
+void enable_enhanced_logging_by_username(const char *username);
+int should_apply_enhanced_logging(unsigned int account_id);
+
 // Function to parse human-readable timestamp
 time_t parse_human_timestamp(const char *timestamp_str) {
     if (!timestamp_str || strlen(timestamp_str) == 0) {
@@ -72,6 +77,27 @@ time_t parse_human_timestamp(const char *timestamp_str) {
     }
     
     return 0;
+}
+
+// Function to enable enhanced logging for a specific account ID
+void enable_enhanced_logging_by_account_id(unsigned int account_id) {
+    enable_enhanced_logging_for_account_id(account_id);
+}
+
+// Function to enable enhanced logging for a specific username
+void enable_enhanced_logging_by_username(const char *username) {
+    // Find account ID for this username and enable enhanced logging
+    username_t *username_entry = find_username(username);
+    if (username_entry) {
+        enable_enhanced_logging_for_account_id(username_entry->account_id);
+    } else {
+        printf("DEBUG: Could not find account ID for username '%s'\n", username);
+    }
+}
+
+// Function to check if enhanced logging should be applied
+int should_apply_enhanced_logging(unsigned int account_id) {
+    return should_apply_enhanced_logging_for_account_id(account_id);
 }
 
 // Function to format timestamp as human-readable string
@@ -171,10 +197,24 @@ int extract_account_id_from_line(const char *line) {
 
 // Function to search logs by account ID with time filtering
 char* search_logs_by_account_id(unsigned int account_id, time_t start_time, time_t end_time) {
-    FILE *log_file = fopen("server.log", "r");
+    FILE *log_file = fopen("logs/server.log", "r");
     if (!log_file) {
-        char *error = malloc(128);
-        snprintf(error, 128, "{\"error\": \"Log file not found\", \"account_id\": %u}", account_id);
+        // Try alternative paths if the first one fails
+        log_file = fopen("../logs/server.log", "r");
+        if (!log_file) {
+            log_file = fopen("../../logs/server.log", "r");
+        }
+    }
+    
+    if (!log_file) {
+        // Get current working directory for debugging
+        char cwd[1024];
+        if (getcwd(cwd, sizeof(cwd)) != NULL) {
+            printf("DEBUG: Current working directory: %s\n", cwd);
+        }
+        
+        char *error = malloc(256);
+        snprintf(error, 256, "{\"error\": \"Log file not found\", \"account_id\": %u, \"tried_paths\": [\"logs/server.log\", \"../logs/server.log\", \"../../logs/server.log\"], \"cwd\": \"%s\"}", account_id, cwd);
         return error;
     }
     
@@ -268,9 +308,7 @@ char* search_logs_by_account_id(unsigned int account_id, time_t start_time, time
 char* search_logs_by_username(const char *username, time_t start_time, time_t end_time) {
     // First find the account_id for this username
     username_t *username_entry = NULL;
-    pthread_mutex_lock(&user_map_mutex);
     HASH_FIND_STR(username_map, username, username_entry);
-    pthread_mutex_unlock(&user_map_mutex);
     
     if (!username_entry) {
         char *error = malloc(128);
@@ -558,9 +596,7 @@ static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *co
         } else if (username_param) {
             // Find account_id for username and return status
             username_t *username_entry = NULL;
-            pthread_mutex_lock(&user_map_mutex);
             HASH_FIND_STR(username_map, username_param, username_entry);
-            pthread_mutex_unlock(&user_map_mutex);
             
             if (username_entry) {
                 json_response = get_user_status_json(username_entry->account_id, username_param);
@@ -584,6 +620,114 @@ static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *co
             MHD_destroy_response(response);
             return ret;
         }
+    }
+    
+    // Handle /enhance endpoint for enhanced logging
+    if (strncmp(url, "/enhance", 8) == 0) {
+        printf("DEBUG: Handling /enhance endpoint\n");
+        const char *account_id_param = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "account_id");
+        const char *username_param = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "username");
+        
+        char *json_response = NULL;
+        
+        if (account_id_param) {
+            unsigned int account_id = atoi(account_id_param);
+            // Enable enhanced logging for this account ID
+            enable_enhanced_logging_by_account_id(account_id);
+            json_response = malloc(256);
+            if (json_response) {
+                snprintf(json_response, 256, "{\"message\": \"Enhanced logging enabled for account ID %d\", \"account_id\": %d, \"status\": \"enabled\"}", 
+                        account_id, account_id);
+            }
+        } else if (username_param) {
+            // Find account_id for username and enable enhanced logging
+            username_t *username_entry = NULL;
+            HASH_FIND_STR(username_map, username_param, username_entry);
+            
+            if (username_entry) {
+                enable_enhanced_logging_by_username(username_param);
+                json_response = malloc(256);
+                if (json_response) {
+                    snprintf(json_response, 256, "{\"message\": \"Enhanced logging enabled for username '%s'\", \"username\": \"%s\", \"account_id\": %d, \"status\": \"enabled\"}", 
+                            username_param, username_param, username_entry->account_id);
+                }
+            } else {
+                json_response = malloc(128);
+                if (json_response) {
+                    snprintf(json_response, 128, "{\"error\": \"User not found\", \"username\": \"%s\"}", username_param);
+                }
+            }
+        } else {
+            json_response = strdup("{\"error\": \"Missing parameter. Use account_id or username\"}");
+        }
+        
+        if (json_response) {
+            response = MHD_create_response_from_buffer(strlen(json_response),
+                                                     (void*)json_response,
+                                                     MHD_RESPMEM_MUST_FREE);
+            MHD_add_response_header(response, "Content-Type", "application/json");
+            MHD_add_response_header(response, "Access-Control-Allow-Origin", "*");
+            ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
+            MHD_destroy_response(response);
+            return ret;
+        }
+    }
+    
+    // Handle /disable endpoint to turn off enhanced logging
+    if (strncmp(url, "/disable", 8) == 0) {
+        printf("DEBUG: Handling /disable endpoint\n");
+        
+        // Disable enhanced logging for all users
+        user_t *user;
+        pthread_mutex_lock(&user_map_mutex);
+        for (user = user_map; user != NULL; user = user->hh.next) {
+            user->enhanced_logging_enabled = 0;
+        }
+        pthread_mutex_unlock(&user_map_mutex);
+        
+        const char *json_response = "{\"message\": \"Enhanced logging disabled for all users\", \"status\": \"disabled\"}";
+        response = MHD_create_response_from_buffer(strlen(json_response),
+                                                 (void*)json_response,
+                                                 MHD_RESPMEM_PERSISTENT);
+        MHD_add_response_header(response, "Content-Type", "application/json");
+        MHD_add_response_header(response, "Access-Control-Allow-Origin", "*");
+        ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
+        MHD_destroy_response(response);
+        return ret;
+    }
+    
+    // Handle /status endpoint to show enhanced logging state
+    if (strncmp(url, "/status", 7) == 0 && strcmp(url, "/status") == 0) {
+        printf("DEBUG: Handling /status endpoint for enhanced logging\n");
+        char json_response[512];
+        
+        // Count users with enhanced logging enabled
+        int enhanced_count = 0;
+        user_t *user;
+        pthread_mutex_lock(&user_map_mutex);
+        for (user = user_map; user != NULL; user = user->hh.next) {
+            if (user->enhanced_logging_enabled) {
+                enhanced_count++;
+            }
+        }
+        pthread_mutex_unlock(&user_map_mutex);
+        
+        if (enhanced_count > 0) {
+            snprintf(json_response, sizeof(json_response), 
+                    "{\"enhanced_logging\": \"enabled\", \"active_users\": %d, \"message\": \"Enhanced logging active for %d user(s)\"}", 
+                    enhanced_count, enhanced_count);
+        } else {
+            strcpy(json_response, "{\"enhanced_logging\": \"disabled\", \"message\": \"Enhanced logging is not active for any users\"}");
+        }
+        
+        response = MHD_create_response_from_buffer(strlen(json_response),
+                                                 (void*)json_response,
+                                                 MHD_RESPMEM_PERSISTENT);
+        MHD_add_response_header(response, "Content-Type", "application/json");
+        MHD_add_response_header(response, "Access-Control-Allow-Origin", "*");
+        ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
+        MHD_destroy_response(response);
+        return ret;
     }
     
     // Handle /logs endpoint with command-line style query

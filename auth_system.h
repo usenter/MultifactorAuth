@@ -40,10 +40,16 @@
 #error "RSA_CHALLENGE_SIZE too large for OAEP padding! Max size is RSA_MAX_ENCRYPT_SIZE bytes"
 #endif
 
+//#define set_sock_opt(sock, level, optname, optval, optlen) if (setsockopt(sock, level, optname, optval, optlen) == -1) { perror("setsockopt"); }
+
 
 #define SERVER_LOG_FILE "logs/server.log"
 
-
+// Enhanced logging function declarations
+void enable_enhanced_logging_for_account_id(unsigned int account_id);
+void disable_enhanced_logging_for_account_id(unsigned int account_id);
+int get_account_enhanced_logging_status(unsigned int account_id);
+int should_apply_enhanced_logging_for_account_id(unsigned int account_id);
 
 // User structure
 typedef struct {
@@ -56,6 +62,7 @@ typedef struct {
     char* address;
     char* phone_number;
     int authLevel;
+    int enhanced_logging_enabled;  // Flag for enhanced logging
     UT_hash_handle hh;
 } user_t;
 
@@ -163,6 +170,7 @@ int init_encrypted_auth_system(char* userFile, char* key);
 int add_user(int account_id, const char* username, const char* password);
 user_t* find_user(int account_id);
 username_t* find_username(const char* username);
+username_t* find_username_by_account_id(unsigned int account_id);
 int authenticate_user(const char* username, const char* password, int account_id);
 int create_session( int account_id);
 void remove_session(int account_id);

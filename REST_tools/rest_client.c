@@ -14,6 +14,10 @@
 
 // Function declarations
 void print_response_in_chunks(const char *response, const char *prefix, int chunk_size);
+int enhance_logging_by_username(const char *server_ip, const char *username);
+int enhance_logging_by_account_id(const char *server_ip, int account_id);
+int disable_enhanced_logging(const char *server_ip);
+int get_enhanced_logging_status(const char *server_ip);
 
 // Callback function for CURL to write response data
 size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
@@ -313,6 +317,183 @@ int query_logs_by_username(const char *server_ip, const char *username, time_t s
     return 0;
 }
 
+// Function to enhance logging for a specific username
+int enhance_logging_by_username(const char *server_ip, const char *username) {
+    CURL *curl;
+    CURLcode res;
+    char *response = NULL;
+    char url[512];
+    
+    // Initialize CURL
+    curl = curl_easy_init();
+    if (!curl) {
+        printf("Error: Failed to initialize CURL\n");
+        return -1;
+    }
+    
+    // Build URL with URL-encoded username
+    char *encoded_username = curl_easy_escape(curl, username, 0);
+    snprintf(url, sizeof(url), "http://%s:%d/enhance?username=%s", 
+             server_ip, REST_SERVER_PORT, encoded_username);
+    
+    // Set up CURL options
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    
+    // Perform the request
+    res = curl_easy_perform(curl);
+    
+    if (res != CURLE_OK) {
+        printf("Error: CURL request failed: %s\n", curl_easy_strerror(res));
+        curl_easy_cleanup(curl);
+        if (response) free(response);
+        if (encoded_username) curl_free(encoded_username);
+        return -1;
+    }
+    
+    // Print response
+    if (response) {
+        printf("Enhanced logging response for Username '%s':\n%s\n", username, response);
+        free(response);
+    }
+    
+    curl_easy_cleanup(curl);
+    if (encoded_username) curl_free(encoded_username);
+    return 0;
+}
+
+// Function to enhance logging for a specific account ID
+int enhance_logging_by_account_id(const char *server_ip, int account_id) {
+    CURL *curl;
+    CURLcode res;
+    char *response = NULL;
+    char url[256];
+    
+    // Initialize CURL
+    curl = curl_easy_init();
+    if (!curl) {
+        printf("Error: Failed to initialize CURL\n");
+        return -1;
+    }
+    
+    // Build URL
+    snprintf(url, sizeof(url), "http://%s:%d/enhance?account_id=%d", 
+             server_ip, REST_SERVER_PORT, account_id);
+    
+    // Set up CURL options
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    
+    // Perform the request
+    res = curl_easy_perform(curl);
+    
+    if (res != CURLE_OK) {
+        printf("Error: CURL request failed: %s\n", curl_easy_strerror(res));
+        curl_easy_cleanup(curl);
+        if (response) free(response);
+        return -1;
+    }
+    
+    // Print response
+    if (response) {
+        printf("Enhanced logging response for Account ID %d:\n%s\n", account_id, response);
+        free(response);
+    }
+    
+    curl_easy_cleanup(curl);
+    return 0;
+}
+
+// Function to disable enhanced logging
+int disable_enhanced_logging(const char *server_ip) {
+    CURL *curl;
+    CURLcode res;
+    char *response = NULL;
+    char url[256];
+    
+    // Initialize CURL
+    curl = curl_easy_init();
+    if (!curl) {
+        printf("Error: Failed to initialize CURL\n");
+        return -1;
+    }
+    
+    // Build URL
+    snprintf(url, sizeof(url), "http://%s:%d/disable", server_ip, REST_SERVER_PORT);
+    
+    // Set up CURL options
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    
+    // Perform the request
+    res = curl_easy_perform(curl);
+    
+    if (res != CURLE_OK) {
+        printf("Error: CURL request failed: %s\n", curl_easy_strerror(res));
+        curl_easy_cleanup(curl);
+        if (response) free(response);
+        return -1;
+    }
+    
+    // Print response
+    if (response) {
+        printf("Disable enhanced logging response:\n%s\n", response);
+        free(response);
+    }
+    
+    curl_easy_cleanup(curl);
+    return 0;
+}
+
+// Function to get enhanced logging status
+int get_enhanced_logging_status(const char *server_ip) {
+    CURL *curl;
+    CURLcode res;
+    char *response = NULL;
+    char url[256];
+    
+    // Initialize CURL
+    curl = curl_easy_init();
+    if (!curl) {
+        printf("Error: Failed to initialize CURL\n");
+        return -1;
+    }
+    
+    // Build URL
+    snprintf(url, sizeof(url), "http://%s:%d/status", server_ip, REST_SERVER_PORT);
+    
+    // Set up CURL options
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    
+    // Perform the request
+    res = curl_easy_perform(curl);
+    
+    if (res != CURLE_OK) {
+        printf("Error: CURL request failed: %s\n", curl_easy_strerror(res));
+        curl_easy_cleanup(curl);
+        if (response) free(response);
+        return -1;
+    }
+    
+    // Print response
+    if (response) {
+        printf("Enhanced logging status:\n%s\n", response);
+        free(response);
+    }
+    
+    curl_easy_cleanup(curl);
+    return 0;
+}
+
 // Function to print large responses in chunks
 void print_response_in_chunks(const char *response, const char *prefix, int chunk_size) {
     if (!response) return;
@@ -342,6 +523,10 @@ void print_help(void) {
     printf("  query account <id>         - Query status by account ID\n");
     printf("  logs username <username> [time_params]  - Search logs by username\n");
     printf("  logs account <id> [time_params]        - Search logs by account ID\n");
+    printf("  enhance username <username> - Enable enhanced logging for username\n");
+    printf("  enhance account <id>        - Enable enhanced logging for account ID\n");
+    printf("  disable                     - Disable enhanced logging\n");
+    printf("  status                     - Show enhanced logging status\n");
     printf("  help                       - Show this help\n");
     printf("  quit                       - Exit the program\n");
     printf("  clear                      - Clear the screen\n");
@@ -729,6 +914,31 @@ int main(int argc, char *argv[]) {
                 } else {
                     printf("Error: Invalid query type '%s' for logs. Use 'username' or 'account'\n", query_type);
                 }
+            } else if (strcmp(command, "enhance") == 0) {
+                if (strcmp(query_type, "username") == 0) {
+                    if (strlen(identifier) > 0) {
+                        printf("Enhancing logging for username: %s\n", identifier);
+                        enhance_logging_by_username(server_ip, identifier);
+                    } else {
+                        printf("Error: Username not provided for enhance\n");
+                    }
+                } else if (strcmp(query_type, "account") == 0) {
+                    int account_id = atoi(identifier);
+                    if (account_id > 0) {
+                        printf("Enhancing logging for account ID: %d\n", account_id);
+                        enhance_logging_by_account_id(server_ip, account_id);
+                    } else {
+                        printf("Error: Invalid account ID '%s' for enhance\n", identifier);
+                    }
+                } else {
+                    printf("Error: Invalid enhance type '%s'. Use 'username' or 'account'\n", query_type);
+                }
+            } else if (strcmp(command, "disable") == 0) {
+                printf("Disabling enhanced logging...\n");
+                disable_enhanced_logging(server_ip);
+            } else if (strcmp(command, "status") == 0) {
+                printf("Getting enhanced logging status...\n");
+                get_enhanced_logging_status(server_ip);
             } else {
                 printf("Error: Unknown command '%s'. Type 'help' for available commands.\n", command);
             }

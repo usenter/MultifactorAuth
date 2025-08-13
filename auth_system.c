@@ -28,8 +28,56 @@ static rsa_keypair_t server_keys = {NULL, NULL};
 static int rsa_system_initialized = 0;
 
 
+// Function to check if enhanced logging should be applied for a specific account ID
+int should_apply_enhanced_logging_for_account_id(unsigned int account_id) {
+    if (account_id <= 0) return 0;
+    
+    // Find user by account_id and check enhanced logging flag
+    user_t *user = find_user(account_id);
+    if (user && user->enhanced_logging_enabled) {
+        return 1;
+    }
+    
+    return 0;
+}
+
+// Function to enable enhanced logging for an account ID
+void enable_enhanced_logging_for_account_id(unsigned int account_id) {
+    if (account_id <= 0) return;
+    
+    user_t *user = find_user(account_id);
+    if (user) {
+        user->enhanced_logging_enabled = 1;
+        printf("Enhanced logging enabled for account ID: %d (username: %s)\n", account_id, user->username);
+    }
+}
+
+// Function to disable enhanced logging for an account ID
+void disable_enhanced_logging_for_account_id(unsigned int account_id) {
+    if (account_id <= 0) return;
+    
+    user_t *user = find_user(account_id);
+    if (user) {
+        user->enhanced_logging_enabled = 0;
+        printf("Enhanced logging disabled for account ID: %d (username: %s)\n", account_id, user->username);
+    }
+}
+
+// Function to get enhanced logging status for an account ID
+int get_account_enhanced_logging_status(unsigned int account_id) {
+    if (account_id <= 0) return 0;
+    
+    user_t *user = find_user(account_id);
+    if (user) {
+        return user->enhanced_logging_enabled;
+    }
+    return 0;
+}
+
 void FILE_LOG(const char* message){
     pthread_mutex_lock(&log_mutex);
+    
+    // Always log to main server log
     FILE* file = fopen(SERVER_LOG_FILE, "a");
     if(file){
         time_t now = time(NULL);
@@ -39,8 +87,53 @@ void FILE_LOG(const char* message){
         fprintf(file, "%s", message);
         fclose(file);
     }
+    
+    // Check if this message contains an account ID and if enhanced logging is enabled
+    // Extract account ID from message if it contains [ID:number] pattern
+    const char *id_marker = strstr(message, "[ID:");
+    if (id_marker) {
+        const char *id_start = id_marker + 4; // Skip "[ID:"
+        const char *id_end = strchr(id_start, ']');
+        if (id_end) {
+            // Extract account ID
+            char id_str[16];
+            int id_len = id_end - id_start;
+            if (id_len < sizeof(id_str)) {
+                strncpy(id_str, id_start, id_len);
+                id_str[id_len] = '\0';
+                unsigned int account_id = atoi(id_str);
+                
+                                    if (account_id > 0) {
+                        // Check if this account ID should get enhanced logging
+                        if (should_apply_enhanced_logging_for_account_id(account_id)) {
+                        // Find username for this account ID
+                        username_t *uname_entry = find_username_by_account_id(account_id);
+                        if (uname_entry) {
+                            // Create enhanced log entry
+                            char user_log_path[256];
+                            snprintf(user_log_path, sizeof(user_log_path), "logs/enhanced_%s.log", uname_entry->username);
+                            
+                            FILE* enhanced_file = fopen(user_log_path, "a");
+                            if(enhanced_file){
+                                time_t now = time(NULL);
+                                char time_str[20];
+                                strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+                                fprintf(enhanced_file, "[%s][ENHANCED][%s][ID:%d] ", time_str, uname_entry->username, account_id);
+                                fprintf(enhanced_file, "%s", message);
+                                fclose(enhanced_file);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
     pthread_mutex_unlock(&log_mutex);
 }
+
+
+
 // Simple hash function (in production, use a proper cryptographic hash)
 void hash_password(const char* password, char* hash) {
     unsigned long hash_val = 5381;
@@ -988,6 +1081,25 @@ username_t* find_username(const char* username) {
     return found;
 }
 
+// Function to find username by account ID
+username_t* find_username_by_account_id(unsigned int account_id) {
+    if (account_id <= 0) return NULL;
+    
+    username_t* entry;
+    pthread_mutex_lock(&username_map_mutex);
+    
+    // Iterate through username map to find matching account_id
+    for (entry = username_map; entry != NULL; entry = entry->hh.next) {
+        if (entry->account_id == account_id) {
+            pthread_mutex_unlock(&username_map_mutex);
+            return entry;
+        }
+    }
+    
+    pthread_mutex_unlock(&username_map_mutex);
+    return NULL;
+}
+
 int load_users_from_encrypted_file(const char* encrypted_filename, const char* key) {
     char log_message[BUFFER_SIZE];
     snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM] Loading users from encrypted file: %s\n", encrypted_filename);
@@ -1065,6 +1177,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
             new_user->phone_number = strdup(phone_number);
             new_user->active = 1;
             new_user->authLevel = auth;
+            new_user->enhanced_logging_enabled = 0;  // Initialize enhanced logging as disabled
             // Check if user already exists
             pthread_mutex_lock(&user_map_mutex);
             pthread_mutex_lock(&username_map_mutex);
@@ -1118,6 +1231,7 @@ int load_users_from_encrypted_file(const char* encrypted_filename, const char* k
                 new_user->phone_number = strdup(phone_number);
                 new_user->active = 1;
                 new_user->authLevel = auth;
+                new_user->enhanced_logging_enabled = 0;  // Initialize enhanced logging as disabled
                 pthread_mutex_lock(&user_map_mutex);
                 pthread_mutex_lock(&username_map_mutex);
                 if (find_user(account_id) == NULL && find_username(username) == NULL) {

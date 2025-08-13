@@ -219,7 +219,6 @@ void broadcast_message(const char* message, int sender_socket, int overrideBroad
     strncat(message_with_newline, "\n", 1);
     snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD] Broadcasting message: %s", message_with_newline);
     FILE_LOG(log_message);
-    pthread_mutex_lock(&clients_mutex);
     client_t *c, *tmp;
     HASH_ITER(hh, clients_map, c, tmp) {
         if ((c->active && c->socket != sender_socket) && 
@@ -237,7 +236,6 @@ void broadcast_message(const char* message, int sender_socket, int overrideBroad
             
         }
     }
-    pthread_mutex_unlock(&clients_mutex);
     free(message_with_newline);
 }
 void remove_client(int client_socket) {
@@ -341,8 +339,6 @@ client_t* find_client_by_nickname(const char* nickname) {
 }
 
 void get_client_list(char* list_buffer, size_t buffer_size) {
-    pthread_mutex_lock(&clients_mutex);
-    
     snprintf(list_buffer, buffer_size, "Connected users (%d): ", client_count);
     int first = 1;
     client_t *c, *tmp;
@@ -357,8 +353,6 @@ void get_client_list(char* list_buffer, size_t buffer_size) {
         }
     }
     strncat(list_buffer, "\n", buffer_size - strlen(list_buffer) - 1);
-    
-    pthread_mutex_unlock(&clients_mutex);
 }
 
 // Move socket from auth thread to command thread
@@ -496,7 +490,6 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
         }
         
         // Update nickname with proper synchronization
-        pthread_mutex_lock(&clients_mutex);
         client_t *client = NULL;
         HASH_FIND_INT(clients_map, &client_socket, client);
         if (client && client->active) {
@@ -507,8 +500,6 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
             strncpy(client->nickname, new_nick, sizeof(client->nickname) - 1);
             client->nickname[sizeof(client->nickname) - 1] = '\0';
             
-            pthread_mutex_unlock(&clients_mutex);
-            
             snprintf(broadcast_msg, sizeof(broadcast_msg), 
                      "Nickname changed to '%s'\n", new_nick);
             send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
@@ -518,9 +509,7 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
             broadcast_message(broadcast_msg, client_socket, 0);
             snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD][ID:%d] Nickname changed to '%s' for socket %d\n", c->account_id, new_nick, client_socket);
             FILE_LOG(log_message);
-        } else {
-            pthread_mutex_unlock(&clients_mutex);
-        }
+        } 
         return;
     }
 
@@ -704,6 +693,17 @@ void* auth_thread_func(void *arg) {
                 }
             }
             
+                    // Enhanced logging for authentication attempts
+        if (account_id > 0) {
+            username_t *uname_entry = find_username_by_account_id(account_id);
+            if (uname_entry) {
+                // Enhanced logging will be handled automatically by FILE_LOG if enabled
+                snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Authentication attempt - Socket: %d, Data: %s\n", 
+                         account_id, client_socket, buffer);
+                FILE_LOG(log_message);
+            }
+        }
+            
             auth_result_t process_result;
             if (account_id > 0) {
                 // Check for lockout before processing any auth attempt
@@ -746,6 +746,16 @@ void* auth_thread_func(void *arg) {
                 if (auth_status == AUTH_FULLY_AUTHENTICATED) {
                     snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Authentication COMPLETE for socket %d, promoting to chat...\n", info->account_id, client_socket);
                     FILE_LOG(log_message);
+                    
+                    // Enhanced logging for successful authentication
+                    username_t *uname_entry = find_username_by_account_id(account_id);
+                    if (uname_entry) {
+                        // Enhanced logging will be handled automatically by FILE_LOG if enabled
+                        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Authentication COMPLETE - Socket: %d, Account: %d\n", 
+                                 account_id, client_socket, account_id);
+                        FILE_LOG(log_message);
+                    }
+                    
                     promote_to_authenticated(client_socket, account_id);
                     snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Promotion complete for socket %d\n", info->account_id, client_socket);
                     FILE_LOG(log_message);
@@ -890,14 +900,12 @@ void* cmd_thread_func(void *arg) {
                 snprintf(log_message, sizeof(log_message), "[ERROR][CMD_THREAD] No client found for socket %d - this shouldn't happen for authenticated users\n", client_socket);
                 FILE_LOG(log_message);
                 // Try to find the client in the hash table for debugging
-                pthread_mutex_lock(&clients_mutex);
                 client_t *c, *tmp;
                 HASH_ITER(hh, clients_map, c, tmp) {
                     snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD] Client in map - socket=%d, active=%d, username=%s\n", 
                            c->socket, c->active, c->username);
                     FILE_LOG(log_message);
                 }
-                pthread_mutex_unlock(&clients_mutex);
             }
         }
     }
@@ -928,8 +936,9 @@ void signal_handler(int sig) {
     snprintf(log_message, sizeof(log_message), "[DEBUG][SIGNAL] shutdown_pipe[1]=%d, shutdown_pipe[0]=%d\n", shutdown_pipe[1], shutdown_pipe[0]);
     FILE_LOG(log_message);
     if (shutdown_pipe[1] != -1) {
-        const char byte = 'x';
-        ssize_t written = write(shutdown_pipe[1], &byte, 1);
+        // Write multiple bytes to ensure the pipe is definitely readable
+        const char bytes[] = "xxx";
+        ssize_t written = write(shutdown_pipe[1], bytes, sizeof(bytes));
         snprintf(log_message, sizeof(log_message), "[DEBUG][SIGNAL] Wrote %zd bytes to shutdown pipe (fd=%d)\n", written, shutdown_pipe[1]);
         FILE_LOG(log_message);
         
@@ -956,13 +965,11 @@ void add_authenticated_client(client_t *new_client) {
     printf("[ADD_CLIENT] Adding authenticated client for user '%s' (socket %d)\n", 
            new_client->username, new_client->socket);
     
-    pthread_mutex_lock(&clients_mutex);
     
     // Check if client already exists by socket (prevent duplicates)
     client_t *existing = NULL;
     HASH_FIND_INT(clients_map, &new_client->socket, existing);
     if (existing) {
-        pthread_mutex_unlock(&clients_mutex);
         snprintf(log_message, sizeof(log_message), "[WARN][AUTH_THREAD][ID:%d] Warning: Client socket %d already exists in map\n", new_client->account_id, new_client->socket);
         FILE_LOG(log_message);
         return;
@@ -983,13 +990,15 @@ void add_authenticated_client(client_t *new_client) {
         }
     }
     
+    pthread_mutex_lock(&clients_mutex);
     HASH_ADD_INT(clients_map, socket, new_client);
     client_count++;
+    pthread_mutex_unlock(&clients_mutex);
     snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Successfully added client for user '%s' (socket %d). Total clients: %d\n", 
            new_client->account_id, new_client->username, new_client->socket, client_count);
     FILE_LOG(log_message);
     
-    pthread_mutex_unlock(&clients_mutex);
+    
 }
 
 void* handle_authenticated_client(void* arg) {
@@ -1019,6 +1028,14 @@ void* handle_authenticated_client(void* arg) {
              PROGRAM_NAME);
     send(client_socket, broadcast_msg, strlen(broadcast_msg), 0);
     
+    // Enhanced logging for authenticated client
+    // Enhanced logging will be handled automatically by FILE_LOG if enabled
+    char log_message[BUFFER_SIZE];
+    snprintf(log_message, sizeof(log_message), "[INFO][CHAT][ID:%d] Client authenticated and joined chat\n", c->account_id);
+    FILE_LOG(log_message);
+    snprintf(log_message, sizeof(log_message), "[INFO][CHAT][ID:%d] Client socket: %d, Mode: %d\n", c->account_id, client_socket, c->account_id);
+    FILE_LOG(log_message);
+    
     // Announce new user to everyone
     snprintf(broadcast_msg, sizeof(broadcast_msg), 
              "%s joined the chat", c->nickname);
@@ -1026,11 +1043,34 @@ void* handle_authenticated_client(void* arg) {
     
     // Main message handling loop
     while (server_running) {
-        int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
-        if (bytes_received <= 0) {
-            client_t *c = find_client_by_socket(client_socket);
-            printf("Client %s disconnected\n", c ? c->nickname : "(unknown)");
+        // Check shutdown flag before each iteration
+        if (!server_running) {
+            printf("Shutdown requested, exiting client handler\n");
             break;
+        }
+        
+        int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, MSG_DONTWAIT);
+        if (bytes_received <= 0) {
+            if (bytes_received == 0) {
+                client_t *c = find_client_by_socket(client_socket);
+                printf("Client %s disconnected\n", c ? c->nickname : "(unknown)");
+                break;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // No data available, check shutdown flag
+                if (!server_running) {
+                    printf("Shutdown requested, exiting client handler\n");
+                    break;
+                }
+                // Small delay before retry
+                struct timespec delay = {0, 10000000}; // 10ms
+                nanosleep(&delay, NULL);
+                continue;
+            } else {
+                // Real error
+                client_t *c = find_client_by_socket(client_socket);
+                printf("Client %s recv error\n", c ? c->nickname : "(unknown)");
+                break;
+            }
         }
         
         buffer[bytes_received] = '\0';
@@ -1040,6 +1080,11 @@ void* handle_authenticated_client(void* arg) {
         if (strlen(buffer) == 0) {
             continue;
         }
+        
+        // Enhanced logging for message received
+        // Enhanced logging will be handled automatically by FILE_LOG if enabled
+        snprintf(log_message, sizeof(log_message), "[INFO][CHAT][ID:%d] Message received: %s\n", c->account_id, buffer);
+        FILE_LOG(log_message);
         
         // Re-check if session is still valid
         c = find_client_by_socket(client_socket);
@@ -1100,9 +1145,14 @@ X509* extract_client_cert(int client_socket) {
     unsigned long total_read = 0;
     while (total_read < sizeof(net_cert_len)) {
         int recvd = recv(client_socket, ((char*)&net_cert_len) + total_read, 
-                        sizeof(net_cert_len) - total_read, 0);
+                        sizeof(net_cert_len) - total_read, MSG_DONTWAIT);
         if (recvd <= 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Check shutdown flag during certificate extraction
+                if (!server_running) {
+                    printf("[SHUTDOWN] Aborting certificate length extraction due to shutdown\n");
+                    return NULL;
+                }
                 struct timespec delay = {0, 100000000}; 
                 nanosleep(&delay, NULL);
                 continue;
@@ -1118,6 +1168,18 @@ X509* extract_client_cert(int client_socket) {
     if (cert_len == 0 || cert_len > 8192) {
         snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD][ID:%d] Invalid certificate length received: %u from socket %d\n", socket_info->account_id, cert_len, client_socket);
         FILE_LOG(log_message);
+        
+                    // Enhanced logging for certificate extraction issues
+            if (socket_info->account_id > 0) {
+                username_t *uname_entry = find_username_by_account_id(socket_info->account_id);
+                if (uname_entry) {
+                    // Enhanced logging will be handled automatically by FILE_LOG if enabled
+                    snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD][ID:%d] Certificate extraction FAILED - Invalid length: %u, Socket: %d\n",
+                             socket_info->account_id, cert_len, client_socket);
+                    FILE_LOG(log_message);
+                }
+            }
+        
         return NULL;
     }
     
@@ -1132,9 +1194,15 @@ X509* extract_client_cert(int client_socket) {
     total_read = 0;
     while (total_read < (unsigned long)cert_len) {
         int recvd = recv(client_socket, cert_buf + total_read, 
-                        cert_len - total_read, 0);
+                        cert_len - total_read, MSG_DONTWAIT);
         if (recvd <= 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Check shutdown flag during certificate extraction
+                if (!server_running) {
+                    printf("[SHUTDOWN] Aborting certificate extraction due to shutdown\n");
+                    free(cert_buf);
+                    return NULL;
+                }
                 struct timespec delay = {0, 100000000}; 
                 nanosleep(&delay, NULL);
                 continue;
@@ -1234,7 +1302,7 @@ int setup_initial_connection(int client_socket) {
 
     // Receive username
     char username_buffer[BUFFER_SIZE];
-    int name_bytes = recv(client_socket, username_buffer, BUFFER_SIZE - 1, 0);
+    int name_bytes = recv(client_socket, username_buffer, BUFFER_SIZE - 1, MSG_DONTWAIT);
     char username[MAX_USERNAME_LEN] = "";
     unsigned int account_id = 0;
     
@@ -1685,7 +1753,7 @@ void cleanup_server(void) {
 
 int main(int argc, char *argv[]) {
     char log_message[BUFFER_SIZE];
-    FILE* log_file = fopen(SERVER_LOG_FILE, "w");
+    FILE* log_file = fopen(SERVER_LOG_FILE, "a");
     if (log_file) {
         fclose(log_file);
         snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Server log file created\n");
@@ -1775,10 +1843,6 @@ int main(int argc, char *argv[]) {
 
     // Removed unused work queue initialization and thread creation
 
-    // Set up signal handlers for graceful shutdown
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    
     // Create server socket
     pthread_mutex_lock(&server_socket_mutex);
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -1893,14 +1957,37 @@ int main(int argc, char *argv[]) {
         pipe_event.events = EPOLLIN;
         pipe_event.data.fd = shutdown_pipe[0];  // Store fd directly instead of pointer
         int epoll_add_result = epoll_ctl(main_epoll_fd, EPOLL_CTL_ADD, shutdown_pipe[0], &pipe_event);
+        if (epoll_add_result == -1) {
+            snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Failed to add shutdown pipe to epoll: %s (errno=%d)\n", strerror(errno), errno);
+            FILE_LOG(log_message);
+            close(shutdown_pipe[0]);
+            close(shutdown_pipe[1]);
+            shutdown_pipe[0] = -1;
+            shutdown_pipe[1] = -1;
+            return 1;
+        }
         snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Added shutdown pipe to epoll, result: %d\n", epoll_add_result);
         FILE_LOG(log_message);
+        
+        // NOW set up signal handlers AFTER shutdown pipe is ready
+        signal(SIGINT, signal_handler);
+        signal(SIGTERM, signal_handler);
+        snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Signal handlers installed after shutdown pipe setup\n");
+        FILE_LOG(log_message);
+        
     } else {
         snprintf(log_message, sizeof(log_message), "[ERROR][MAIN_THREAD] Failed to create shutdown pipe: %s\n", strerror(errno));
         FILE_LOG(log_message);
     }
     
-    // Start worker threads
+    // Block signals in all threads except main thread
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+    
+    // Start worker threads (they inherit the signal mask, so signals blocked)
     auth_thread_ctx.running = 1;
     cmd_thread_ctx.running = 1;
     
@@ -1926,19 +2013,16 @@ int main(int argc, char *argv[]) {
     FILE_LOG(log_message);
     
     while (server_running) {
+        
+        // Check shutdown flag before epoll_wait
         if (!server_running) {
             snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] server_running is 0, exiting main loop\n");
             FILE_LOG(log_message);
             break;
         }
         
-        snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] About to call epoll_wait, server_running=%d, shutdown_pipe[0]=%d\n", server_running, shutdown_pipe[0]);
-        FILE_LOG(log_message);
-        
+        // Use shorter timeout for more responsive shutdown
         int nfds = epoll_wait(main_epoll_fd, events, max_events, 100);
-        
-        snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] epoll_wait returned %d, server_running=%d\n", nfds, server_running);
-        FILE_LOG(log_message);
         
         // Check shutdown flag immediately after epoll_wait
         if (!server_running) {
@@ -1949,8 +2033,12 @@ int main(int argc, char *argv[]) {
         
         if (nfds == -1) {
             if (errno == EINTR) {
-                snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Main epoll_wait interrupted by signal (EINTR), checking server_running flag\n");
-                FILE_LOG(log_message);
+                // Check if we should exit due to signal
+                if (!server_running) {
+                    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] server_running=0 detected after EINTR, exiting main loop\n");
+                    FILE_LOG(log_message);
+                    break;
+                }
                 continue;
             }
             snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] epoll_wait (main) failed\n");
@@ -1959,32 +2047,51 @@ int main(int argc, char *argv[]) {
         }
         
         if (nfds == 0) {
-            //snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] epoll_wait timeout (100ms), server_running=%d\n", server_running);
-            //FILE_LOG(log_message);
-        } 
-        else {
-            snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Processing %d epoll events\n", nfds);
-            FILE_LOG(log_message);
-        }
-        if (events[0].data.fd == shutdown_pipe[0]) {
-            // Drain the pipe and break to exit loop
-            snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] SHUTDOWN PIPE EVENT DETECTED! Processing shutdown...\n");
-            FILE_LOG(log_message);
-            char buf[16];
-            int bytes_read = 0;
-            while ((bytes_read = read(shutdown_pipe[0], buf, sizeof(buf))) > 0) {
-                snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Drained %d bytes from shutdown pipe\n", bytes_read);
+            // Check shutdown flag on timeout as fallback
+            if (!server_running) {
+                snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Shutdown detected via flag during timeout\n");
                 FILE_LOG(log_message);
+                break;
             }
-            snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Setting server_running=0 and breaking from main loop\n");
-            FILE_LOG(log_message);
-            server_running = 0;
+        } 
+        
+        // Check ALL events for shutdown pipe first (priority check)
+        int shutdown_detected = 0;
+       
+        
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.fd == shutdown_pipe[0]) {
+                // Drain the pipe and break to exit loop
+                snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] SHUTDOWN PIPE EVENT DETECTED! Processing shutdown...\n");
+                FILE_LOG(log_message);
+                char buf[16];
+                int bytes_read = 0;
+                while ((bytes_read = read(shutdown_pipe[0], buf, sizeof(buf))) > 0) {
+                    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Drained %d bytes from shutdown pipe\n", bytes_read);
+                    FILE_LOG(log_message);
+                }
+                snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Setting server_running=0 and breaking from main loop\n");
+                FILE_LOG(log_message);
+                server_running = 0;
+                shutdown_detected = 1;
+                break;
+            }
+        }
+        
+        // Exit immediately if shutdown was detected
+        if (shutdown_detected) {
             break;
         }
+        
+        // Process other events only if not shutting down
         for (int i = 0; i < nfds; i++) {
+            // Skip shutdown pipe events (already processed above)
+            if (events[i].data.fd == shutdown_pipe[0]) {
+                continue;
+            }
+            
             snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Event %d: data.fd=%d, shutdown_pipe[0]=%d\n", i, events[i].data.fd, shutdown_pipe[0]);
             FILE_LOG(log_message);
-            
             
             if (events[i].data.fd == server_socket) {
                 // New connection
@@ -2001,7 +2108,6 @@ int main(int argc, char *argv[]) {
                 }
                 
                 // Check if we've reached the maximum number of clients
-                pthread_mutex_lock(&clients_mutex);
                 int max_clients = get_max_users();
                 if (client_count >= max_clients) {
                     snprintf(log_message, sizeof(log_message), "[WARN][MAIN_THREAD] Maximum clients (%d) reached, rejecting connection from %s:%d\n", 
@@ -2009,10 +2115,8 @@ int main(int argc, char *argv[]) {
                     FILE_LOG(log_message);
                     send(client_socket, "Server is full, please try again later\n", 38, 0);
                     close(client_socket);
-                    pthread_mutex_unlock(&clients_mutex);
                     continue;
                 }
-                pthread_mutex_unlock(&clients_mutex);
                 
                 snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] New connection from %s:%d (socket=%d)\n", 
                        inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), client_socket);
@@ -2038,8 +2142,8 @@ int main(int argc, char *argv[]) {
                 
                 int setup_result = setup_initial_connection(client_socket);
                 if(setup_result != 0){
-                    remove_client(client_socket);
-                    close(client_socket);
+                    // setup_initial_connection already handles cleanup on failure
+                    // Don't call remove_client or close again - socket is already closed
                     continue;
                 }
                 if (setup_result == 0) {
