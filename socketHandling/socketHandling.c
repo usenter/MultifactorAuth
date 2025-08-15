@@ -94,6 +94,15 @@ client_t* find_client_by_socket(int client_socket) {
     pthread_mutex_unlock(&clients_mutex);
     return c;
 }
+// SIGPIPE handler to gracefully handle broken pipes
+void sigpipe_handler(int sig) {
+    (void)sig;
+    char log_message[BUFFER_SIZE];
+    snprintf(log_message, sizeof(log_message), "[WARN][SIGNAL] Received SIGPIPE (broken pipe)\n");
+    FILE_LOG(log_message);
+}
+
+
 
 // Function to get client status by account ID
 char* get_client_status_by_account_id(unsigned int account_id) {

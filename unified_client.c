@@ -12,6 +12,11 @@
 #include <openssl/err.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+#include <errno.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <netinet/tcp.h>
+#include <sys/utsname.h>
 #define PORT 12345
 #define BUFFER_SIZE 1024
 #define MAX_MESSAGES 100
@@ -30,6 +35,8 @@ int password_authenticated = 0;
 int rsa_completed = 0;
 int email_authenticated = 0;
 int locked = 0;
+static char g_username[MAX_USERNAME_LEN] = "";
+static char g_last_shutdown_reason[128] = "normal";
 
 
 // RSA keys for automatic authentication
@@ -77,6 +84,114 @@ int get_stored_messages(char messages[][BUFFER_SIZE], int max_count) {
     }
     pthread_mutex_unlock(&message_mutex);
     return count;
+}
+
+// Ensure logs directory exists
+static void ensure_logs_dir(void) {
+    struct stat st;
+    if (stat("logs", &st) == -1) {
+        mkdir("logs", 0755);
+    }
+}
+
+// Helper to append a shell command's output into a report
+static void append_shell_section(FILE* fp, const char* title, const char* cmd) {
+    if (!fp || !cmd) return;
+    fprintf(fp, "\n[%s]\n$ %s\n", title ? title : "CMD", cmd);
+    fflush(fp);
+    FILE* pp = popen(cmd, "r");
+    if (!pp) {
+        fprintf(fp, "(failed to run)\n");
+        return;
+    }
+    char line[512];
+    int lines = 0;
+    while (fgets(line, sizeof(line), pp) && lines < 2000) { // cap to prevent huge logs
+        fputs(line, fp);
+        lines++;
+    }
+    pclose(pp);
+}
+
+// Generate a client-side debug report
+static void generate_client_debug_report(const char* reason, int client_socket, int last_errno) {
+    ensure_logs_dir();
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_now);
+
+    char filename[256];
+    snprintf(filename, sizeof(filename), "logs/ClientDebug_%s_%s_%d.log",
+             (g_username[0] ? g_username : "unknown"), ts, getpid());
+
+    FILE* fp = fopen(filename, "w");
+    if (!fp) return;
+
+    fprintf(fp, "CLIENT DEBUG REPORT\n");
+    fprintf(fp, "Timestamp: %s\n", ts);
+    fprintf(fp, "Program: %s\n", PROGRAM_NAME);
+    fprintf(fp, "PID: %d\n", getpid());
+    fprintf(fp, "Username: %s\n", (g_username[0] ? g_username : "unknown"));
+    fprintf(fp, "Reason: %s\n", reason ? reason : "unspecified");
+
+    // System info
+    struct utsname uts; if (uname(&uts) == 0) {
+        fprintf(fp, "System: %s %s %s %s %s\n", uts.sysname, uts.nodename, uts.release, uts.version, uts.machine);
+    }
+
+    // Auth state
+    fprintf(fp, "AuthState: password=%d rsa=%d email=%d locked=%d\n",
+            password_authenticated, rsa_completed, email_authenticated, locked);
+
+    // Socket info
+    if (client_socket >= 0) {
+        struct sockaddr_in peer; socklen_t plen = sizeof(peer);
+        char ip[INET_ADDRSTRLEN] = "UNKNOWN"; int port = -1;
+        if (getpeername(client_socket, (struct sockaddr*)&peer, &plen) == 0) {
+            inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+            port = ntohs(peer.sin_port);
+        }
+        int soerr = 0; socklen_t slen = sizeof(soerr);
+        getsockopt(client_socket, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+        fprintf(fp, "Socket: fd=%d peer=%s:%d last_errno=%d(%s) SO_ERROR=%d(%s)\n",
+                client_socket, ip, port, last_errno, strerror(last_errno), soerr, strerror(soerr));
+
+        struct tcp_info tcpi; socklen_t tlen = sizeof(tcpi);
+        if (getsockopt(client_socket, IPPROTO_TCP, TCP_INFO, &tcpi, &tlen) == 0) {
+            fprintf(fp, "TCP_INFO: state=%u rtt=%u rttvar=%u snd_cwnd=%u retrans=%u unacked=%u\n",
+                    tcpi.tcpi_state, tcpi.tcpi_rtt, tcpi.tcpi_rttvar,
+                    tcpi.tcpi_snd_cwnd, tcpi.tcpi_retransmits, tcpi.tcpi_unacked);
+        }
+    }
+
+    // Recent messages
+    fprintf(fp, "\nRecentMessages:\n");
+    char msgs[MAX_MESSAGES][BUFFER_SIZE];
+    int cnt = get_stored_messages(msgs, MAX_MESSAGES);
+    int start = (cnt > 20) ? (cnt - 20) : 0; // last 20
+    for (int i = start; i < cnt; i++) {
+        fprintf(fp, "- %s\n", msgs[i]);
+    }
+
+    // Local shell diagnostics (best-effort; may be unavailable)
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "ss -tanpi | grep ':%d ' || ss -tanpi | head -n 100", PORT);
+    append_shell_section(fp, "ss_port", cmd);
+    snprintf(cmd, sizeof(cmd), "netstat -anp 2>/dev/null | grep ':%d' | head -n 100", PORT);
+    append_shell_section(fp, "netstat_port", cmd);
+    append_shell_section(fp, "ss_summary", "ss -s");
+    append_shell_section(fp, "route", "ip route show");
+    append_shell_section(fp, "ifconfig", "ip -br addr");
+    // If running as root, include iptables snapshot and a small RST sniff
+    if (geteuid() == 0) {
+        append_shell_section(fp, "iptables_connlimit", "iptables -L INPUT -v -n --line-numbers | grep -E 'REJECT|SYN_FLOOD|connlimit' || true");
+        snprintf(cmd, sizeof(cmd), "timeout 1 tcpdump -Q inout -ni any -vv -c 10 'tcp port %d and tcp[tcpflags] & tcp-rst != 0' 2>&1", PORT);
+        append_shell_section(fp, "tcpdump_rst_1s", cmd);
+    }
+
+    fclose(fp);
 }
 
 // RSA Authentication Functions
@@ -282,7 +397,11 @@ void* receive_messages(void* arg) {
     while (running) {
         int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
         if (bytes_received <= 0) {
+            int last_errno = errno;
+            snprintf(g_last_shutdown_reason, sizeof(g_last_shutdown_reason),
+                     "recv_failed bytes=%d errno=%d:%s", bytes_received, last_errno, strerror(last_errno));
             printf("\nServer disconnected or recv error (bytes_received=%d)\n", bytes_received);
+            generate_client_debug_report(g_last_shutdown_reason, client_socket, last_errno);
             running = 0;
             break;
         }
@@ -293,6 +412,8 @@ void* receive_messages(void* arg) {
         MessageResult result = process_server_message(client_socket, buffer);
         
         if (result == MSG_EXIT) {
+            snprintf(g_last_shutdown_reason, sizeof(g_last_shutdown_reason), "auth_or_rsa_exit");
+            generate_client_debug_report(g_last_shutdown_reason, client_socket, 0);
             break;
         }
         
@@ -539,6 +660,10 @@ int client_mode(int client_socket, const char* username) {
     email_authenticated = 0;
     locked = 0;
 
+    if (username) {
+        strncpy(g_username, username, sizeof(g_username) - 1);
+        g_username[sizeof(g_username) - 1] = '\0';
+    }
     printf("Connected to secure MultiFactor Authentication chat server! Beginning RSA challenge-response authentication...\n");
     //printf("Starting RSA challenge-response authentication...\n");
 
@@ -617,6 +742,8 @@ int client_mode(int client_socket, const char* username) {
     // Now start the receive thread for chat and further messages
     if (pthread_create(&receive_thread, NULL, receive_messages, &client_socket) != 0) {
         printf("Failed to create receive thread\n");
+        snprintf(g_last_shutdown_reason, sizeof(g_last_shutdown_reason), "pthread_create_failed");
+        generate_client_debug_report(g_last_shutdown_reason, client_socket, errno);
         return 0;
     }
     //printf("[CLIENT_DEBUG] started receive thread\n");
@@ -690,6 +817,10 @@ int client_mode(int client_socket, const char* username) {
     pthread_join(receive_thread, NULL);
     printf("Disconnected from chat server\n");
     cleanup_client_resources(client_socket);
+    if (g_last_shutdown_reason[0] == '\0') {
+        snprintf(g_last_shutdown_reason, sizeof(g_last_shutdown_reason), "normal");
+    }
+    generate_client_debug_report(g_last_shutdown_reason, client_socket, 0);
     return 1; // cleaned up and returned successfully
 }
 
@@ -769,6 +900,11 @@ int main(int argc, char *argv[]) {
         printf("  %s --no-rsa alice           # Skip RSA key generation (for RSA-disabled servers)\n", argv[0]);
         return 1;
     }
+    // Capture for debug report filename
+    if (username) {
+        strncpy(g_username, username, sizeof(g_username) - 1);
+        g_username[sizeof(g_username) - 1] = '\0';
+    }
     
     // Set global client_id for use in RSA functions
     strncpy(client_id, username, sizeof(client_id) - 1);
@@ -822,21 +958,41 @@ int main(int argc, char *argv[]) {
         printf("Connecting to server... (RSA disabled)\n");
     }
     
-    // Connect to server
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("Socket creation failed");
-        return 1;
-    }
+    // Connect to server with retry logic
+    int sock = -1;
+    int connect_retries = 0;
+    const int max_connect_retries = 3;
+    const int connect_retry_delay = 1; // seconds
     
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
-    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    
-    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        printf("Connection failed\n");
-        return 1;
+    while (connect_retries < max_connect_retries) {
+        sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            perror("Socket creation failed");
+            return 1;
+        }
+        
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(PORT);
+        server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+        
+        if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            printf("Connection attempt %d/%d failed: %s\n", connect_retries + 1, max_connect_retries, strerror(errno));
+            close(sock);
+            sock = -1;
+            
+            connect_retries++;
+            if (connect_retries < max_connect_retries) {
+                printf("Retrying connection in %d second(s)...\n", connect_retry_delay);
+                sleep(connect_retry_delay);
+            } else {
+                printf("All connection attempts failed. Giving up.\n");
+                return 1;
+            }
+        } else {
+            printf("Connection successful on attempt %d/%d\n", connect_retries + 1, max_connect_retries);
+            break;
+        }
     }
     //printf("Connected to server. Sending certificate...\n");
     
@@ -846,11 +1002,10 @@ int main(int argc, char *argv[]) {
         recv(sock, clear_buf, sizeof(clear_buf), 0);
     }
     
-    // Send certificate (or placeholder) as first message
-    char cert_buf[8192];
-    size_t cert_len = 0;
-    
     if (!skip_rsa) {
+        char cert_buf[8192];
+        size_t cert_len = 0;
+        
         // Send real certificate
         char cert_file[MAX_FILE_PATH_LEN];
         snprintf(cert_file, sizeof(cert_file), "RSAkeys/client_%s_cert.pem", username);
@@ -864,35 +1019,81 @@ int main(int argc, char *argv[]) {
         cert_len = fread(cert_buf, 1, sizeof(cert_buf) - 1, cert_fp);
         fclose(cert_fp);
         cert_buf[cert_len] = '\0';
-    } else {
-        // Send placeholder certificate
-        strcpy(cert_buf, "NO_RSA_CERTIFICATE");
-        cert_len = strlen(cert_buf);
+        
+        // Send certificate length first (as 4-byte int, network order) with retry logic
+        uint32_t net_cert_len = htonl(cert_len);
+        int cert_retries = 0;
+        const int max_cert_retries = 3;
+        const int cert_retry_delay = 1; // seconds
+        
+        while (cert_retries < max_cert_retries) {
+            if (send(sock, &net_cert_len, sizeof(net_cert_len), 0) != sizeof(net_cert_len)) {
+                printf("ERROR: Failed to send certificate length (attempt %d/%d): %s\n", 
+                       cert_retries + 1, max_cert_retries, strerror(errno));
+                
+                cert_retries++;
+                if (cert_retries < max_cert_retries) {
+                    printf("Retrying certificate length send in %d second(s)...\n", cert_retry_delay);
+                    sleep(cert_retry_delay);
+                } else {
+                    printf("All certificate length send attempts failed. Giving up.\n");
+                    close(sock);
+                    return 1;
+                }
+            } else {
+                break;
+            }
+        }
+        
+        // Send certificate data with retry logic
+        cert_retries = 0;
+        ssize_t sent_bytes = 0;
+        
+        while (cert_retries < max_cert_retries) {
+            sent_bytes = send(sock, cert_buf, cert_len, 0);
+            if (sent_bytes != (ssize_t)cert_len) {
+                printf("ERROR: Failed to send certificate data (attempt %d/%d): Sent %zd of %zu bytes: %s\n", 
+                       cert_retries + 1, max_cert_retries, sent_bytes, cert_len, strerror(errno));
+                
+                cert_retries++;
+                if (cert_retries < max_cert_retries) {
+                    printf("Retrying certificate data send in %d second(s)...\n", cert_retry_delay);
+                    sleep(cert_retry_delay);
+                } else {
+                    printf("All certificate data send attempts failed. Giving up.\n");
+                    close(sock);
+                    return 1;
+                }
+            } else {
+                break;
+            }
+        }
     }
     
-    // Send certificate length first (as 4-byte int, network order)
-    uint32_t net_cert_len = htonl(cert_len);
-    if (send(sock, &net_cert_len, sizeof(net_cert_len), 0) != sizeof(net_cert_len)) {
-        printf("ERROR: Failed to send certificate length.\n");
-        close(sock);
-        return 1;
-    }
-    
-    // Send certificate data
-    ssize_t sent_bytes = send(sock, cert_buf, cert_len, 0);
-    if (sent_bytes != (ssize_t)cert_len) {
-        printf("ERROR: Failed to send certificate data. Sent %zd of %zu bytes\n", sent_bytes, cert_len);
-        close(sock);
-        return 1;
-    }
-    //printf("Certificate sent to server. Starting authentication...\n");
-    // Send username after certificate
+    // Send username after certificate with retry logic
     char id_msg[BUFFER_SIZE];
     snprintf(id_msg, sizeof(id_msg), "USERNAME:%s\n", username);
-    if (send(sock, id_msg, strlen(id_msg), 0) < 0) {
-        perror("Failed to send username");
-        close(sock);
-        return 1;
+    int user_retries = 0;
+    const int max_user_retries = 3;
+    const int user_retry_delay = 1; // seconds
+
+    while (user_retries < max_user_retries) {
+        if (send(sock, id_msg, strlen(id_msg), 0) < 0) {
+            printf("ERROR: Failed to send username (attempt %d/%d): %s\n", 
+                   user_retries + 1, max_user_retries, strerror(errno));
+            
+            user_retries++;
+            if (user_retries < max_user_retries) {
+                printf("Retrying username send in %d second(s)...\n", user_retry_delay);
+                sleep(user_retry_delay);
+            } else {
+                printf("All username send attempts failed. Giving up.\n");
+                close(sock);
+                return 1;
+            }
+        } else {
+            break;
+        }
     }
     // Run secure chat client
     if(client_mode(sock, username)){

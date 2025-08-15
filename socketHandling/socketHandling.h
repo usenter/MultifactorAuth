@@ -77,3 +77,6 @@ socket_info_t* get_socket_info(int socket);
 
 char* get_client_status_by_account_id(unsigned int account_id);
 char* get_client_status_by_username(const char *username);
+
+// Signal handler for broken pipes
+void sigpipe_handler(int sig);

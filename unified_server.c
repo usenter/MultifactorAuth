@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,13 +12,36 @@
 #include <pthread.h>
 #include <sys/epoll.h>
 #include <fcntl.h>
-#include "auth_system.h"
-#include "hashmap/uthash.h"
+#include <netinet/tcp.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+#include "auth_system.h"
+#include "hashmap/uthash.h"
 #include "fileOperationTools/fileOperations.h" // File mode operations
 #include "configTools/serverConfig.h"
 #include "REST_tools/serverRest.h"
+#include "IPTableFunctions/IPtableFunctions.h"
+
+// Function to check client connection health
+int check_client_health(int socket) {
+    // Check if socket is still valid   
+    if (fcntl(socket, F_GETFD) == -1) {
+        return 0; // Socket is invalid
+    }
+    
+    // Try to get socket error status
+    int error = 0;
+    socklen_t len = sizeof(error);
+    if (getsockopt(socket, SOL_SOCKET, SO_ERROR, &error, &len) == -1) {
+        return 0; // Socket error
+    }
+    
+    if (error != 0) {
+        return 0; // Socket has error
+    }
+    
+    return 1; // Socket is healthy
+}
 
 // Optional: Apply basic iptables mitigation at server start and remove at shutdown
 #include <sys/types.h>
@@ -30,139 +52,8 @@
 static volatile sig_atomic_t shutdown_flag = 0;
 static int shutdown_pipe[2] = { -1, -1 }; // [0]=read, [1]=write
 
-// Tunables
-    // Tuneable iptables parameters; you can adjust for lower aggressiveness if seeing ECONNRESET (104)
-    const char *syn_rate = "1000/second";   // Increased from 500/second
-    const int syn_burst = 200;              // Increased from 100
-    const int per_ip_limit = 500;           // Increased from 200
 
 
-static int run_shell_command(const char *cmd) {
-    char log_message[BUFFER_SIZE];
-    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Running shell command: %s\n", cmd);
-    FILE_LOG(log_message);
-    int rc = system(cmd);
-    if (rc == -1) {
-        FILE_LOG("[ERROR][MAIN_THREAD] system() returned -1\n");
-        return -1;
-    }
-    if (WIFEXITED(rc)) {
-        int status = WEXITSTATUS(rc);
-        snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Command exit status: %d\n", status);
-        FILE_LOG(log_message);
-        return status;
-    }
-    FILE_LOG("[ERROR][MAIN_THREAD] Command did not exit normally\n");
-    return -1;
-}
-
-// Remove ALL iptables rules relevant to a specific service port to avoid stacking
-static void clear_iptables_rules_for_port(int service_port) {
-    if (geteuid() != 0) return;
-    char log_message[BUFFER_SIZE];
-    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Clearing existing iptables rules for tcp/%d (avoid stacking)\n", service_port);
-    FILE_LOG(log_message);
-
-    char cmd[512];
-    
-    // Remove ALL connlimit rules for this port by numeric index (descending) - IMPROVED
-    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Removing connlimit rules for port %d\n", service_port);
-    FILE_LOG(log_message);
-    snprintf(cmd, sizeof(cmd),
-             "bash -c \"for n in \\$(iptables -L INPUT -n --line-numbers | awk '/REJECT.*tcp.*dpt:%d.*conn.*src/ {print \\$1}' | sort -nr); do [ -n \\\"\\$n\\\" ] && echo \\\"Removing rule \\$n\\\" && iptables -w 2 -D INPUT \\$n; done\"",
-             service_port);
-    run_shell_command(cmd);
-    
-    // Also try removing by exact pattern matching for any remaining rules
-    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Attempting pattern-based connlimit removal for port %d\n", service_port);
-    FILE_LOG(log_message);
-    for (int limit = 50; limit <= 1000; limit += 50) {
-        snprintf(cmd, sizeof(cmd),
-                 "iptables -w 2 -D INPUT -p tcp --dport %d -m connlimit --connlimit-above %d --connlimit-mask 32 -j REJECT --reject-with tcp-reset 2>/dev/null || true",
-                 service_port, limit);
-        run_shell_command(cmd);
-    }
-
-    // Detach all INPUT hooks to SYN_FLOOD for this port (repeat until none)
-    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Removing SYN_FLOOD hooks for port %d\n", service_port);
-    FILE_LOG(log_message);
-    snprintf(cmd, sizeof(cmd),
-             "bash -lc 'while iptables -w 2 -C INPUT -p tcp --syn --dport %d -j SYN_FLOOD 2>/dev/null; do iptables -w 2 -D INPUT -p tcp --syn --dport %d -j SYN_FLOOD; done'",
-             service_port, service_port);
-    run_shell_command(cmd);
-
-    // Flush and delete custom chain if present
-    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Cleaning up SYN_FLOOD chain\n");
-    FILE_LOG(log_message);
-    run_shell_command("iptables -w 2 -F SYN_FLOOD 2>/dev/null || true");
-    run_shell_command("iptables -w 2 -X SYN_FLOOD 2>/dev/null || true");
-
-    // Verify cleanup by listing remaining rules for this port
-    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Verifying cleanup - checking for remaining rules on port %d\n", service_port);
-    FILE_LOG(log_message);
-    snprintf(cmd, sizeof(cmd), "iptables -L INPUT -n --line-numbers | grep -E \"dpt:%d|SYN_FLOOD\" || echo \"No remaining rules found for port %d\"", service_port, service_port);
-    run_shell_command(cmd);
-    
-    FILE_LOG("[INFO][MAIN_THREAD] iptables rules cleared for service port\n");
-}
-
-
-
-static int apply_iptables_protection(int service_port) {
-    char log_message[BUFFER_SIZE];
-    if (geteuid() != 0) {
-        snprintf(log_message, sizeof(log_message), "[WARN][MAIN_THREAD] Skipping iptables mitigation: server not running as root\n");
-        FILE_LOG(log_message);
-        return 0;
-    }
-
-    // Always begin from a clean state to avoid stacking rules
-    clear_iptables_rules_for_port(service_port);
-
-    
-    // Kernel hardening
-    run_shell_command("sysctl -w net.ipv4.tcp_syncookies=1 >/dev/null 2>&1");
-    run_shell_command("sysctl -w net.ipv4.tcp_max_syn_backlog=4096 >/dev/null 2>&1");
-    run_shell_command("sysctl -w net.ipv4.tcp_synack_retries=3 >/dev/null 2>&1");
-
-    char cmd[512];
-    // Create/flush chain (fail fast if xtables lock is held)
-    run_shell_command("iptables -w 2 -N SYN_FLOOD 2>/dev/null || true");
-    run_shell_command("iptables -w 2 -F SYN_FLOOD >/dev/null 2>&1");
-
-    // Add hashlimit RETURN and then DROP
-    snprintf(cmd, sizeof(cmd),
-             "iptables -w 2 -A SYN_FLOOD -m hashlimit --hashlimit-name syn_%d --hashlimit-mode srcip --hashlimit-upto %s --hashlimit-burst %d -j RETURN",
-             service_port, syn_rate, syn_burst);
-    run_shell_command(cmd);
-    run_shell_command("iptables -w 2 -A SYN_FLOOD -j DROP");
-
-    // Hook for SYN packets to this port
-    snprintf(cmd, sizeof(cmd),
-             "iptables -w 2 -C INPUT -p tcp --syn --dport %d -j SYN_FLOOD 2>/dev/null || iptables -w 2 -A INPUT -p tcp --syn --dport %d -j SYN_FLOOD",
-             service_port, service_port);
-    run_shell_command(cmd);
-
-    // Per-IP concurrent connection limit
-    snprintf(cmd, sizeof(cmd),
-             "iptables -w 2 -C INPUT -p tcp --dport %d -m connlimit --connlimit-above %d --connlimit-mask 32 -j REJECT --reject-with tcp-reset 2>/dev/null || iptables -w 2 -A INPUT -p tcp --dport %d -m connlimit --connlimit-above %d --connlimit-mask 32 -j REJECT --reject-with tcp-reset",
-             service_port, per_ip_limit, service_port, per_ip_limit);
-    run_shell_command(cmd);
-
-    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] iptables mitigation applied for tcp/%d\n", service_port);
-    FILE_LOG(log_message);
-    return 0;
-}
-
-static void remove_iptables_protection(int service_port) {
-    if (geteuid() != 0) return;
-    char log_message[BUFFER_SIZE];
-    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Removing iptables mitigation for tcp/%d\n", service_port);
-    FILE_LOG(log_message);
-    clear_iptables_rules_for_port(service_port);
-    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] iptables mitigation removal complete for tcp/%d\n", service_port);
-    FILE_LOG(log_message);
-}
 
 
 int setup_initial_connection(int client_socket);
@@ -219,23 +110,71 @@ void broadcast_message(const char* message, int sender_socket, int overrideBroad
     strncat(message_with_newline, "\n", 1);
     snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD] Broadcasting message: %s", message_with_newline);
     FILE_LOG(log_message);
+    
+    pthread_mutex_lock(&clients_mutex);
     client_t *c, *tmp;
     HASH_ITER(hh, clients_map, c, tmp) {
         if ((c->active && c->socket != sender_socket) && 
             (c->mode == CLIENT_MODE_CHAT || overrideBroadcast)) {
             
             // Send with error checking but don't hold mutex during send
-            int client_socket = c->socket;
-            
-            if (send(client_socket, message_with_newline, strlen(message_with_newline), 0) < 0) {
-                snprintf(log_message, sizeof(log_message), "[WARN][MAIN_THREAD] Failed to send to socket %d: errno=%d (%s)\n", client_socket, errno, strerror(errno));
-                FILE_LOG(log_message);
-                // We already have the client pointer 'c' and clients_mutex is locked
-                c->active = 0;
-            }
+            			// Send with error checking but don't hold mutex during send
+			int client_socket = c->socket;
+			size_t mlen = strlen(message_with_newline);
+			ssize_t sent = send(client_socket, message_with_newline, mlen, 0);
+			if (sent < 0) {
+				int send_errno = errno;
+				struct sockaddr_in peer; socklen_t plen = sizeof(peer);
+				char ip[INET_ADDRSTRLEN] = "UNKNOWN"; int port = -1;
+				if (getpeername(client_socket, (struct sockaddr*)&peer, &plen) == 0) {
+					inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+					port = ntohs(peer.sin_port);
+				}
+				int soerr = 0; socklen_t slen = sizeof(soerr);
+				getsockopt(client_socket, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+				struct tcp_info tcpi; 
+                socklen_t tlen = sizeof(tcpi);
+				int have_tcpi = (getsockopt(client_socket, IPPROTO_TCP, TCP_INFO, &tcpi, &tlen) == 0);
+
+				// If the non-blocking socket would block, do NOT mark inactive; skip and try later
+				if (send_errno == EAGAIN || send_errno == EWOULDBLOCK) {
+					const char *mode_str = (c->mode == CLIENT_MODE_CHAT) ? "chat" : "file";
+					snprintf(log_message, sizeof(log_message),
+						"[DEBUG][BROADCAST][ID:%u user:%s nick:%s mode:%s] send would block on socket %d peer=%s:%d; skipping for now (errno=%d:%s)\n",
+						c->account_id, c->username, c->nickname, mode_str,
+						client_socket, ip, port, send_errno, strerror(send_errno));
+					FILE_LOG(log_message);
+				} else {
+					const char *mode_str = (c->mode == CLIENT_MODE_CHAT) ? "chat" : "file";
+					snprintf(log_message, sizeof(log_message),
+						"[WARN][BROADCAST][ID:%u user:%s nick:%s mode:%s] send to socket %d peer=%s:%d failed: errno=%d(%s) SO_ERROR=%d(%s)%s%s\n",
+						c->account_id, c->username, c->nickname, mode_str,
+						client_socket, ip, port, send_errno, strerror(send_errno), soerr, strerror(soerr),
+						have_tcpi ? " TCP_STATE=" : "", have_tcpi ? "" : "");
+					FILE_LOG(log_message);
+					if (have_tcpi) {
+						snprintf(log_message, sizeof(log_message),
+							"[WARN][BROADCAST][ID:%u] tcp_info: state=%u rtt=%u rttvar=%u snd_cwnd=%u retrans=%u unacked=%u\n",
+							c->account_id,
+							tcpi.tcpi_state, tcpi.tcpi_rtt, tcpi.tcpi_rttvar,
+							tcpi.tcpi_snd_cwnd, tcpi.tcpi_retransmits, tcpi.tcpi_unacked);
+						FILE_LOG(log_message);
+					}
+					// Only mark inactive for real errors
+					c->active = 0;
+				}
+			} else if ((size_t)sent < mlen) {
+				const char *mode_str = (c->mode == CLIENT_MODE_CHAT) ? "chat" : "file";
+				snprintf(log_message, sizeof(log_message),
+					"[WARN][BROADCAST][ID:%u user:%s nick:%s mode:%s] partial send to socket %d: sent=%zd of %zu bytes\n",
+					c->account_id, c->username, c->nickname, mode_str,
+					client_socket, sent, mlen);
+				FILE_LOG(log_message);
+			}
             
         }
     }
+    pthread_mutex_unlock(&clients_mutex);
     free(message_with_newline);
 }
 void remove_client(int client_socket) {
@@ -243,17 +182,19 @@ void remove_client(int client_socket) {
     snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Starting cleanup for socket %d\n", client_socket);
     FILE_LOG(log_message);
     
-  
-    
     client_t *c = NULL;
+    
+    // Acquire mutex first to prevent race conditions
+    pthread_mutex_lock(&clients_mutex);
     HASH_FIND_INT(clients_map, &client_socket, c);
     if (!c) {
+        pthread_mutex_unlock(&clients_mutex);
         snprintf(log_message, sizeof(log_message), "[WARN][CLEANUP] No client found for socket %d\n", client_socket);
         FILE_LOG(log_message);
         return; // Client not found
     }
     
-    // Mark as inactive first to prevent further operations
+    // Mark as inactive while holding mutex to prevent race conditions
     c->active = 0;
     
     // Copy necessary data for logging and broadcasting
@@ -266,13 +207,11 @@ void remove_client(int client_socket) {
     strncpy(nickname_copy, c->nickname, sizeof(nickname_copy) - 1);
     nickname_copy[sizeof(nickname_copy) - 1] = '\0';
     
-    // Remove from hash table while holding mutex
-    pthread_mutex_lock(&clients_mutex);
+    // Remove from hash table while still holding mutex
     HASH_DEL(clients_map, c);
     client_count--;
     pthread_mutex_unlock(&clients_mutex);
 
-    
     snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] User '%s' (%s) left the chat (Total clients: %d)\n", 
            username_copy, nickname_copy, client_count);
     FILE_LOG(log_message);
@@ -280,9 +219,20 @@ void remove_client(int client_socket) {
     // Remove from socket tracking
     remove_socket_info(client_socket);
     
-    // Remove from epoll (both auth and command threads)
-    epoll_ctl(auth_thread_ctx.epoll_fd, EPOLL_CTL_DEL, client_socket, NULL);
-    epoll_ctl(cmd_thread_ctx.epoll_fd, EPOLL_CTL_DEL, client_socket, NULL);
+    // Remove from epoll with proper error handling
+    int epoll_result = epoll_ctl(auth_thread_ctx.epoll_fd, EPOLL_CTL_DEL, client_socket, NULL);
+    if (epoll_result < 0 && errno != ENOENT) {
+        snprintf(log_message, sizeof(log_message), "[WARN][CLEANUP] Failed to remove socket %d from auth epoll: %s\n", 
+                client_socket, strerror(errno));
+        FILE_LOG(log_message);
+    }
+    
+    epoll_result = epoll_ctl(cmd_thread_ctx.epoll_fd, EPOLL_CTL_DEL, client_socket, NULL);
+    if (epoll_result < 0 && errno != ENOENT) {
+        snprintf(log_message, sizeof(log_message), "[WARN][CLEANUP] Failed to remove socket %d from cmd epoll: %s\n", 
+                client_socket, strerror(errno));
+        FILE_LOG(log_message);
+    }
     
     // Close socket outside of mutex
     close(client_socket);
@@ -342,7 +292,8 @@ void get_client_list(char* list_buffer, size_t buffer_size) {
     snprintf(list_buffer, buffer_size, "Connected users (%d): ", client_count);
     int first = 1;
     client_t *c, *tmp;
-    
+    pthread_mutex_lock(&clients_mutex);
+
     HASH_ITER(hh, clients_map, c, tmp) {
         if (c->active) {
             if (!first) {
@@ -352,6 +303,7 @@ void get_client_list(char* list_buffer, size_t buffer_size) {
             first = 0;
         }
     }
+    pthread_mutex_unlock(&clients_mutex);
     strncat(list_buffer, "\n", buffer_size - strlen(list_buffer) - 1);
 }
 
@@ -360,7 +312,13 @@ void promote_to_authenticated(int socket, unsigned int account_id) {
     char log_message[BUFFER_SIZE];
     snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE][ID:%d] Starting promotion for socket %d\n", account_id, socket);
     FILE_LOG(log_message);
+    // Get accurate client count to avoid race conditions
+    pthread_mutex_lock(&clients_mutex);
+    int current_count = client_count;
+    pthread_mutex_unlock(&clients_mutex);
+    
     printf("Added authenticated client %d to chat\n", account_id);
+    printf("total clients: %d\n", current_count);
     // Create client structure
     client_t *new_client = malloc(sizeof(client_t));
     if (!new_client) {
@@ -420,8 +378,8 @@ void promote_to_authenticated(int socket, unsigned int account_id) {
     
     // Add to command thread epoll
     struct epoll_event event;
-    event.events = EPOLLIN | EPOLLET;
     event.data.fd = socket;
+    event.events = EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLHUP | EPOLLERR;
     snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE][ID:%d] Adding socket %d to command thread epoll\n", account_id, socket);
     FILE_LOG(log_message);
     if (epoll_ctl(cmd_thread_ctx.epoll_fd, EPOLL_CTL_ADD, socket, &event) == -1) {
@@ -432,9 +390,32 @@ void promote_to_authenticated(int socket, unsigned int account_id) {
     }
     snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE][ID:%d] Successfully added socket %d to command thread epoll\n", account_id, socket);
     FILE_LOG(log_message);
+    
+    // Validate socket is still valid after epoll addition
+    if (fcntl(socket, F_GETFD) == -1) {
+        snprintf(log_message, sizeof(log_message), "[ERROR][PROMOTE][ID:%d] Socket %d became invalid after epoll addition\n", account_id, socket);
+        FILE_LOG(log_message);
+        remove_client(socket);
+        return;
+    }
+    
     char response[BUFFER_SIZE];
     snprintf(response, sizeof(response), "AUTH_SUCCESS You are now fully authenticated.\n");
-    send(socket, response, strlen(response), 0);
+    
+    // Send with error checking
+    ssize_t sent = send(socket, response, strlen(response), 0);
+    if (sent < 0) {
+        snprintf(log_message, sizeof(log_message), "[ERROR][PROMOTE][ID:%d] Failed to send AUTH_SUCCESS to socket %d: %s\n", 
+                 account_id, socket, strerror(errno));
+        FILE_LOG(log_message);
+        remove_client(socket);
+        return;
+    } else if (sent != (ssize_t)strlen(response)) {
+        snprintf(log_message, sizeof(log_message), "[WARN][PROMOTE][ID:%d] Partial send to socket %d: %zd of %zu bytes\n", 
+                 account_id, socket, sent, strlen(response));
+        FILE_LOG(log_message);
+    }
+    
     snprintf(log_message, sizeof(log_message), "[DEBUG][PROMOTE][ID:%d] SENDING to socket %d: '%s'\n", account_id, socket, response);
     FILE_LOG(log_message);
     snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE][ID:%d] Socket %d is fully authenticated\n", account_id, socket);
@@ -630,14 +611,47 @@ void* auth_thread_func(void *arg) {
             int client_socket = events[i].data.fd;
             socket_info_t *info = get_socket_info(client_socket);
             if (!info) continue;
+    
+            // NEW: handle hangup/error events up-front
+            uint32_t ev = events[i].events;
+            if (ev & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+                char log_message[BUFFER_SIZE];
+                struct sockaddr_in peer; socklen_t plen = sizeof(peer);
+                char ip[INET_ADDRSTRLEN] = "UNKNOWN"; int port = -1;
+                if (getpeername(client_socket, (struct sockaddr*)&peer, &plen) == 0) {
+                    inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+                    port = ntohs(peer.sin_port);
+                }
+                int soerr = 0; socklen_t slen = sizeof(soerr);
+                getsockopt(client_socket, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+                snprintf(log_message, sizeof(log_message),
+                    "[ERROR][AUTH_THREAD][ID:%d] Socket %d event(s):%s%s%s peer=%s:%d SO_ERROR=%d:%s\n",
+                    info->account_id, client_socket,
+                    (ev & EPOLLRDHUP) ? " RDHUP" : "",
+                    (ev & EPOLLHUP) ? " HUP" : "",
+                    (ev & EPOLLERR) ? " ERR" : "",
+                    ip, port, soerr, strerror(soerr));
+                FILE_LOG(log_message);
+                remove_socket_info(client_socket);
+                remove_client(client_socket);
+                continue;
+            }
             
             ssize_t bytes_read = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
             if (bytes_read <= 0) {
                 if (bytes_read == 0) {
                     snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Socket %d closed by peer (orderly shutdown)\n", info->account_id, client_socket);
                 } else {
-                    snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD][ID:%d] Socket %d recv error (bytes_read=%zd, errno=%d:%s)\n", info->account_id, client_socket, bytes_read, errno, strerror(errno));
-                }
+                    struct sockaddr_in peer; socklen_t plen = sizeof(peer);
+                    char ip[INET_ADDRSTRLEN] = "UNKNOWN"; int port = -1;
+                    if (getpeername(client_socket, (struct sockaddr*)&peer, &plen) == 0) {
+                        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip)); port = ntohs(peer.sin_port);
+                    }
+                    int soerr = 0; socklen_t slen = sizeof(soerr);
+                    getsockopt(client_socket, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+                    snprintf(log_message, sizeof(log_message),
+                    "[ERROR][AUTH_THREAD][ID:%d] Socket %d recv error (errno=%d:%s, SO_ERROR=%d:%s, peer=%s:%d)\n",
+                    info->account_id, client_socket, errno, strerror(errno), soerr, strerror(soerr), ip, port);                }
                 FILE_LOG(log_message);
                 remove_socket_info(client_socket);
                 remove_client(client_socket);
@@ -842,8 +856,33 @@ void* cmd_thread_func(void *arg) {
         for (int i = 0; i < nfds; i++) {
             int client_socket = events[i].data.fd;
             socket_info_t *info = get_socket_info(client_socket);
-            
+    
             if (!info || info->state != SOCKET_STATE_AUTHENTICATED) {
+                continue;
+            }
+    
+            // NEW: handle hangup/error events up-front
+            uint32_t ev = events[i].events;
+            if (ev & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+                char log_message[BUFFER_SIZE];
+                struct sockaddr_in peer; socklen_t plen = sizeof(peer);
+                char ip[INET_ADDRSTRLEN] = "UNKNOWN"; int port = -1;
+                if (getpeername(client_socket, (struct sockaddr*)&peer, &plen) == 0) {
+                    inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+                    port = ntohs(peer.sin_port);
+                }
+                int soerr = 0; socklen_t slen = sizeof(soerr);
+                getsockopt(client_socket, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+                snprintf(log_message, sizeof(log_message),
+                    "[ERROR][CMD_THREAD][ID:%d] Socket %d event(s):%s%s%s peer=%s:%d SO_ERROR=%d:%s\n",
+                    info->account_id, client_socket,
+                    (ev & EPOLLRDHUP) ? " RDHUP" : "",
+                    (ev & EPOLLHUP) ? " HUP" : "",
+                    (ev & EPOLLERR) ? " ERR" : "",
+                    ip, port, soerr, strerror(soerr));
+                FILE_LOG(log_message);
+                remove_socket_info(client_socket);
+                remove_client(client_socket);
                 continue;
             }
             
@@ -852,8 +891,16 @@ void* cmd_thread_func(void *arg) {
                 if (bytes_read == 0) {
                     snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD][ID:%d] Socket %d closed by peer (orderly shutdown)\n", info->account_id, client_socket);
                 } else {
-                    snprintf(log_message, sizeof(log_message), "[ERROR][CMD_THREAD][ID:%d] Socket %d recv error (bytes_read=%zd, errno=%d:%s)\n", info->account_id, client_socket, bytes_read, errno, strerror(errno));
-                }
+                    struct sockaddr_in peer; socklen_t plen = sizeof(peer);
+                    char ip[INET_ADDRSTRLEN] = "UNKNOWN"; int port = -1;
+                    if (getpeername(client_socket, (struct sockaddr*)&peer, &plen) == 0) {
+                        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip)); port = ntohs(peer.sin_port);
+                    }
+                    int soerr = 0; socklen_t slen = sizeof(soerr);
+                    getsockopt(client_socket, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+                    snprintf(log_message, sizeof(log_message),
+                    "[ERROR][CMD_THREAD][ID:%d] Socket %d recv error (errno=%d:%s, SO_ERROR=%d:%s, peer=%s:%d)\n",
+                    info->account_id, client_socket, errno, strerror(errno), soerr, strerror(soerr), ip, port);                }
                 FILE_LOG(log_message);
                 remove_socket_info(client_socket);
                 remove_client(client_socket);
@@ -915,8 +962,6 @@ void* cmd_thread_func(void *arg) {
     return NULL;
 }
 
-
-// Signal handler for graceful shutdown (async-signal-safe)
 void signal_handler(int sig) {
     (void)sig; // Suppress unused parameter warning
     char log_message[BUFFER_SIZE];
@@ -959,12 +1004,12 @@ void signal_handler(int sig) {
     FILE_LOG(log_message);
 }
 
-// Function to add a new authenticated client - FIXED
 void add_authenticated_client(client_t *new_client) {
     char log_message[BUFFER_SIZE];
     printf("[ADD_CLIENT] Adding authenticated client for user '%s' (socket %d)\n", 
            new_client->username, new_client->socket);
     
+    pthread_mutex_lock(&clients_mutex);
     
     // Check if client already exists by socket (prevent duplicates)
     client_t *existing = NULL;
@@ -972,6 +1017,7 @@ void add_authenticated_client(client_t *new_client) {
     if (existing) {
         snprintf(log_message, sizeof(log_message), "[WARN][AUTH_THREAD][ID:%d] Warning: Client socket %d already exists in map\n", new_client->account_id, new_client->socket);
         FILE_LOG(log_message);
+        pthread_mutex_unlock(&clients_mutex);
         return;
     }
     
@@ -990,7 +1036,6 @@ void add_authenticated_client(client_t *new_client) {
         }
     }
     
-    pthread_mutex_lock(&clients_mutex);
     HASH_ADD_INT(clients_map, socket, new_client);
     client_count++;
     pthread_mutex_unlock(&clients_mutex);
@@ -1143,6 +1188,9 @@ X509* extract_client_cert(int client_socket) {
     
     // Read certificate length with retry logic
     unsigned long total_read = 0;
+    int retry_count = 0;
+    const int max_retries = 50; // 5 seconds total with 100ms delays
+    
     while (total_read < sizeof(net_cert_len)) {
         int recvd = recv(client_socket, ((char*)&net_cert_len) + total_read, 
                         sizeof(net_cert_len) - total_read, MSG_DONTWAIT);
@@ -1153,7 +1201,16 @@ X509* extract_client_cert(int client_socket) {
                     printf("[SHUTDOWN] Aborting certificate length extraction due to shutdown\n");
                     return NULL;
                 }
-                struct timespec delay = {0, 100000000}; 
+                
+                retry_count++;
+                if (retry_count > max_retries) {
+                    snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD][ID:%d] Certificate length extraction timeout after %d retries for socket %d\n", 
+                             socket_info->account_id, max_retries, client_socket);
+                    FILE_LOG(log_message);
+                    return NULL;
+                }
+                
+                struct timespec delay = {0, 100000000}; // 100ms
                 nanosleep(&delay, NULL);
                 continue;
             }
@@ -1162,6 +1219,7 @@ X509* extract_client_cert(int client_socket) {
             return NULL;
         }
         total_read += recvd;
+        retry_count = 0; // Reset retry count on successful read
     }
     
     uint32_t cert_len = ntohl(net_cert_len);
@@ -1192,6 +1250,8 @@ X509* extract_client_cert(int client_socket) {
     
     // Read certificate data with retry logic
     total_read = 0;
+    retry_count = 0; // Reuse retry counter for certificate data
+    
     while (total_read < (unsigned long)cert_len) {
         int recvd = recv(client_socket, cert_buf + total_read, 
                         cert_len - total_read, MSG_DONTWAIT);
@@ -1203,7 +1263,26 @@ X509* extract_client_cert(int client_socket) {
                     free(cert_buf);
                     return NULL;
                 }
-                struct timespec delay = {0, 100000000}; 
+                
+                retry_count++;
+                if (retry_count > max_retries) {
+                    snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD][ID:%d] Certificate data extraction timeout after %d retries for socket %d\n", 
+                             socket_info->account_id, max_retries, client_socket);
+                    FILE_LOG(log_message);
+                    free(cert_buf);
+                    return NULL;
+                }
+                
+                if(errno == EAGAIN){
+                    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD] EAGAIN received for socket %d (retry %d/%d)\n", client_socket, retry_count, max_retries);
+                    FILE_LOG(log_message);
+                }
+                else if(errno == EWOULDBLOCK){
+                    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD] EWOULDBLOCK received for socket %d (retry %d/%d)\n", client_socket, retry_count, max_retries);
+                    FILE_LOG(log_message);
+                }
+
+                struct timespec delay = {0, 100000000}; // 100ms
                 nanosleep(&delay, NULL);
                 continue;
             }
@@ -1213,6 +1292,7 @@ X509* extract_client_cert(int client_socket) {
             return NULL;
         }
         total_read += recvd;
+        retry_count = 0; // Reset retry count on successful read
     }
     
     cert_buf[cert_len] = '\0';
@@ -1238,7 +1318,6 @@ X509* extract_client_cert(int client_socket) {
     return client_cert;
 }
 
-// implements initial connection setup for epoll architecture
 int setup_initial_connection(int client_socket) {
     char log_message[BUFFER_SIZE];
     char response[BUFFER_SIZE];
@@ -1254,33 +1333,40 @@ int setup_initial_connection(int client_socket) {
     }
     FILE_LOG(log_message);
 
-    // Temporarily set socket to blocking
-    int flags = fcntl(client_socket, F_GETFL, 0);
-    fcntl(client_socket, F_SETFL, flags & ~O_NONBLOCK);
+    // Decide whether to perform RSA certificate extraction
+    extern int is_rsa_disabled(void);
+    int rsa_disabled = is_rsa_disabled();
 
-    // Extract certificate
-    X509* client_cert = extract_client_cert(client_socket);
-
-    // Restore non-blocking mode after certificate extraction
-    fcntl(client_socket, F_SETFL, flags | O_NONBLOCK);
-
+    X509* client_cert = NULL;
     EVP_PKEY* client_pubkey = NULL;
-    
-    if (!client_cert) {
-        // Check if RSA is disabled - if so, this is expected
-        extern int is_rsa_disabled(void);
-        if (is_rsa_disabled()) {
-            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD] No certificate received (RSA disabled). Proceeding without RSA authentication.\n");
+
+    if (!rsa_disabled) {
+        // Temporarily set socket to blocking
+        int flags = fcntl(client_socket, F_GETFL, 0);
+        fcntl(client_socket, F_SETFL, flags & ~O_NONBLOCK);
+
+        // Extract certificate
+        client_cert = extract_client_cert(client_socket);
+
+        // Restore non-blocking mode after certificate extraction
+        fcntl(client_socket, F_SETFL, flags | O_NONBLOCK);
+
+        // Validate socket_info consistency after certificate extraction
+        socket_info_t *cert_info = get_socket_info(client_socket);
+        if (cert_info && cert_info->account_id > 0) {
+            snprintf(log_message, sizeof(log_message), "[WARN][AUTH_THREAD] Socket %d: account_id already set to %d before username extraction\n", 
+                     client_socket, cert_info->account_id);
             FILE_LOG(log_message);
-            // client_pubkey remains NULL, which will skip RSA challenges
-        } else {
-            snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD] Client certificate extraction failed. Closing connection.\n");
+        }
+
+        if (!client_cert) {
+            snprintf(log_message, sizeof(log_message), "[WARN][AUTH_THREAD] Certificate extraction failed for socket %d - client may have disconnected\n", client_socket);
             FILE_LOG(log_message);
             remove_socket_info(client_socket);
             close(client_socket);
             return -1;
         }
-    } else {
+
         // We have a valid certificate, extract the public key
         client_pubkey = X509_get_pubkey(client_cert);
         if (!client_pubkey) {
@@ -1298,19 +1384,70 @@ int setup_initial_connection(int client_socket) {
         X509_NAME_get_text_by_NID(subj, NID_commonName, cn, sizeof(cn));
         snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][SOCKET-%d] Received client certificate. Subject CN: %s\n", client_socket, cn);
         FILE_LOG(log_message);
+    } else {
+        // RSA is disabled: skip certificate extraction entirely
+        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD] No certificate required (RSA disabled). Proceeding without RSA authentication.\n");
+        FILE_LOG(log_message);
+        // Ensure any prior incorrect warning only triggers for real account ids
+        socket_info_t *cert_info = get_socket_info(client_socket);
+        if (cert_info && cert_info->account_id > 0) {
+            snprintf(log_message, sizeof(log_message), "[WARN][AUTH_THREAD] Socket %d: account_id already set to %d before username extraction\n", 
+                     client_socket, cert_info->account_id);
+            FILE_LOG(log_message);
+        }
     }
 
-    // Receive username
+    // Receive username with retry logic
     char username_buffer[BUFFER_SIZE];
-    int name_bytes = recv(client_socket, username_buffer, BUFFER_SIZE - 1, MSG_DONTWAIT);
+    int name_bytes = 0;
+    int username_retry_count = 0;
+    const int max_username_retries = 30; // 3 seconds total with 100ms delays
+    
+    // Try to read username with retries
+    while (name_bytes <= 0 && username_retry_count < max_username_retries) {
+        name_bytes = recv(client_socket, username_buffer, BUFFER_SIZE - 1, MSG_DONTWAIT);
+        
+        if (name_bytes <= 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                username_retry_count++;
+                if (username_retry_count >= max_username_retries) {
+                    snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD] Username extraction timeout after %d retries for socket %d\n", 
+                             max_username_retries, client_socket);
+                    FILE_LOG(log_message);
+                    EVP_PKEY_free(client_pubkey);
+                    X509_free(client_cert);
+                    remove_socket_info(client_socket);
+                    close(client_socket);
+                    return -1;
+                }
+                
+                struct timespec delay = {0, 100000000}; // 100ms
+                nanosleep(&delay, NULL);
+                continue;
+            } else {
+                // Real error, not just no data
+                snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD] Socket %d: client disconnected before sending username (errno=%d: %s)\n", 
+                         client_socket, errno, strerror(errno));
+                FILE_LOG(log_message);
+                EVP_PKEY_free(client_pubkey);
+                X509_free(client_cert);
+                remove_socket_info(client_socket);
+                close(client_socket);
+                return -1;
+            }
+        }
+    }
+    
     char username[MAX_USERNAME_LEN] = "";
     unsigned int account_id = 0;
     
-    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD] Socket %d: received %d bytes for username\n", client_socket, name_bytes);
+    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD] Socket %d: received %d bytes for username after %d retries\n", 
+             client_socket, name_bytes, username_retry_count);
     FILE_LOG(log_message);
     
+    // Final check that we actually got valid data
     if (name_bytes <= 0) {
-        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD] Socket %d: client disconnected before sending username\n", client_socket);
+        snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD] Socket %d: failed to receive username after all retries\n", client_socket);
         FILE_LOG(log_message);
         EVP_PKEY_free(client_pubkey);
         X509_free(client_cert);
@@ -1343,6 +1480,16 @@ int setup_initial_connection(int client_socket) {
         }
         
         account_id = uname_entry->account_id;
+        
+        // Update socket_info with the account_id
+        socket_info_t *current_socket_info = get_socket_info(client_socket);
+        if (current_socket_info) {
+            current_socket_info->account_id = account_id;
+            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD] Socket %d: assigned account_id=%d for user '%s'\n", 
+                     client_socket, account_id, username);
+            FILE_LOG(log_message);
+        }
+        
         user_t *user = find_user(account_id);
         if (!user) {
             snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD] Invalid account_id received: %u\n", account_id);
@@ -1781,7 +1928,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    signal(SIGPIPE, SIG_IGN);
     
     const char* database_password = argv[1];
     
@@ -1972,6 +2118,8 @@ int main(int argc, char *argv[]) {
         // NOW set up signal handlers AFTER shutdown pipe is ready
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
+        signal(SIGPIPE, sigpipe_handler);
+
         snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Signal handlers installed after shutdown pipe setup\n");
         FILE_LOG(log_message);
         
@@ -2133,8 +2281,11 @@ int main(int argc, char *argv[]) {
                 if (info) {
                     info->state = SOCKET_STATE_NEW;
                     info->last_activity = time(NULL);
-                    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: initialized with state=NEW\n", client_socket);
-                    FILE_LOG(log_message);                }
+                    info->account_id = -1;  // Ensure clean state
+                    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: initialized with state=NEW, account_id=%d\n", 
+                             client_socket, info->account_id);
+                    FILE_LOG(log_message);
+                }
                 
                 // Handle initial connection setup BEFORE adding to epoll (certificate extraction, RSA challenge)
                 snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: starting initial setup\n", client_socket);
@@ -2143,6 +2294,13 @@ int main(int argc, char *argv[]) {
                 int setup_result = setup_initial_connection(client_socket);
                 if(setup_result != 0){
                     // setup_initial_connection already handles cleanup on failure
+                    // But ensure socket_info is also cleaned up
+                    socket_info_t *failed_info = get_socket_info(client_socket);
+                    if (failed_info) {
+                        snprintf(log_message, sizeof(log_message), "[WARN][MAIN_THREAD] Socket %d: setup failed, cleaning up socket_info\n", client_socket);
+                        FILE_LOG(log_message);
+                        remove_socket_info(client_socket);
+                    }
                     // Don't call remove_client or close again - socket is already closed
                     continue;
                 }
@@ -2154,16 +2312,18 @@ int main(int argc, char *argv[]) {
                             // Auto-authentication occurred during setup - socket is already promoted
                             snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: auto-authenticated during setup, skipping auth epoll\n", client_socket);
                             FILE_LOG(log_message);
-                        } else {
+                        } 
+                        else {
                             // Normal authentication flow - set state and add to auth epoll
                             updated_info->state = SOCKET_STATE_AUTHENTICATING;
                             snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Socket %d: setup successful, state=AUTHENTICATING\n", client_socket);
                             FILE_LOG(log_message);
                             
-                            // Add to auth thread's epoll AFTER setup is complete
+                            // Add to auth thread's epoll after setup is complete
                             struct epoll_event client_event;
-                            client_event.events = EPOLLIN | EPOLLET;
                             client_event.data.fd = client_socket;
+                            client_event.events = EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLHUP | EPOLLERR;
+                            snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE][ID:%d] Adding socket %d to auth thread epoll\n", updated_info->account_id, client_socket);
                             if (epoll_ctl(auth_thread_ctx.epoll_fd, EPOLL_CTL_ADD, client_socket, &client_event) == -1) {
                                 snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] epoll_ctl (auth) failed\n");
                                 FILE_LOG(log_message);
@@ -2256,7 +2416,8 @@ int main(int argc, char *argv[]) {
     OPENSSL_cleanup();
     snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] OpenSSL cleanup completed\n");
     FILE_LOG(log_message);
-    
+    free(server_config.serverIPaddress);
+
     printf("Server Cleanup Succesful...\n");
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] %s shutdown complete\n", PROGRAM_NAME);
     FILE_LOG(log_message);

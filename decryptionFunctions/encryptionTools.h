@@ -7,7 +7,7 @@
 
 #define AES_KEY_SIZE 32  // 256 bits
 #define AES_BLOCK_SIZE 16
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 2048
 
 typedef struct {
     char* data;

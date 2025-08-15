@@ -1,10 +1,10 @@
 # Simplified Makefile for TCP Server/Client Project (Linux)
 CC = clang
-CFLAGS = -Wall -Wextra -std=c17 -pthread -D_POSIX_C_SOURCE=200809L
-LIBS = -lssl -lcrypto -lcurl -lcjson -lmicrohttpd -g
+CFLAGS = -Wall -Wextra -std=c17 -pthread -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -g
+LIBS = -lssl -lcrypto -lcurl -lcjson -lmicrohttpd 
 
 # Object files
-OBJS = encryptionTools.o auth_system.o fileOperations.o emailFunction.o serverConfig.o socketHandling.o serverRest.o
+OBJS = encryptionTools.o auth_system.o fileOperations.o emailFunction.o serverConfig.o socketHandling.o serverRest.o IPtableFunctions.o
 
 # Targets
 all: unified_server unified_client encryptionTools user_encryptor generate_rsa_keys rest_client
@@ -34,6 +34,10 @@ socketHandling.o: socketHandling/socketHandling.c socketHandling/socketHandling.
 # REST API handling
 serverRest.o: REST_tools/serverRest.c REST_tools/serverRest.h
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# IP table functions
+IPtableFunctions.o: IPTableFunctions/IPtableFunctions.c IPTableFunctions/IPtableFunctions.h
+	$(CC) $(CFLAGS) -c IPTableFunctions/IPtableFunctions.c -o $@
 
 # REST client program
 rest_client: REST_tools/rest_client.c serverConfig.o

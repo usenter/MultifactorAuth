@@ -1,9 +1,12 @@
 {
   "maxUsers": 1000,
-  "maxEvents": 100,
+  "maxEvents": 1000,
   "disableEmail": true,
   "disableRSA": true,
   "disablePassword": true,
   "serverIPaddress": "127.0.0.1",
-  "serverPort": 12345
+  "serverPort": 12345,
+  "syn_rate": "1000/second",
+  "syn_burst": 200,
+  "per_ip_limit": 10000
 } 

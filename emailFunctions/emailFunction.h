@@ -5,7 +5,7 @@
 #define EMAIL_FUNCTION_H
 
 
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 2048
 #define EMAIL_CONFIG_PATH "configTools/emailConfig.json"
 
 typedef struct {
