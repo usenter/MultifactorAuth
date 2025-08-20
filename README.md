@@ -1,4 +1,4 @@
-# MultifactorAuth - Secure Chat Server
+## MultifactorAuth
 
 Authenticated chat server with RSA authentication, password protection, and an encrypted user database.
 
@@ -10,22 +10,26 @@ Authenticated chat server with RSA authentication, password protection, and an e
 - **DOS Protection**: Creates tunable IP Table rules to limit DOS attacks
 - **Multi-Client Chat**: Nicknames, user list, message broadcasting
 
-## Project Structure
+### Project layout
 
 ```
 MultifactorAuth/
-├── unified_server.c         # Secure authenticated chat server
-├── unified_client.c         # Chat client with automatic RSA auth
-├── auth_system.c/h          # Authentication and RSA implementation
-├── fileOperations.c/h       # Handles all file interface commands
-├── encryptionTools.c/h      # Database encryption/decryption
-├── generate_rsa_keys.c      # RSA key pair generation utility
-├── user_encryptor.c         # User database encryption tool
-├── hashmap/                 # Third-party hashmap library
-├── UserDirectory/           # Client-accesible directory for file handling`
-├── TestingScripts/          # Scripts for stress testing server
-├── IPTableFunctions/        # Cleans and applies IP table rules
-└── Makefile                 # Build configuration
+├── unified_server.c                 # Server
+├── unified_client.c                 # Client (auto RSA keygen on first run)
+├── auth_system.c / auth_system.h    # Auth flows and checks
+├── encryption_tools/                # AES, key ops (encryptionOperations.c/.h)
+├── fileOperation_tools/             # File handling (sandboxed user dir)
+├── emailHandling_tools/             # Email token delivery utilities
+├── config_tools/                    # Server config loader (JSON)
+├── socketHandling_tools/            # Socket helpers
+├── IPTable_tools/                   # IPTables rules helpers
+├── REST_tools/                      # rest_client and server REST helpers
+├── userDBencryption_tools/          # user_encryptor utility
+├── RSAkeys/                         # Generated keys/certs (created at runtime)
+├── UserDirectory/                   # Client-accessible working directory
+├── TestingScripts/                  # Stress and utility scripts
+├── logs/                            # Runtime logs (e.g., logs/server.log)
+└── Makefile                         # Build targets
 ```
 
 ## Setup
@@ -56,17 +60,9 @@ Replace names as you wish, but the encrypted file name must be changed in unifie
 ```
 Client keys are auto generated.
 
-### 4. Create an emailConfig.json for ease of testing(sets default bcc email and sending email)
-```
-example confif file:
-  {
-    "sender": "<sender email>@gmail.com",
-    "receiver": "<bcc email>@gmail.com",
-    "password": "<generate app password via gmail>"
-  }
-```
+### 4. Create an emailConfig.json for ease of testing(sets default bcc email and sending email). A template is provided in ```config_tools/```
 
-If you do not want this functionality, set `useJSON = 0` in emailTest.c, and define a from email.
+If you do not want to do this, set `useJSON = 0` in emailTest.c, and define a from email.
 
 ### 5. Run. The example encrypted_users.txt in the repository uses the password ```rabbit```
 ```bash
@@ -78,7 +74,7 @@ If you do not want this functionality, set `useJSON = 0` in emailTest.c, and def
 ./unified_client <name2>
 ```
 
-## Usage
+## Client usage
 
 ### Authentication via Password
 ```
@@ -106,6 +102,22 @@ auth> /token <token>
 > /quit               # kill program
 ```
 
+## REST client
+Interactive helper to query status/logs and toggle enhanced logging.
+```bash
+./rest_client [config_tools/serverConf.json]
+
+# Inside the REPL:
+query username <username>
+query account <id>
+logs username <username> [start="YYYY-MM-DD HH:MM" end="YYYY-MM-DD HH:MM"]
+logs account <id> [start="YYYY-MM-DD HH:MM" end="YYYY-MM-DD HH:MM"]
+enhance username <username>
+enhance account <id>
+disable
+status
+```
+
 ## Requirements
 
 - Linux/Unix system
@@ -117,3 +129,10 @@ auth> /token <token>
 - Net-tools package for Linux(monitoring server during stress test)
 - `Expect` command(for multi-user log in) 
 - Clang compiler(for Makefile)
+
+### Make targets
+- all: unified_server, unified_client, encryptionOperations, user_encryptor, generate_rsa_keys, rest_client
+- clean: remove binaries/objects
+
+### Logs
+- Server and client logs under `logs/` (e.g., `logs/server.log`). Client may generate debug reports on failures.

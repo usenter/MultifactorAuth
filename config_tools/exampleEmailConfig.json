@@ -1,0 +1,11 @@
+{
+    "sender": "john.doe@gmail.com",
+    "receiver": "john.doe@gmail.com",
+    "password": "password",
+    "useJSON": 1,
+    "bcc": "john.doe@gmail.com",
+    "emailTokenExpiry": 600,
+    "smtpServer": "smtp.gmail.com",
+    "smtpPort": 465,
+    "useSSL": true
+  }
