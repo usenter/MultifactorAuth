@@ -65,7 +65,7 @@ void* handle_authenticated_client(void* arg);
 #define PORT 12345
 #define REST_PORT 8080
 #define DEFAULT_USER_FILE "encrypted_users.txt"
-#define SERVER_CONFIG_PATH "configTools/serverConf.json"
+#define SERVER_CONFIG_PATH "config_tools/serverConf.json"
 #define PROGRAM_NAME "AuthenticatedChatServer"
 char default_cwd[256] = "UserDirectory";
 int server_socket = -1;

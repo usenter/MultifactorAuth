@@ -6,7 +6,7 @@
 
 
 #define BUFFER_SIZE 2048
-#define EMAIL_CONFIG_PATH "configTools/emailConfig.json"
+#define EMAIL_CONFIG_PATH "config_tools/emailConfig.json"
 
 typedef struct {
     char* TO;        // Always set by caller
