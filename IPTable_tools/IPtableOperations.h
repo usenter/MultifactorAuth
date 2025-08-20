@@ -2,8 +2,8 @@
 /*
  * IP table functions public interface
  */
-#ifndef IPTABLEFUNCTIONS_H
-#define IPTABLEFUNCTIONS_H
+#ifndef IPTABLEOPERATIONS_H
+#define IPTABLEOPERATIONS_H
 
 #include <stdio.h>
 #include <sys/wait.h>

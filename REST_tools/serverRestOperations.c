@@ -6,7 +6,7 @@
 #include <microhttpd.h>
 
 #include "../auth_system.h"
-#include "../socketHandling/socketHandling.h"
+#include "../socketHandling_tools/socketHandlingOperations.h"
 
 // Function declarations
 void enable_enhanced_logging_by_account_id(unsigned int account_id);

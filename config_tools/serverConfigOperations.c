@@ -1,4 +1,4 @@
-#include "serverConfig.h"
+#include "serverConfigOperations.h"
 
 // Global server configuration
 server_config_t server_config = {0, 0, 0, 0, 0, 0, 0, 0, 0};

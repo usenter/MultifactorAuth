@@ -7,7 +7,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <curl/curl.h>
-#include "../configTools/serverConfig.h"
+#include "../config_tools/serverConfigOperations.h"
 
 #define REST_SERVER_PORT 8080
 #define BUFFER_SIZE 4096

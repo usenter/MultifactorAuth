@@ -4,54 +4,53 @@ CFLAGS = -Wall -Wextra -std=c17 -pthread -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE
 LIBS = -lssl -lcrypto -lcurl -lcjson -lmicrohttpd 
 
 # Object files
-OBJS = encryptionTools.o auth_system.o fileOperations.o emailFunction.o serverConfig.o socketHandling.o serverRest.o IPtableFunctions.o
+OBJS = encryptionOperations.o auth_system.o fileHandlingOperations.o emailHandlingOperations.o serverConfigOperations.o socketHandlingOperations.o serverRestOperations.o IPtableOperations.o
 
 # Targets
-all: unified_server unified_client encryptionTools user_encryptor generate_rsa_keys rest_client
+all: unified_server unified_client encryptionOperations user_encryptor generate_rsa_keys rest_client
 
 # Object file rules with header dependencies
-encryptionTools.o: decryptionFunctions/encryptionTools.c decryptionFunctions/encryptionTools.h
+encryptionOperations.o: encryption_tools/encryptionOperations.c encryption_tools/encryptionOperations.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 auth_system.o: auth_system.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-fileOperations.o: fileOperationTools/fileOperations.c fileOperationTools/fileOperations.h
+fileHandlingOperations.o: fileOperation_tools/fileOperations.c fileOperation_tools/fileOperations.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Email test executable
-emailFunction.o: emailFunctions/emailFunction.c emailFunctions/emailFunction.h
+emailHandlingOperations.o: emailHandling_tools/emailHandlingOperations.c emailHandling_tools/emailHandlingOperations.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Server configuration
-serverConfig.o: configTools/serverConfig.c configTools/serverConfig.h
+serverConfigOperations.o: config_tools/serverConfigOperations.c config_tools/serverConfigOperations.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Socket handling
-socketHandling.o: socketHandling/socketHandling.c socketHandling/socketHandling.h
+socketHandlingOperations.o: socketHandling_tools/socketHandlingOperations.c socketHandling_tools/socketHandlingOperations.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # REST API handling
-serverRest.o: REST_tools/serverRest.c REST_tools/serverRest.h
+serverRestOperations.o: REST_tools/serverRestOperations.c REST_tools/serverRestOperations.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # IP table functions
-IPtableFunctions.o: IPTableFunctions/IPtableFunctions.c IPTableFunctions/IPtableFunctions.h
-	$(CC) $(CFLAGS) -c IPTableFunctions/IPtableFunctions.c -o $@
+IPtableOperations.o: IPTable_tools/IPtableOperations.c IPTable_tools/IPtableOperations.h
+	$(CC) $(CFLAGS) -c IPTable_tools/IPtableOperations.c -o $@
 
 # REST client program
-rest_client: REST_tools/rest_client.c serverConfig.o
-	$(CC) $(CFLAGS) -o $@ $< serverConfig.o $(LIBS)
+rest_client: REST_tools/rest_client.c serverConfigOperations.o
+	$(CC) $(CFLAGS) -o $@ $< serverConfigOperations.o $(LIBS)
 
 # Standalone file encryption/decryption tool
-user_encryptor: userEncryptionTools/user_encryptor.c
+user_encryptor: userDBencryption_tools/user_encryptor.c
 	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
 
 # Server with authentication (uses object files)
 unified_server: unified_server.c $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
-
-encryptionTools: decryptionFunctions/encryptionTools.c decryptionFunctions/encryptionTools.h
+encryptionOperations: encryption_tools/encryptionOperations.c encryption_tools/encryptionOperations.h
 	$(CC) $(CFLAGS) -DTEST_MAIN -o $@ $< $(LIBS)
 
 # Unified client with authentication support (includes RSA authentication)
@@ -64,6 +63,6 @@ generate_rsa_keys: generate_rsa_keys.c $(OBJS)
 
 # Clean
 clean:
-	rm -f *.o unified_server unified_client encryptionTools user_encryptor generate_rsa_keys rest_client
+	rm -f *.o unified_server unified_client encryptionOperations user_encryptor generate_rsa_keys rest_client
 
 .PHONY: all clean 

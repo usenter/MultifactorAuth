@@ -4,7 +4,7 @@
 #include <cjson/cJSON.h>
 #include <stdlib.h>
 #include <time.h>
-#include "emailFunction.h"
+#include "emailHandlingOperations.h"
 
 const char* emailFrom = "noreply@example.com";
 

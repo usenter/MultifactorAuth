@@ -1,7 +1,7 @@
 #ifndef FILE_OPERATIONS_H
 #define FILE_OPERATIONS_H
 
-#include "../socketHandling/socketHandling.h"
+#include "../socketHandling_tools/socketHandlingOperations.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

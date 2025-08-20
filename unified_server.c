@@ -1,4 +1,3 @@
-#include <emailFunctions/emailFunction.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,10 +19,11 @@
 #include <openssl/rand.h>
 #include "auth_system.h"
 #include "hashmap/uthash.h"
-#include "fileOperationTools/fileOperations.h" // File mode operations
-#include "configTools/serverConfig.h"
-#include "REST_tools/serverRest.h"
-#include "IPTableFunctions/IPtableFunctions.h"
+#include "emailHandling_tools/emailHandlingOperations.h"
+#include "fileOperation_tools/fileOperations.h" 
+#include "config_tools/serverConfigOperations.h"
+#include "REST_tools/serverRestOperations.h"
+#include "IPTable_tools/IPtableOperations.h"
 
 // Function to check client connection health
 int check_client_health(int socket) {

@@ -10,8 +10,8 @@
 #include <openssl/rand.h>
 #include <openssl/err.h>
 #include "hashmap/uthash.h"
-#include "decryptionFunctions/encryptionTools.h"
-#include "emailFunctions/emailFunction.h"
+#include "encryption_tools/encryptionOperations.h"
+#include "emailHandling_tools/emailHandlingOperations.h"
 #include <sys/socket.h>
 
 

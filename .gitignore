@@ -5,7 +5,7 @@ unified_client
 authenticated_client
 simple_test_client
 user_encryptor
-encryptionTools_test
+encryptionOperations_test
 generate_rsa_keys
 rest_client
 
@@ -30,6 +30,7 @@ build/
 .vscode/
 Checkers/
 TestingScripts/
+userGeneration/
 
 # Temporary files
 temp.txt
