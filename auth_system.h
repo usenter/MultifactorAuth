@@ -111,6 +111,11 @@ typedef struct {
     auth_flags_t auth_status;  // Authentication flags with bit operations
     email_token_t email_token;  // Email token for 2FA
     persistent_lockout_t lockout_info;
+    // ECDH (X25519) ephemeral and session key
+    EVP_PKEY *ecdh_keypair;
+    unsigned char session_key[32];
+    unsigned char ecdh_peer_pub[64];
+    size_t ecdh_peer_pub_len;
     UT_hash_handle hh;  // Required for hash table functionality
 } session_t;
 
@@ -180,6 +185,8 @@ void cleanup_expired_sessions(void);
 void cleanup_session(session_t *session);
 void cleanup_user(user_t *user);
 void hash_password(const char* password, char* hash);
+// Reset any per-connection ECDH/session keying material without destroying the session
+void reset_session_ecdh(int account_id);
 int verify_password(const char* password, const char* hash);
 void save_users_to_file(const char* filename);
 void load_users_from_file(const char* filename);

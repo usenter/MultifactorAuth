@@ -8,8 +8,10 @@
 #include <pthread.h>
 #include <openssl/pem.h>
 #include <openssl/evp.h>
+#include <openssl/kdf.h>
 #include <openssl/rand.h>
 #include <openssl/err.h>
+#include <openssl/crypto.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <errno.h>
@@ -18,7 +20,7 @@
 #include <netinet/tcp.h>
 #include <sys/utsname.h>
 #define PORT 12345
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 2048
 #define MAX_MESSAGES 100
 #define MAX_USERNAME_LEN 32
 #define MAX_PASSWORD_LEN 64
@@ -35,13 +37,30 @@ int password_authenticated = 0;
 int rsa_completed = 0;
 int email_authenticated = 0;
 int locked = 0;
+static int ecdh_ready = 0;
 static char g_username[MAX_USERNAME_LEN] = "";
 static char g_last_shutdown_reason[128] = "normal";
 
 
-// RSA keys for automatic authentication
-EVP_PKEY* client_private_key = NULL;
-EVP_PKEY* server_public_key = NULL;
+// RSA keys for automatic authentication + ECDH session state
+typedef struct {
+    EVP_PKEY *client_private_key;      
+    EVP_PKEY *server_public_key;  
+    // ECDH (X25519) ephemeral keypair for this connection
+    EVP_PKEY *ecdh_keypair;
+    unsigned char ecdh_public_raw[64];
+    size_t ecdh_public_len;
+    // Peer (server) ephemeral public key (raw)
+    unsigned char peer_public_raw[64];
+    size_t peer_public_len;
+    // Derived shared secret and session key
+    unsigned char *shared_secret;   
+    size_t shared_secret_len;
+    unsigned char symmetric_key[32]; // Final 256-bit key
+} dh_session_t;
+
+dh_session_t dh_session;
+
 char client_id[64] = "";  // Must be specified by user
 unsigned int account_id = 0;  // Add account_id
 
@@ -56,6 +75,213 @@ typedef struct {
     char message[BUFFER_SIZE];
     int valid;
 } stored_message_t;
+
+int derive_shared_secret(dh_session_t *session) {
+    EVP_PKEY_CTX *ctx = NULL;
+    int result = 0;
+    size_t secret_length = 0;
+
+    if (session == NULL || session->ecdh_keypair == NULL || session->peer_public_len == 0) {
+        printf("ERROR: ECDH keys not ready\n");
+        return 0;
+    }
+
+    EVP_PKEY *peer_key = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL,
+                                                     session->peer_public_raw, session->peer_public_len);
+    if (!peer_key) {
+        printf("ERROR: Failed to load peer ECDH public key\n");
+        return 0;
+    }
+
+    ctx = EVP_PKEY_CTX_new(session->ecdh_keypair, NULL);
+    if (ctx == NULL) {
+        printf("ERROR: Failed to create derivation context\n");
+        EVP_PKEY_free(peer_key);
+        return 0;
+    }
+    if (EVP_PKEY_derive_init(ctx) <= 0) {
+        printf("ERROR: Failed to initialize derivation\n");
+        goto cleanup;
+    }
+    if (EVP_PKEY_derive_set_peer(ctx, peer_key) <= 0) {
+        printf("ERROR: Failed to set peer public key\n");
+        goto cleanup;
+    }
+    if (EVP_PKEY_derive(ctx, NULL, &secret_length) <= 0) {
+        fprintf(stderr, "Failed to determine secret length\n");
+        goto cleanup;
+    }
+    session->shared_secret = OPENSSL_malloc(secret_length);
+    if (!session->shared_secret) {
+        fprintf(stderr, "Failed to allocate memory for shared secret\n");
+        goto cleanup;
+    }
+    if (EVP_PKEY_derive(ctx, session->shared_secret, &secret_length) <= 0) {
+        fprintf(stderr, "Failed to derive shared secret\n");
+        OPENSSL_free(session->shared_secret);
+        session->shared_secret = NULL;
+        goto cleanup;
+    }
+    session->shared_secret_len = secret_length;
+    
+    result = 1;
+
+cleanup:
+    if (ctx) EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(peer_key);
+    return result;
+}
+
+int derive_session_key(dh_session_t *session) {
+    if (session == NULL || session->shared_secret == NULL || session->shared_secret_len == 0) {
+        return 0;
+    }
+    // Use HKDF-SHA256 with no salt/info to derive a 32-byte session key
+    EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
+    if (!kctx) return 0;
+    size_t outlen = sizeof(session->symmetric_key);
+    int ok = EVP_PKEY_derive_init(kctx) == 1 &&
+             EVP_PKEY_CTX_set_hkdf_md(kctx, EVP_sha256()) == 1 &&
+             EVP_PKEY_CTX_set1_hkdf_salt(kctx, NULL, 0) == 1 &&
+             EVP_PKEY_CTX_set1_hkdf_key(kctx, session->shared_secret, (int)session->shared_secret_len) == 1 &&
+             EVP_PKEY_CTX_add1_hkdf_info(kctx, (const unsigned char*)"MFADH", 5) == 1 &&
+             EVP_PKEY_derive(kctx, session->symmetric_key, &outlen) == 1;
+    EVP_PKEY_CTX_free(kctx);
+    if (ok) {
+        return 1;
+    }
+    else{
+        printf("[ECDH] Failed to derive session key\n");
+    }
+    return 0;
+}
+
+
+
+
+static int hex_encode(const unsigned char* in, size_t len, char* out, size_t outsz) {
+    static const char* hex = "0123456789abcdef";
+    if (outsz < (len * 2 + 1)) return 0;
+    for (size_t i = 0; i < len; i++) {
+        out[i*2] = hex[(in[i] >> 4) & 0xF];
+        out[i*2+1] = hex[in[i] & 0xF];
+    }
+    out[len*2] = '\0';
+    return 1;
+}
+
+static int hex_decode(const char* in, unsigned char* out, size_t outsz, size_t* written) {
+    size_t inlen = strlen(in);
+    if (inlen % 2 != 0) return 0;
+    size_t need = inlen / 2;
+    if (need > outsz) return 0;
+    for (size_t i = 0; i < need; i++) {
+        unsigned int byte;
+        if (sscanf(in + i*2, "%2x", &byte) != 1) return 0;
+        out[i] = (unsigned char)byte;
+    }
+    if (written) *written = need;
+    return 1;
+}
+
+// Generate client ECDH (X25519) ephemeral keypair
+static int generate_dh_keys(dh_session_t* session) {
+    if (!session) return 0;
+    EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+    if (!kctx) return 0;
+    if (EVP_PKEY_keygen_init(kctx) <= 0) { EVP_PKEY_CTX_free(kctx); return 0; }
+    if (EVP_PKEY_keygen(kctx, &session->ecdh_keypair) <= 0) { EVP_PKEY_CTX_free(kctx); return 0; }
+    EVP_PKEY_CTX_free(kctx);
+    session->ecdh_public_len = sizeof(session->ecdh_public_raw);
+    if (EVP_PKEY_get_raw_public_key(session->ecdh_keypair, session->ecdh_public_raw, &session->ecdh_public_len) != 1) {
+        EVP_PKEY_free(session->ecdh_keypair);
+        session->ecdh_keypair = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+
+
+static int aes_gcm_decrypt_hex(const unsigned char* key,
+                               const char* in_hex,
+                               unsigned char* out_plain, size_t out_plain_sz,
+                               size_t* out_written) {
+    size_t bin_len_est = strlen(in_hex) / 2;
+    unsigned char* bin = malloc(bin_len_est);
+    if (!bin) return 0;
+    size_t bin_len = 0;
+    if (!hex_decode(in_hex, bin, bin_len_est, &bin_len)) { free(bin); return 0; }
+    if (bin_len < 12 + 16) { free(bin); return 0; }
+    unsigned char *iv = bin;
+    unsigned char *tag = bin + bin_len - 16;
+    unsigned char *ciphertext = bin + 12;
+    size_t clen = bin_len - 12 - 16;
+    if (clen > out_plain_sz) { free(bin); return 0; }
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) { free(bin); return 0; }
+    int ok = EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+             EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) == 1;
+    if (!ok) { EVP_CIPHER_CTX_free(ctx); free(bin); return 0; }
+    int outlen = 0, tmplen = 0;
+    if (EVP_DecryptUpdate(ctx, out_plain, &outlen, ciphertext, (int)clen) != 1) { EVP_CIPHER_CTX_free(ctx); free(bin); return 0; }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag) != 1) { EVP_CIPHER_CTX_free(ctx); free(bin); return 0; }
+    if (EVP_DecryptFinal_ex(ctx, out_plain + outlen, &tmplen) != 1) { EVP_CIPHER_CTX_free(ctx); free(bin); return 0; }
+    outlen += tmplen;
+    EVP_CIPHER_CTX_free(ctx);
+    free(bin);
+    if (out_written) *out_written = (size_t)outlen;
+    return 1;
+}
+
+ssize_t send_secure(const int server_socket, const char* data, size_t len) {
+   
+    if (server_socket >= 0 && ecdh_ready) {
+        unsigned char iv[12];
+        if (RAND_bytes(iv, sizeof(iv)) != 1) {
+            return send(server_socket, data, len, 0);
+        }
+        EVP_CIPHER_CTX* ectx = EVP_CIPHER_CTX_new();
+        if (!ectx) return send(server_socket, data, len, 0);
+        int ok = EVP_EncryptInit_ex(ectx, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
+                 EVP_CIPHER_CTX_ctrl(ectx, EVP_CTRL_GCM_SET_IVLEN, (int)sizeof(iv), NULL) == 1 &&
+                 EVP_EncryptInit_ex(ectx, NULL, NULL, dh_session.symmetric_key, iv) == 1;
+        if (!ok) { EVP_CIPHER_CTX_free(ectx); return send(server_socket, data, len, 0); }
+        unsigned char ct[4096]; int ctlen = 0, t = 0;
+        if (EVP_EncryptUpdate(ectx, ct, &ctlen, (const unsigned char*)data, (int)len) != 1 ||
+            EVP_EncryptFinal_ex(ectx, ct + ctlen, &t) != 1) {
+            EVP_CIPHER_CTX_free(ectx);
+            printf("Failed to encrypt message: %s\n", data);
+            return send(server_socket, data, len, 0);
+        }
+        ctlen += t;
+        unsigned char tag[16];
+        if (EVP_CIPHER_CTX_ctrl(ectx, EVP_CTRL_GCM_GET_TAG, 16, tag) != 1) {
+            EVP_CIPHER_CTX_free(ectx);
+            printf("Failed to get tag: %s\n", data);
+            return send(server_socket, data, len, 0);
+        }
+        EVP_CIPHER_CTX_free(ectx);
+        unsigned char frame[12 + (size_t)ctlen + 16];
+        memcpy(frame, iv, 12);
+        memcpy(frame + 12, ct, ctlen);
+        memcpy(frame + 12 + ctlen, tag, 16);
+        char hexbuf[8192];
+        if (!hex_encode(frame, sizeof(frame), hexbuf, sizeof(hexbuf))) {
+            printf("Failed to hex-encode message: %s\n", data);
+            return send(server_socket, data, len, 0);
+        }
+        char enc_frame[8300];
+        int n = snprintf(enc_frame, sizeof(enc_frame), "ENC %s\n", hexbuf);
+        if (n < 0) return -1;
+        return send(server_socket, enc_frame, (size_t)n, 0);
+    }
+    printf(" message sent: %s\n", data);
+    return send(server_socket, data, len, 0);
+}
+
 
 stored_message_t message_buffer[MAX_MESSAGES];
 int message_count = 0;
@@ -115,6 +341,7 @@ static void append_shell_section(FILE* fp, const char* title, const char* cmd) {
 
 // Generate a client-side debug report
 static void generate_client_debug_report(const char* reason, int client_socket, int last_errno) {
+    printf("Generating client debug report...\n");
     ensure_logs_dir();
     time_t now = time(NULL);
     struct tm tm_now;
@@ -194,7 +421,7 @@ static void generate_client_debug_report(const char* reason, int client_socket, 
     fclose(fp);
 }
 
-// RSA Authentication Functions
+
 // Load client's private key
 int load_client_private_key(const char* username) {
     char key_file[MAX_FILE_PATH_LEN];
@@ -206,10 +433,10 @@ int load_client_private_key(const char* username) {
         return 0;
     }
     
-    client_private_key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
+    dh_session.client_private_key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
     fclose(fp);
     
-    if (!client_private_key) {
+    if (!dh_session.client_private_key) {
         printf("ERROR: Could not read client private key from: %s\n", key_file);
         return 0;
     }
@@ -226,34 +453,28 @@ int load_server_public_key(void) {
         return 0;
     }
     
-    server_public_key = PEM_read_PUBKEY(fp, NULL, NULL, NULL);
+    dh_session.server_public_key = PEM_read_PUBKEY(fp, NULL, NULL, NULL);
     fclose(fp);
     
-    if (!server_public_key) {
+    if (!dh_session.server_public_key) {
         printf("ERROR: Could not read server public key\n");
         return 0;
     }
 
     return 1;
 }
-int generate_self_signed_cert(const char* username);
+
 // Handle RSA challenge automatically
 int handle_rsa_challenge(int socket, const char* hex_challenge) {
-    if (!client_private_key || !server_public_key) {
+    if (!dh_session.client_private_key || !dh_session.server_public_key) {
         printf("RSA keys not loaded - cannot handle RSA challenge!\n");
         return 0;
     }
     
-    //printf("Authenticating with server...\n");
-    
-    // Convert hex challenge back to binary
+   
     size_t challenge_len = strlen(hex_challenge) / 2;
     unsigned char encrypted_challenge[MAX_RSA_ENCRYPTED_SIZE];
-    /*
-    printf("DEBUG: Hex challenge length: %zu chars, Binary length: %zu bytes\n", 
-           strlen(hex_challenge), challenge_len);
-    printf("DEBUG: Expected encrypted size for 2048-bit RSA: %d bytes\n", MAX_RSA_ENCRYPTED_SIZE);
-    */
+    
     if (challenge_len != MAX_RSA_ENCRYPTED_SIZE) {
         printf("ERROR: Encrypted challenge length mismatch! Expected %d, got %zu\n", 
                MAX_RSA_ENCRYPTED_SIZE, challenge_len);
@@ -265,7 +486,7 @@ int handle_rsa_challenge(int socket, const char* hex_challenge) {
     }
     
     // Decrypt challenge with client private key
-    EVP_PKEY_CTX *decrypt_ctx = EVP_PKEY_CTX_new(client_private_key, NULL);
+    EVP_PKEY_CTX *decrypt_ctx = EVP_PKEY_CTX_new(dh_session.client_private_key, NULL);
     if (!decrypt_ctx || EVP_PKEY_decrypt_init(decrypt_ctx) <= 0 || 
         EVP_PKEY_CTX_set_rsa_padding(decrypt_ctx, RSA_PKCS1_OAEP_PADDING) <= 0) {
         if (decrypt_ctx) EVP_PKEY_CTX_free(decrypt_ctx);
@@ -276,23 +497,17 @@ int handle_rsa_challenge(int socket, const char* hex_challenge) {
     unsigned char decrypted_challenge[RSA_DECRYPT_BUFFER_SIZE];
     size_t decrypted_len = sizeof(decrypted_challenge);
     
-    /*
-    printf("DEBUG: About to decrypt %zu bytes of encrypted data\n", challenge_len);
-    printf("DEBUG: Decryption buffer size: %zu bytes\n", decrypted_len);
-    printf("DEBUG: Expected decrypted size: %d bytes\n", RSA_CHALLENGE_SIZE);
-        */
-    //decrypt the challenge using the client private key
+    
     if (EVP_PKEY_decrypt(decrypt_ctx, decrypted_challenge, &decrypted_len, encrypted_challenge, challenge_len) <= 0) {
         ERR_print_errors_fp(stdout);
-        PEM_write_PrivateKey(stdout, client_private_key, NULL, NULL, 0, NULL, NULL);
+        PEM_write_PrivateKey(stdout, dh_session.client_private_key, NULL, NULL, 0, NULL, NULL);
         EVP_PKEY_CTX_free(decrypt_ctx);
         printf("Failed to decrypt RSA challenge\n");
         return 0;
     }
     EVP_PKEY_CTX_free(decrypt_ctx);
     
-    //printf("DEBUG: Successfully decrypted %zu bytes (expected %d bytes)\n", 
-    //       decrypted_len, RSA_CHALLENGE_SIZE);
+    
     
     if (decrypted_len != RSA_CHALLENGE_SIZE) {
         printf("WARNING: Decrypted length mismatch! Expected %d, got %zu\n", 
@@ -300,7 +515,7 @@ int handle_rsa_challenge(int socket, const char* hex_challenge) {
     }
     
     // Encrypt decrypted challenge with server public key
-    EVP_PKEY_CTX *encrypt_ctx = EVP_PKEY_CTX_new(server_public_key, NULL);
+    EVP_PKEY_CTX *encrypt_ctx = EVP_PKEY_CTX_new(dh_session.server_public_key, NULL);
     if (!encrypt_ctx || EVP_PKEY_encrypt_init(encrypt_ctx) <= 0 || 
         EVP_PKEY_CTX_set_rsa_padding(encrypt_ctx, RSA_PKCS1_OAEP_PADDING) <= 0) {
         if (encrypt_ctx) EVP_PKEY_CTX_free(encrypt_ctx);
@@ -313,8 +528,7 @@ int handle_rsa_challenge(int socket, const char* hex_challenge) {
     
     // Use RSA_CHALLENGE_SIZE instead of decrypted_len for consistency
     size_t input_len = RSA_CHALLENGE_SIZE;
-    //printf("DEBUG: About to re-encrypt %zu bytes with server public key\n", input_len);
-    //printf("DEBUG: Output buffer size: %zu bytes\n", encrypted_len);
+   
     
     if (EVP_PKEY_encrypt(encrypt_ctx, encrypted_response, &encrypted_len, decrypted_challenge, input_len) <= 0) {
         ERR_print_errors_fp(stdout);
@@ -324,8 +538,7 @@ int handle_rsa_challenge(int socket, const char* hex_challenge) {
     }
     EVP_PKEY_CTX_free(encrypt_ctx);
     
-    //printf("DEBUG: Successfully re-encrypted to %zu bytes (expected %d bytes)\n", 
-    //      encrypted_len, MAX_RSA_ENCRYPTED_SIZE);
+    
     
     if (encrypted_len != MAX_RSA_ENCRYPTED_SIZE) {
         printf("WARNING: Re-encrypted length mismatch! Expected %d, got %zu\n", 
@@ -346,7 +559,6 @@ int handle_rsa_challenge(int socket, const char* hex_challenge) {
         return 0;
     }
     
-    //printf("RSA response sent successfully\n");
     
     // Clear sensitive data
     memset(decrypted_challenge, 0, sizeof(decrypted_challenge));
@@ -357,13 +569,13 @@ int handle_rsa_challenge(int socket, const char* hex_challenge) {
 
 // Cleanup RSA keys
 void cleanup_rsa_keys(void) {
-    if (client_private_key) {
-        EVP_PKEY_free(client_private_key);
-        client_private_key = NULL;
+    if (dh_session.client_private_key) {
+        EVP_PKEY_free(dh_session.client_private_key);
+        dh_session.client_private_key = NULL;
     }
-    if (server_public_key) {
-        EVP_PKEY_free(server_public_key);
-        server_public_key = NULL;
+    if (dh_session.server_public_key) {
+        EVP_PKEY_free(dh_session.server_public_key);
+        dh_session.server_public_key = NULL;
     }
 }
 
@@ -382,6 +594,7 @@ typedef enum {
 
 MessageResult process_server_message(int client_socket, const char* buffer);
 MessageResult handle_rsa_messages(int client_socket, const char* buffer);
+MessageResult handle_ecdh_messages(int client_socket, const char* buffer);
 MessageResult handle_server_shutdown(int client_socket, const char* buffer);
 MessageResult handle_auth_state_messages(const char* buffer);
 MessageResult handle_token_messages(const char* buffer);
@@ -408,6 +621,34 @@ void* receive_messages(void* arg) {
         
         buffer[bytes_received] = '\0';
         
+        // If secure and message is encrypted, decrypt first and then process
+        if (ecdh_ready && strncmp(buffer, "ENC ", 4) == 0) {
+            char* hex = buffer + 4;
+            // Trim trailing newline/CR/whitespace from the hex payload
+            char* end = hex + strlen(hex);
+            while (end > hex && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) {
+                end--;
+            }
+            *end = '\0';
+            unsigned char plain[BUFFER_SIZE]; 
+            size_t written = 0;
+            if (aes_gcm_decrypt_hex(dh_session.symmetric_key, hex, plain, sizeof(plain)-1, &written)) {
+                plain[written] = '\0';
+                // Process decrypted plaintext as if received
+                MessageResult result = process_server_message(client_socket, (const char*)plain);
+                if (result == MSG_EXIT) {
+                    snprintf(g_last_shutdown_reason, sizeof(g_last_shutdown_reason), "auth_or_rsa_exit");
+                    generate_client_debug_report(g_last_shutdown_reason, client_socket, 0);
+                    break;
+                }
+                if (result == MSG_PROCESSED) {
+                    show_appropriate_prompt();
+                }
+                continue;
+            } else {
+                printf("[SECURE] Failed to decrypt incoming message\n");
+            }
+        }
         // Process the message and determine if we should continue the loop
         MessageResult result = process_server_message(client_socket, buffer);
         
@@ -425,8 +666,6 @@ void* receive_messages(void* arg) {
     return NULL;
 }
 
-
-
 MessageResult process_server_message(int client_socket, const char* buffer) {
     // Store the message first
     store_message(buffer);
@@ -435,6 +674,11 @@ MessageResult process_server_message(int client_socket, const char* buffer) {
     MessageResult rsa_result = handle_rsa_messages(client_socket, buffer);
     if (rsa_result != MSG_PROCESSED) {
         return rsa_result;
+    }
+    // Handle ECDH exchange
+    MessageResult ecdh_result = handle_ecdh_messages(client_socket, buffer);
+    if (ecdh_result != MSG_PROCESSED) {
+        return ecdh_result;
     }
     
     // Handle server shutdown
@@ -468,6 +712,7 @@ MessageResult process_server_message(int client_socket, const char* buffer) {
     
     // Default: show server message
     printf("%s\n", buffer);
+    show_appropriate_prompt();
     return MSG_PROCESSED;
 }
 
@@ -480,13 +725,15 @@ MessageResult handle_rsa_messages(int client_socket, const char* buffer) {
         printf("\n[RSA] Performing RSA mutual authentication...\n");
         if (handle_rsa_challenge(client_socket, challenge_start)) {
             rsa_completed = 1;
-            printf("[RSA] SUCCESS: RSA mutual authentication completed!\n");
-            printf("[RSA] Secure encrypted channel established between client and server.\n");
-            printf("[RSA] You may now login with your username and password.\n\n");
+            
+            //printf("[RSA] SUCCESS: RSA mutual authentication completed!\n");
+           // printf("[RSA] Secure encrypted channel established between client and server.\n");
+            //printf("[RSA] You may now login with your username and password.\n\n");
+            return MSG_CONTINUE;
         } else {
             printf("[RSA] FAILED: RSA authentication failed! Connection may be terminated.\n");
+            return MSG_EXIT;
         }
-        return MSG_EXIT;
     }
     
     if (strstr(buffer, "RSA_FAILED")) {
@@ -509,6 +756,50 @@ MessageResult handle_rsa_messages(int client_socket, const char* buffer) {
     return MSG_PROCESSED;
 }
 
+// Handle ECDH messages
+MessageResult handle_ecdh_messages(int client_socket, const char* buffer) {
+    if (strncmp(buffer, "ECDH_SERVER_PUB", 15) == 0) {
+        printf("[ECDH] Received server public key\n");
+        const char* hex = buffer + 16;
+        const char* nl = strchr(hex, '\n');
+        char hexbuf[256];
+        if (nl) {
+            size_t n = (size_t)(nl - hex);
+            if (n >= sizeof(hexbuf)) n = sizeof(hexbuf) - 1;
+            memcpy(hexbuf, hex, n);
+            hexbuf[n] = '\0';
+            hex = hexbuf;
+        }
+        size_t written = 0;
+        if (!hex_decode(hex, dh_session.peer_public_raw, sizeof(dh_session.peer_public_raw), &written)) {
+            printf("[ECDH] Failed to parse server ECDH public key\n");
+            return MSG_PROCESSED;
+        }
+        dh_session.peer_public_len = written;
+        if (!derive_shared_secret(&dh_session) || !derive_session_key(&dh_session)) {
+            printf("[ECDH] Failed to derive session key\n");
+            return MSG_PROCESSED;
+        }
+        printf("[ECDH] Session keys derived, waiting for ECDH_OK to enable encryption\n");
+        // Send our ECDH public key to server
+        char hexpub[256];
+        if (!hex_encode(dh_session.ecdh_public_raw, dh_session.ecdh_public_len, hexpub, sizeof(hexpub))) {
+            return MSG_PROCESSED;
+        }
+        char msg[300];
+        snprintf(msg, sizeof(msg), "ECDH_CLIENT_PUB %s\n", hexpub);
+        send(client_socket, msg, strlen(msg), 0);
+        printf("[ECDH] Sent client public key, waiting for ECDH_OK\n");
+        return MSG_CONTINUE;
+    }
+    if (strncmp(buffer, "ECDH_OK", 7) == 0) {
+        ecdh_ready = 1; // Enable encryption after receiving ECDH_OK confirmation
+        printf("[ECDH] ECDH_OK received - handshake complete, encryption now enabled\n");
+        return MSG_CONTINUE;
+    }
+    return MSG_PROCESSED;
+}
+
 MessageResult handle_server_shutdown(int client_socket, const char* buffer) {
     if (strstr(buffer, "Server is shutting down") || 
         strstr(buffer, "server disconnected") ||
@@ -528,6 +819,13 @@ MessageResult handle_auth_state_messages(const char* buffer) {
     if (strstr(buffer, "AUTH_LOCKED")) {
         printf("\n%s\n", buffer);
         locked = 1;
+        return MSG_CONTINUE;
+    }
+    // Control message from server: request debug report on exit
+    if (strncmp(buffer, "DEBUG_ON_EXIT ", 14) == 0) {
+        strncpy(g_last_shutdown_reason, "debug_on_exit", sizeof(g_last_shutdown_reason)-1);
+        g_last_shutdown_reason[sizeof(g_last_shutdown_reason)-1] = '\0';
+        printf("[CTRL] Server requested client to generate debug report on exit.\n");
         return MSG_CONTINUE;
     }
     
@@ -633,6 +931,24 @@ void cleanup_client_resources(int client_socket) {
     
     // Cleanup RSA keys
     cleanup_rsa_keys();
+
+    // Cleanup ECDH ephemeral materials and reset state
+    ecdh_ready = 0;
+    if (dh_session.ecdh_keypair) {
+        EVP_PKEY_free(dh_session.ecdh_keypair);
+        dh_session.ecdh_keypair = NULL;
+    }
+    if (dh_session.shared_secret) {
+        OPENSSL_cleanse(dh_session.shared_secret, dh_session.shared_secret_len);
+        OPENSSL_free(dh_session.shared_secret);
+        dh_session.shared_secret = NULL;
+        dh_session.shared_secret_len = 0;
+    }
+    OPENSSL_cleanse(dh_session.symmetric_key, sizeof(dh_session.symmetric_key));
+    OPENSSL_cleanse(dh_session.ecdh_public_raw, dh_session.ecdh_public_len);
+    dh_session.ecdh_public_len = 0;
+    OPENSSL_cleanse(dh_session.peer_public_raw, dh_session.peer_public_len);
+    dh_session.peer_public_len = 0;
     
     // Cleanup message mutex
     pthread_mutex_destroy(&message_mutex);
@@ -654,6 +970,9 @@ int client_mode(int client_socket, const char* username) {
     char buffer[BUFFER_SIZE];
     pthread_t receive_thread;
 
+    // Ensure run loop is active for a fresh connection (in case prior session set it to 0)
+    running = 1;
+
     // Reset authentication state variables for fresh connection
     password_authenticated = 0;
     rsa_completed = 0;
@@ -665,80 +984,37 @@ int client_mode(int client_socket, const char* username) {
         g_username[sizeof(g_username) - 1] = '\0';
     }
     printf("Connected to secure MultiFactor Authentication chat server! Beginning RSA challenge-response authentication...\n");
-    //printf("Starting RSA challenge-response authentication...\n");
 
-    // Synchronously wait for and handle RSA challenge before starting receive thread
-    int rsa_ok = 0;
-    while (!rsa_ok && running) {
+    // Synchronously wait for and handle RSA challenge and ECDH handshake before starting receive thread
+    int rsa_auth_complete = 0;
+    while (!rsa_auth_complete && running) {
         int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
         if (bytes_received <= 0) {
             printf("\nServer disconnected\n");
             running = 0;
             return 0;
         }
-        //printf("[CLIENT_DEBUG] Parsing server input...\n");
+
         buffer[bytes_received] = '\0';
-        if (strstr(buffer, "RSA_CHALLENGE:") && !rsa_completed) {
-            char* challenge_start = strstr(buffer, "RSA_CHALLENGE:") + 14;
-            char* challenge_end = strchr(challenge_start, '\n');
-            if (challenge_end) *challenge_end = '\0';
-            //printf("[RSA] Performing RSA mutual authentication...\n");
-            if (handle_rsa_challenge(client_socket, challenge_start)) {
-                rsa_completed = 1;
-                rsa_ok = 1;
-                printf("[RSA] SUCCESS: RSA mutual authentication completed!\n");
-                //printf("[RSA] You may now login with your username and password.\n");
-            } 
-            else {
-                printf("[RSA] FAILED: RSA authentication failed! Connection may be terminated.\n");
-                running = 0;
-                return 0;
-            }
-        }
-        else if (strstr(buffer, "RSA_FAILED")) {
-            printf("\n[RSA] RSA authentication failed - connection may be terminated by server.\n");
+        MessageResult result = process_server_message(client_socket, buffer);
+        if (result == MSG_EXIT) {
             running = 0;
             return 0;
-        } 
-        else if (strstr(buffer, "SECURITY_ERROR")) {
-            printf("\n[RSA] SECURITY ERROR: RSA authentication is required but failed.\n");
-            printf("[RSA] Make sure you have the correct RSA keys for your client.\n");
-            running = 0;
-            return 0;
-        } 
-        else {
-            // Check for immediate authentication success (when all auth methods disabled)
-            if (strstr(buffer, "AUTH_SUCCESS")) {
-                printf("%s", buffer);
-                // Set all authentication flags
-                email_authenticated = 1;
-                password_authenticated = 1;
-                rsa_completed = 1;
-                locked = 0;
-                rsa_ok = 1; // Exit the authentication loop
-                printf("[AUTH] Auto-authentication successful! You are now fully authenticated.\n");
-            }
-            // Check for lockout status in initial messages
-            else if (strstr(buffer, "AUTH_LOCKED")) {
-                locked = 1;
-                printf("\n[AUTH] You are currently locked out. Please wait before trying again.\n");
-                running = 0;
-                return 0;
-            }
-            else {
-                // Print any other server message (e.g., banner, authentication prompt)
-                printf("%s", buffer);
-                
-                // Show auth prompt after displaying server messages
-                if (!rsa_completed) {
-                    printf("auth> ");
-                    fflush(stdout);
-                }
-            }
         }
-        
+        // If server indicates immediate success (no RSA/ECDH), finish bootstrap
+        if (strstr(buffer, "AUTH_SUCCESS") && !strstr(buffer, "RSA_AUTH_SUCCESS")) {
+            ecdh_ready = 1;
+            rsa_auth_complete = 1;
+            continue;
+        }
+        // When RSA and ECDH are both ready, we can proceed
+        if (rsa_completed && ecdh_ready) {
+            printf("[AUTH] RSA and ECDH authentication completed successfully!\n");
+            printf("[AUTH] You may now login with your username and password.\n\n");
+            rsa_auth_complete = 1;
+        }
     }
-    //printf("[CLIENT_DEBUG] RSA challenge completed\n");
+
     // Now start the receive thread for chat and further messages
     if (pthread_create(&receive_thread, NULL, receive_messages, &client_socket) != 0) {
         printf("Failed to create receive thread\n");
@@ -746,7 +1022,9 @@ int client_mode(int client_socket, const char* username) {
         generate_client_debug_report(g_last_shutdown_reason, client_socket, errno);
         return 0;
     }
-    //printf("[CLIENT_DEBUG] started receive thread\n");
+
+    // Show appropriate prompt since authentication handshake is complete
+    show_appropriate_prompt();
 
     // Main loop to send messages
     while (running && fgets(buffer, BUFFER_SIZE, stdin)) {
@@ -759,14 +1037,13 @@ int client_mode(int client_socket, const char* username) {
         if (strlen(buffer) > 0) {
             if(locked){
                 snprintf(buffer, sizeof(buffer), "/time");
-                send(client_socket, buffer, strlen(buffer), 0);
+                send_secure(client_socket, buffer, strlen(buffer));
                 continue;
             }
             if (!password_authenticated) {
                 if (strncmp(buffer, "/login", 6) == 0)  {
-                    //printf("[CLIENT_DEBUG] Sending auth command to server: '%s'\n", buffer);
                     
-                    if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
+                    if (send_secure(client_socket, buffer, strlen(buffer)) < 0) {
                         printf("Failed to send message\n");
                         running = 0;
                         break;
@@ -778,12 +1055,17 @@ int client_mode(int client_socket, const char* username) {
                     printf("auth> ");
                     continue;
                 }
+                else{
+                    printf("Please use /login <username> <password> to login\n");
+                    show_appropriate_prompt();
+                    continue;
+                }
 
             }
             else if(!email_authenticated) {
                 if(strncmp(buffer, "/token", 6) == 0 || strncmp(buffer, "/newToken", 9) == 0){
                     //printf("[CLIENT_DEBUG] Sending token command to server: '%s'\n", buffer);
-                    if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
+                    if (send_secure(client_socket, buffer, strlen(buffer)) < 0) {
                         printf("Failed to send message\n");
                         running = 0;
                         break;
@@ -795,8 +1077,8 @@ int client_mode(int client_socket, const char* username) {
                     continue;
                 }
             } else {
-                //printf("[CLIENT_DEBUG] Sending chat message to server: '%s'\n", buffer);
-                if (send(client_socket, buffer, strlen(buffer), 0) < 0) {
+                // Use send_secure for all post-authentication messages
+                if (send_secure(client_socket, buffer, strlen(buffer)) < 0) {
                     printf("Failed to send message\n");
                     running = 0;
                     break;
@@ -808,7 +1090,7 @@ int client_mode(int client_socket, const char* username) {
                 file_handling(username);
             }
             else{
-                printf(">");
+                show_appropriate_prompt();
             }
         } 
     }
@@ -953,7 +1235,12 @@ int main(int argc, char *argv[]) {
             printf("Failed to load RSA keys\n");
             return 1;
         }
-        printf("RSA keys loaded. Connecting to server...\n");
+        printf("RSA keys loaded. Generating ECDH keys... \n");
+        if (!generate_dh_keys(&dh_session)) {
+            printf("Failed to generate ECDH keys\n");
+            return 1;
+        }
+        printf("ECDH keys ready. Connecting to server...\n");
     } else {
         printf("Connecting to server... (RSA disabled)\n");
     }
@@ -1070,7 +1357,6 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    // Send username after certificate with retry logic
     char id_msg[BUFFER_SIZE];
     snprintf(id_msg, sizeof(id_msg), "USERNAME:%s\n", username);
     int user_retries = 0;
@@ -1095,7 +1381,6 @@ int main(int argc, char *argv[]) {
             break;
         }
     }
-    // Run secure chat client
     if(client_mode(sock, username)){
         close(sock);
         return 1;

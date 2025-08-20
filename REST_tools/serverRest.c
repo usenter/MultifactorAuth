@@ -12,7 +12,7 @@
 void enable_enhanced_logging_by_account_id(unsigned int account_id);
 void enable_enhanced_logging_by_username(const char *username);
 int should_apply_enhanced_logging(unsigned int account_id);
-
+char log_message[BUFFER_SIZE];
 // Function to parse human-readable timestamp
 time_t parse_human_timestamp(const char *timestamp_str) {
     if (!timestamp_str || strlen(timestamp_str) == 0) {
@@ -64,8 +64,9 @@ time_t parse_human_timestamp(const char *timestamp_str) {
         target_tm.tm_sec = 0;
         target_tm.tm_isdst = -1;
         time_t result = mktime(&target_tm);
-        printf( "DEBUG: Parsed '%s' -> year=%d, month=%d, day=%d, hour=%d, min=%d -> timestamp=%ld\n", 
+        snprintf(log_message, sizeof(log_message), "[DEBUG]Parsed '%s' -> year=%d, month=%d, day=%d, hour=%d, min=%d -> timestamp=%ld\n", 
                 timestamp_str, year, month, day, hour, minute, result);
+        FILE_LOG(log_message);
         return result;
     }
     
@@ -91,7 +92,8 @@ void enable_enhanced_logging_by_username(const char *username) {
     if (username_entry) {
         enable_enhanced_logging_for_account_id(username_entry->account_id);
     } else {
-        printf("DEBUG: Could not find account ID for username '%s'\n", username);
+        snprintf(log_message, sizeof(log_message), "[DEBUG]Could not find account ID for username '%s'\n", username);
+        FILE_LOG(log_message);
     }
 }
 
@@ -161,7 +163,8 @@ int is_log_in_time_range(const char *line, time_t start_time, time_t end_time) {
     }
      // Add this error check!
      if (log_time == (time_t)-1) {
-        printf( "ERROR: Failed to parse timestamp in line: %s\n", line);
+        snprintf(log_message, sizeof(log_message), "[ERROR]Failed to parse timestamp in line: %s\n", line);
+        FILE_LOG(log_message);
         return 0; 
     }
     if (start_time > 0 && end_time > 0) {
@@ -210,7 +213,8 @@ char* search_logs_by_account_id(unsigned int account_id, time_t start_time, time
         // Get current working directory for debugging
         char cwd[1024];
         if (getcwd(cwd, sizeof(cwd)) != NULL) {
-            printf("DEBUG: Current working directory: %s\n", cwd);
+            snprintf(log_message, sizeof(log_message), "[DEBUG]Current working directory: %s\n", cwd);
+            FILE_LOG(log_message);
         }
         
         char *error = malloc(256);
@@ -231,7 +235,8 @@ char* search_logs_by_account_id(unsigned int account_id, time_t start_time, time
     // Start building JSON response
     int json_len = snprintf(json, 1024*1024, 
         "{\"account_id\": %u, \"log_entries\": [", account_id);
-    printf( "DEBUG: Searching logs for account_id: %u, start_time: %ld, end_time: %ld\n", account_id, start_time, end_time);
+    snprintf(log_message, sizeof(log_message), "[DEBUG]Searching logs for account_id: %u, start_time: %ld, end_time: %ld\n", account_id, start_time, end_time);
+    FILE_LOG(log_message);
     while (fgets(line, sizeof(line), log_file)) {
         int line_account_id = extract_account_id_from_line(line);
         if (line_account_id == (int)account_id) {
@@ -382,24 +387,30 @@ char* get_user_status_json(unsigned int account_id, const char *username) {
     
     auth_flags_t auth_status = session ? session->auth_status : AUTH_NONE;
     const char *status_str = get_auth_status_string(auth_status);
+    int ecdh_ready = (session && session->session_key[0] != 0) ? 1 : 0;
+    int enhanced = get_account_enhanced_logging_status(account_id) ? 1 : 0;
     
-    char *json = malloc(512);
+    char *json = malloc(BUFFER_SIZE);
     if (!json) {
         return strdup("{\"error\": \"Memory allocation failed\"}");
     }
     
     if (username) {
-        snprintf(json, 512, 
-            "{\"username\": \"%s\", \"account_id\": %u, \"status\": \"%s\", \"last_seen\": \"%s\", \"auth_flags\": %d}", 
-            username, account_id, status_str, 
+        snprintf(json, BUFFER_SIZE,
+            "{\"username\": \"%s\", \"account_id\": %u, \"status\": \"%s\", \"last_seen\": \"%s\", \"auth_flags\": %d, \"ecdh_ready\": %s, \"enhanced_logging\": %s}",
+            username, account_id, status_str,
             session ? format_human_time(session->login_time) : "never",
-            auth_status);
+            auth_status,
+            ecdh_ready ? "true" : "false",
+            enhanced ? "true" : "false");
     } else {
-        snprintf(json, 512, 
-            "{\"account_id\": %u, \"username\": \"%s\", \"status\": \"%s\", \"last_seen\": \"%s\", \"auth_flags\": %d}", 
+        snprintf(json, BUFFER_SIZE,
+            "{\"account_id\": %u, \"username\": \"%s\", \"status\": \"%s\", \"last_seen\": \"%s\", \"auth_flags\": %d, \"ecdh_ready\": %s, \"enhanced_logging\": %s}",
             account_id, user->username, status_str,
             session ? format_human_time(session->login_time) : "never",
-            auth_status);
+            auth_status,
+            ecdh_ready ? "true" : "false",
+            enhanced ? "true" : "false");
     }
     
     return json;
@@ -474,7 +485,8 @@ log_query_t parse_log_query(const char *query) {
     if (!query) {
         return result;
     }
-    printf("DEBUG: Parsing query: %s\n", query);
+    snprintf(log_message, sizeof(log_message), "[DEBUG]Parsing query: %s\n", query);
+    FILE_LOG(log_message);
     char *query_copy = strdup(query);
     if (!query_copy) {
         return result; // Memory allocation failed
@@ -560,7 +572,8 @@ static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *co
     static int dummy;
     struct MHD_Response *response;
     int ret;
-    printf("DEBUG: REST API request handler called for URL: %s\n", url);
+    snprintf(log_message, sizeof(log_message), "[DEBUG]REST API request handler called for URL: %s\n", url);
+    FILE_LOG(log_message);
     if (&dummy != *con_cls) {
         *con_cls = &dummy;
         return MHD_YES;
@@ -572,7 +585,8 @@ static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *co
     // Handle only GET requests
     if (strcmp(method, "GET") != 0) {
         const char *error_msg = "{\"error\": \"Method not allowed\"}";
-        printf("DEBUG: Method not allowed\n");
+        snprintf(log_message, sizeof(log_message), "[DEBUG]Method not allowed\n");
+        FILE_LOG(log_message);
         response = MHD_create_response_from_buffer(strlen(error_msg),
                                                  (void*)error_msg,
                                                  MHD_RESPMEM_PERSISTENT);
@@ -584,7 +598,8 @@ static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *co
     
     // Handle /status endpoint
     if (strncmp(url, "/status", 7) == 0) {
-        printf("DEBUG: Handling /status endpoint\n");
+        snprintf(log_message, sizeof(log_message), "[DEBUG]Handling /status endpoint\n");
+        FILE_LOG(log_message);
         const char *account_id_param = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "account_id");
         const char *username_param = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "username");
         
@@ -624,7 +639,8 @@ static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *co
     
     // Handle /enhance endpoint for enhanced logging
     if (strncmp(url, "/enhance", 8) == 0) {
-        printf("DEBUG: Handling /enhance endpoint\n");
+        snprintf(log_message, sizeof(log_message), "[DEBUG]Handling /enhance endpoint\n");
+        FILE_LOG(log_message);
         const char *account_id_param = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "account_id");
         const char *username_param = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "username");
         
@@ -634,6 +650,18 @@ static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *co
             unsigned int account_id = atoi(account_id_param);
             // Enable enhanced logging for this account ID
             enable_enhanced_logging_by_account_id(account_id);
+            // Also signal the client to produce a debug report on exit
+            // Lookup active socket for this account
+            account_socket_t *mapping = NULL;
+            pthread_mutex_lock(&account_socket_map_mutex);
+            HASH_FIND_INT(account_socket_map, &account_id, mapping);
+            pthread_mutex_unlock(&account_socket_map_mutex);
+            if (mapping) {
+                // Try to send a control message (encrypted if session exists)
+                session_t *sess = find_session(account_id);
+                const char *ctrl = "DEBUG_ON_EXIT 1\n";
+                send(mapping->socket, ctrl, strlen(ctrl), 0);
+            }
             json_response = malloc(256);
             if (json_response) {
                 snprintf(json_response, 256, "{\"message\": \"Enhanced logging enabled for account ID %d\", \"account_id\": %d, \"status\": \"enabled\"}", 
@@ -646,6 +674,15 @@ static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *co
             
             if (username_entry) {
                 enable_enhanced_logging_by_username(username_param);
+                // Signal the client
+                account_socket_t *mapping = NULL;
+                pthread_mutex_lock(&account_socket_map_mutex);
+                HASH_FIND_INT(account_socket_map, &username_entry->account_id, mapping);
+                pthread_mutex_unlock(&account_socket_map_mutex);
+                if (mapping) {
+                    const char *ctrl = "DEBUG_ON_EXIT 1\n";
+                    send(mapping->socket, ctrl, strlen(ctrl), 0);
+                }
                 json_response = malloc(256);
                 if (json_response) {
                     snprintf(json_response, 256, "{\"message\": \"Enhanced logging enabled for username '%s'\", \"username\": \"%s\", \"account_id\": %d, \"status\": \"enabled\"}", 
@@ -675,7 +712,8 @@ static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *co
     
     // Handle /disable endpoint to turn off enhanced logging
     if (strncmp(url, "/disable", 8) == 0) {
-        printf("DEBUG: Handling /disable endpoint\n");
+        snprintf(log_message, sizeof(log_message), "[DEBUG]Handling /disable endpoint\n");
+        FILE_LOG(log_message);
         
         // Disable enhanced logging for all users
         user_t *user;
@@ -698,7 +736,8 @@ static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *co
     
     // Handle /status endpoint to show enhanced logging state
     if (strncmp(url, "/status", 7) == 0 && strcmp(url, "/status") == 0) {
-        printf("DEBUG: Handling /status endpoint for enhanced logging\n");
+        snprintf(log_message, sizeof(log_message), "[DEBUG]Handling /status endpoint for enhanced logging\n");
+        FILE_LOG(log_message);
         char json_response[512];
         
         // Count users with enhanced logging enabled
@@ -808,7 +847,7 @@ static enum MHD_Result rest_request_handler(void *cls, struct MHD_Connection *co
 
 // Function to start REST API server
 struct MHD_Daemon* start_rest_server(int port) {
-    printf("DEBUG: Starting REST API server on port %d\n", port);
+    printf("Starting REST API server on port %d\n", port);
     return MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, port, NULL, NULL,
                            &rest_request_handler, NULL,
                            MHD_OPTION_END);

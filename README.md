@@ -7,6 +7,7 @@ Authenticated chat server with RSA authentication, password protection, and an e
 - **Authentication**: RSA cryptographic challenge + username/password
 - **Encrypted User Database**: AES-256-CBC encrypted user storage  
 - **Session Management**: Automatic timeout and cleanup
+- **DOS Protection**: Creates tunable IP Table rules to limit DOS attacks
 - **Multi-Client Chat**: Nicknames, user list, message broadcasting
 
 ## Project Structure
@@ -21,7 +22,9 @@ MultifactorAuth/
 ├── generate_rsa_keys.c      # RSA key pair generation utility
 ├── user_encryptor.c         # User database encryption tool
 ├── hashmap/                 # Third-party hashmap library
-├── UserDirectory/           # Client-accesible directory for file handling
+├── UserDirectory/           # Client-accesible directory for file handling`
+├── TestingScripts/          # Scripts for stress testing server
+├── IPTableFunctions/        # Cleans and applies IP table rules
 └── Makefile                 # Build configuration
 ```
 

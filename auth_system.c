@@ -6,6 +6,8 @@
 #include <dirent.h>
 #include "hashmap/uthash.h"
 #include <openssl/evp.h>
+#include <openssl/kdf.h>
+#include <openssl/crypto.h>
 
 
 // Global variables
@@ -594,6 +596,10 @@ int create_auth_session(int account_id) {
     session->lockout_info.lockout_start_time = 0;
     memset(session->challenge, 0, RSA_CHALLENGE_SIZE);
     memset(&session->email_token, 0, sizeof(email_token_t));
+    session->ecdh_keypair = NULL;
+    memset(session->session_key, 0, sizeof(session->session_key));
+    memset(session->ecdh_peer_pub, 0, sizeof(session->ecdh_peer_pub));
+    session->ecdh_peer_pub_len = 0;
     
     pthread_mutex_lock(&session_map_mutex);
     HASH_ADD_INT(session_map, account_id, session);
@@ -1711,7 +1717,7 @@ rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* 
         session->auth_status |= AUTH_RSA;  // Set RSA authentication flag
         result.success = 1;
         snprintf(result.response, sizeof(result.response), 
-                "%s RSA authentication successful", RSA_AUTH_SUCCESS);
+                "%s RSA authentication successful.", RSA_AUTH_SUCCESS);
         
         snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] RSA authentication successful\n", account_id);
         FILE_LOG(log_message);
@@ -1962,13 +1968,39 @@ void cleanup_session(session_t *session) {
         return;
     }
     
-    
+    // Cleanse sensitive ECDH/session materials
+    OPENSSL_cleanse(session->session_key, sizeof(session->session_key));
+    OPENSSL_cleanse(session->ecdh_peer_pub, sizeof(session->ecdh_peer_pub));
+    session->ecdh_peer_pub_len = 0;
+    OPENSSL_cleanse(session->challenge, sizeof(session->challenge));
     
     // Session doesn't own the user - just clear the reference
     // The user will be freed separately when cleaning up the user_map
     session->user = NULL;
+    if (session->ecdh_keypair) {
+        EVP_PKEY_free(session->ecdh_keypair);
+        session->ecdh_keypair = NULL;
+    }
     
     free(session);
+}
+
+// Reset per-connection ECDH/session keying material without destroying the session
+void reset_session_ecdh(int account_id) {
+    session_t *session = NULL;
+    pthread_mutex_lock(&session_map_mutex);
+    HASH_FIND_INT(session_map, &account_id, session);
+    pthread_mutex_unlock(&session_map_mutex);
+    if (!session) {
+        return;
+    }
+    if (session->ecdh_keypair) {
+        EVP_PKEY_free(session->ecdh_keypair);
+        session->ecdh_keypair = NULL;
+    }
+    memset(session->session_key, 0, sizeof(session->session_key));
+    memset(session->ecdh_peer_pub, 0, sizeof(session->ecdh_peer_pub));
+    session->ecdh_peer_pub_len = 0;
 }
 // Cleanup RSA system
 void cleanup_rsa_system(void) {

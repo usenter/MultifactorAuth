@@ -3,7 +3,7 @@
 
 //default values
 const char *syn_rate = "1000/second";   
-const int syn_burst = 200;              
+const int syn_burst = 2000;      // make same as syn_rate        
 const int per_ip_limit = 10000;           
 
 static int run_shell_command(const char *cmd) {
