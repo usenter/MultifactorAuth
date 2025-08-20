@@ -1,3 +1,4 @@
+#include <emailFunctions/emailFunction.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -175,8 +176,12 @@ static void decrypt_inplace_if_needed(int client_socket, char* buffer, size_t bu
         return;
     }
     session_t *sess = find_session(sinfo->account_id);
-    if (!sess || sess->session_key[0] == 0) {
-        printf("[DECRYPT] No session or session keys for account_id %d\n", sinfo->account_id);
+    if (!sess) {
+        printf("[DECRYPT] No session found for account_id %d\n", sinfo->account_id);
+        return;
+    }
+    if (sess->session_key[0] == 0) {
+        printf("[DECRYPT] Session exists but no session key for account_id %d (ECDH not complete)\n", sinfo->account_id);
         return;
     }
     snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Decrypting message: %s\n", 
@@ -245,6 +250,13 @@ static int send_ecdh_server_pub(int client_socket, unsigned int account_id) {
 static int handle_ecdh_client_pub(int client_socket, unsigned int account_id, const char* hex) {
     session_t *session = find_session(account_id);
     if (!session || !session->ecdh_keypair) return 0;
+    char log_message[BUFFER_SIZE];
+    // Prevent duplicate ECDH processing - if we already have a session key, skip
+    if (session->session_key[0] != 0) {
+        snprintf(log_message, sizeof(log_message), "[ECDH] Session key already exists for account_id %d, skipping duplicate ECDH\n", account_id);
+        FILE_LOG(log_message);
+        return 1; // Return success but don't process
+    }
     size_t written = 0;
     if (!hex_decode(hex, session->ecdh_peer_pub, sizeof(session->ecdh_peer_pub), &written)) return 0;
     session->ecdh_peer_pub_len = written;
@@ -363,6 +375,41 @@ void broadcast_message(const char* message, int sender_socket, int overrideBroad
     pthread_mutex_unlock(&clients_mutex);
     free(message_with_newline);
 }
+
+// Helper function for proper socket cleanup with ECDH key handling
+static void cleanup_socket_with_ecdh(int client_socket) {
+    char log_message[BUFFER_SIZE];
+    
+    // Check if we have account_id and session data to clean up
+    socket_info_t *sinfo = get_socket_info(client_socket);
+    if (sinfo && sinfo->account_id > 0) {
+        // Clean up ECDH keys and session data
+        session_t *sess = find_session(sinfo->account_id);
+        if (sess) {
+            if (sess->ecdh_keypair) {
+                EVP_PKEY_free(sess->ecdh_keypair);
+                sess->ecdh_keypair = NULL;
+                snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Freed ECDH keypair for account_id %d during error cleanup\n", sinfo->account_id);
+                FILE_LOG(log_message);
+            }
+            // Clear session key and peer pub data
+            memset(sess->session_key, 0, sizeof(sess->session_key));
+            memset(sess->ecdh_peer_pub, 0, sizeof(sess->ecdh_peer_pub));
+            sess->ecdh_peer_pub_len = 0;
+            snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Cleared session keys for account_id %d during error cleanup\n", sinfo->account_id);
+            FILE_LOG(log_message);
+        }
+        
+        // Remove account mapping and session
+        remove_account_socket_mapping(sinfo->account_id);
+        remove_session(sinfo->account_id);
+    }
+    
+    // Remove socket info and close socket
+    remove_socket_info(client_socket);
+    close(client_socket);
+}
+
 void remove_client(int client_socket) {
     char log_message[BUFFER_SIZE];
     snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Starting cleanup for socket %d\n", client_socket);
@@ -405,6 +452,24 @@ void remove_client(int client_socket) {
             remove_account_socket_mapping(fallback_account_id);
             snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Removing session for account_id %d (fallback)\n", fallback_account_id);
             FILE_LOG(log_message);
+            
+            // Clean up ECDH keys and session data before removing session
+            session_t *sess = find_session(fallback_account_id);
+            if (sess) {
+                if (sess->ecdh_keypair) {
+                    EVP_PKEY_free(sess->ecdh_keypair);
+                    sess->ecdh_keypair = NULL;
+                    snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Freed ECDH keypair for account_id %d (fallback)\n", fallback_account_id);
+                    FILE_LOG(log_message);
+                }
+                // Clear session key and peer pub data
+                memset(sess->session_key, 0, sizeof(sess->session_key));
+                memset(sess->ecdh_peer_pub, 0, sizeof(sess->ecdh_peer_pub));
+                sess->ecdh_peer_pub_len = 0;
+                snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Cleared session keys for account_id %d (fallback)\n", fallback_account_id);
+                FILE_LOG(log_message);
+            }
+            
             remove_session(fallback_account_id);
         }
         snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Fallback cleanup complete for socket %d\n", client_socket);
@@ -471,6 +536,24 @@ void remove_client(int client_socket) {
     if (account_id != 0) {
         snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Removing session for account_id %d\n", account_id);
         FILE_LOG(log_message);
+        
+        // Clean up ECDH keys and session data before removing session
+        session_t *sess = find_session(account_id);
+        if (sess) {
+            if (sess->ecdh_keypair) {
+                EVP_PKEY_free(sess->ecdh_keypair);
+                sess->ecdh_keypair = NULL;
+                snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Freed ECDH keypair for account_id %d\n", account_id);
+                FILE_LOG(log_message);
+            }
+            // Clear session key and peer pub data
+            memset(sess->session_key, 0, sizeof(sess->session_key));
+            memset(sess->ecdh_peer_pub, 0, sizeof(sess->ecdh_peer_pub));
+            sess->ecdh_peer_pub_len = 0;
+            snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Cleared session keys for account_id %d\n", account_id);
+            FILE_LOG(log_message);
+        }
+        
         remove_session(account_id);
     }
     
@@ -621,7 +704,7 @@ void promote_to_authenticated(int socket, unsigned int account_id) {
     snprintf(response, sizeof(response), "AUTH_SUCCESS You are now fully authenticated.\n");
     
     // Send with error checking
-    ssize_t sent = send(socket, response, strlen(response), 0);
+    ssize_t sent = send_secure(socket, response, strlen(response));
     if (sent < 0) {
         snprintf(log_message, sizeof(log_message), "[ERROR][PROMOTE][ID:%d] Failed to send AUTH_SUCCESS to socket %d: %s\n", 
                  account_id, socket, strerror(errno));
@@ -771,6 +854,12 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
     // Regular chat message - broadcast to everyone
     if (strlen(buffer) > 0) {
         decrypt_inplace_if_needed(client_socket, buffer, sizeof(buffer));
+        // Ignore ECDH messages in chat path
+        if (strncmp(buffer, "ECDH_", 5) == 0) {
+            snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD][ID:%d] Ignoring ECDH message in chat path: %s\n", c->account_id, buffer);
+            FILE_LOG(log_message);
+            return;
+        }
         snprintf(broadcast_msg, sizeof(broadcast_msg), 
                  "%s: %s", c->nickname, buffer);
         broadcast_message(broadcast_msg, client_socket, 0);
@@ -881,7 +970,10 @@ void* auth_thread_func(void *arg) {
             buffer[strcspn(buffer, "\r\n")] = 0;
             
             // If this socket is secure and message starts with ENC, decrypt first
-            decrypt_inplace_if_needed(client_socket, buffer, sizeof(buffer));
+            // But skip ECDH handshake messages to avoid decrypting during key exchange
+            if (strncmp(buffer, "ECDH_", 5) != 0) {
+                decrypt_inplace_if_needed(client_socket, buffer, sizeof(buffer));
+            }
             
             // ECDH client pub handling (only allowed after RSA)
             if (strncmp(buffer, "ECDH_CLIENT_PUB", 15) == 0) {
@@ -955,8 +1047,6 @@ void* auth_thread_func(void *arg) {
         if (account_id > 0) {
             username_t *uname_entry = find_username_by_account_id(account_id);
             if (uname_entry) {
-                // Enhanced logging will be handled automatically by FILE_LOG if enabled
-                decrypt_inplace_if_needed(client_socket, buffer, sizeof(buffer));
                 snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Authentication attempt - Socket: %d, Data: %s\n", 
                          account_id, client_socket, buffer);
                 FILE_LOG(log_message);
@@ -1002,14 +1092,17 @@ void* auth_thread_func(void *arg) {
                     continue;
                 }
 
-                // After RSA succeeds, force a fresh ECDH handshake for this socket
+                // After RSA succeeds, initiate ECDH exactly once (do NOT reset if a key exists)
                 if ((auth_status & AUTH_RSA)) {
                     session_t *sess = find_session(account_id);
-                    if (sess) {
-                        reset_session_ecdh(account_id);
-                        send_ecdh_server_pub(client_socket, account_id);
-                        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] ECDH server pub sent to socket %d (reset)\n", info->account_id, client_socket);
-                        FILE_LOG(log_message);
+                    if (sess && sess->session_key[0] == 0) {
+                        // Only start ECDH if no session key has been derived yet
+                        if (!sess->ecdh_keypair) {
+                            // First-time ECDH for this connection
+                            send_ecdh_server_pub(client_socket, account_id);
+                            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] ECDH server pub sent to socket %d (first-time after RSA)\n", info->account_id, client_socket);
+                            FILE_LOG(log_message);
+                        }
                     }
                 }
 
@@ -1175,6 +1268,13 @@ void* cmd_thread_func(void *arg) {
             decrypt_inplace_if_needed(client_socket, buffer, sizeof(buffer));
             snprintf(log_message, sizeof(log_message), "[INFO]Decrypted message: %s\n", buffer);
             FILE_LOG(log_message);
+
+            // Ignore any stray ECDH handshake messages in CMD thread to avoid broadcasting them
+            if (strncmp(buffer, "ECDH_", 5) == 0) {
+                snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD][ID:%d] Ignoring ECDH message in CMD thread: %s\n", info->account_id, buffer);
+                FILE_LOG(log_message);
+                continue;
+            }
             
             buffer[strcspn(buffer, "\r\n")] = 0;
             
@@ -1318,7 +1418,7 @@ void* handle_authenticated_client(void* arg) {
     
     if (!c) {
         printf("Error: No client found for socket %d in authenticated handler\n", client_socket);
-        close(client_socket);
+        cleanup_socket_with_ecdh(client_socket);
         return NULL;
     }
     
@@ -1624,8 +1724,7 @@ int setup_initial_connection(int client_socket) {
         if (!client_cert) {
             snprintf(log_message, sizeof(log_message), "[WARN][AUTH_THREAD] Certificate extraction failed for socket %d - client may have disconnected\n", client_socket);
             FILE_LOG(log_message);
-            remove_socket_info(client_socket);
-            close(client_socket);
+            cleanup_socket_with_ecdh(client_socket);
             return -1;
         }
 
@@ -1635,8 +1734,7 @@ int setup_initial_connection(int client_socket) {
             snprintf(log_message, sizeof(log_message), "[CRITICAL][AUTH_THREAD] Failed to extract public key from client certificate.\n");
             FILE_LOG(log_message);
             X509_free(client_cert);
-            remove_socket_info(client_socket);
-            close(client_socket);
+            cleanup_socket_with_ecdh(client_socket);
             return -1;
         }
         
@@ -1678,8 +1776,7 @@ int setup_initial_connection(int client_socket) {
                     FILE_LOG(log_message);
                     EVP_PKEY_free(client_pubkey);
                     X509_free(client_cert);
-                    remove_socket_info(client_socket);
-                    close(client_socket);
+                    cleanup_socket_with_ecdh(client_socket);
                     return -1;
                 }
                 
@@ -1693,8 +1790,7 @@ int setup_initial_connection(int client_socket) {
                 FILE_LOG(log_message);
                 EVP_PKEY_free(client_pubkey);
                 X509_free(client_cert);
-                remove_socket_info(client_socket);
-                close(client_socket);
+                cleanup_socket_with_ecdh(client_socket);
                 return -1;
             }
         }
@@ -1713,8 +1809,7 @@ int setup_initial_connection(int client_socket) {
         FILE_LOG(log_message);
         EVP_PKEY_free(client_pubkey);
         X509_free(client_cert);
-        remove_socket_info(client_socket);
-        close(client_socket);
+        cleanup_socket_with_ecdh(client_socket);
         return -1;
     }
     
@@ -1736,8 +1831,7 @@ int setup_initial_connection(int client_socket) {
             
             if (client_pubkey) EVP_PKEY_free(client_pubkey);
             if (client_cert) X509_free(client_cert);
-            remove_socket_info(client_socket);
-            close(client_socket);
+            cleanup_socket_with_ecdh(client_socket);
             return -1;
         }
         
@@ -1760,8 +1854,7 @@ int setup_initial_connection(int client_socket) {
             send(client_socket, response, strlen(response), 0);
             if (client_pubkey) EVP_PKEY_free(client_pubkey);
             if (client_cert) X509_free(client_cert);
-            remove_socket_info(client_socket);
-            close(client_socket);
+            cleanup_socket_with_ecdh(client_socket);
             return -1;
         }
         if(get_auth_status(account_id) & AUTH_STATUS_LOCKED){
@@ -1773,8 +1866,7 @@ int setup_initial_connection(int client_socket) {
             FILE_LOG(log_message);
             if (client_pubkey) EVP_PKEY_free(client_pubkey);
             if (client_cert) X509_free(client_cert);
-            remove_socket_info(client_socket);
-            close(client_socket);
+            cleanup_socket_with_ecdh(client_socket);
             return -1;
             }
             else if(get_remaining_lockout_time(account_id) <= 0){
@@ -1809,8 +1901,7 @@ int setup_initial_connection(int client_socket) {
             send(client_socket, response, strlen(response), 0);
             if (client_pubkey) EVP_PKEY_free(client_pubkey);
             if (client_cert) X509_free(client_cert);
-            remove_socket_info(client_socket);
-            close(client_socket);
+            cleanup_socket_with_ecdh(client_socket);
             return -1;
         }
         
@@ -1825,8 +1916,7 @@ int setup_initial_connection(int client_socket) {
             FILE_LOG(log_message);
             if (client_pubkey) EVP_PKEY_free(client_pubkey);
             if (client_cert) X509_free(client_cert);
-            remove_socket_info(client_socket);
-            close(client_socket);
+            cleanup_socket_with_ecdh(client_socket);
             return -1;
         }
         if(check_and_handle_lockout(account_id, client_socket)){
@@ -1858,8 +1948,7 @@ int setup_initial_connection(int client_socket) {
                 FILE_LOG(log_message);
                 EVP_PKEY_free(client_pubkey);
                 X509_free(client_cert);
-                remove_socket_info(client_socket);
-                close(client_socket);
+                cleanup_socket_with_ecdh(client_socket);
                 return -1;
             }
         }
@@ -1910,8 +1999,7 @@ int setup_initial_connection(int client_socket) {
         send(client_socket, response, strlen(response), 0);
         EVP_PKEY_free(client_pubkey);
         X509_free(client_cert);
-        remove_socket_info(client_socket);
-        close(client_socket);
+        cleanup_socket_with_ecdh(client_socket);
         return -1;
     }
     if (account_id > 0) {
@@ -1920,8 +2008,7 @@ int setup_initial_connection(int client_socket) {
             FILE_LOG(log_message);
             if (client_pubkey) EVP_PKEY_free(client_pubkey);
             if (client_cert) X509_free(client_cert);
-            remove_socket_info(client_socket);
-            close(client_socket);
+            cleanup_socket_with_ecdh(client_socket);
             return -1; // Reject connection entirely
         }
     }
@@ -2522,7 +2609,7 @@ int main(int argc, char *argv[]) {
                            max_clients, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
                     FILE_LOG(log_message);
                     send(client_socket, "Server is full, please try again later\n", 38, 0);
-                    close(client_socket);
+                    cleanup_socket_with_ecdh(client_socket);
                     continue;
                 }
                 
@@ -2587,8 +2674,7 @@ int main(int argc, char *argv[]) {
                             if (epoll_ctl(auth_thread_ctx.epoll_fd, EPOLL_CTL_ADD, client_socket, &client_event) == -1) {
                                 snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] epoll_ctl (auth) failed\n");
                                 FILE_LOG(log_message);
-                                remove_socket_info(client_socket);
-                                close(client_socket);
+                                cleanup_socket_with_ecdh(client_socket);
                                 continue;
                             }
                             

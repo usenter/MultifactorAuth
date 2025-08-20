@@ -629,6 +629,9 @@ int reset_auth_session(int account_id) {
     session->lockout_info.failed_attempts = 0;
     session->lockout_info.is_locked = 0;
     
+    // Ensure ECDH material is cleared for a fresh handshake on new connections
+    reset_session_ecdh(account_id);
+
     return 1;
 }
 

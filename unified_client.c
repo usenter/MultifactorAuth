@@ -712,7 +712,6 @@ MessageResult process_server_message(int client_socket, const char* buffer) {
     
     // Default: show server message
     printf("%s\n", buffer);
-    show_appropriate_prompt();
     return MSG_PROCESSED;
 }
 
