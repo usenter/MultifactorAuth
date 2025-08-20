@@ -125,7 +125,7 @@ status
 - POSIX threads (pthread)
 
 
-###Requirements for Scripts and Makefiles###
+###Requirements for Scripts and Makefiles
 - Net-tools package for Linux(monitoring server during stress test)
 - `Expect` command(for multi-user log in) 
 - Clang compiler(for Makefile)
