@@ -1609,6 +1609,11 @@ rsa_challenge_result_t start_rsa_challenge_for_client(int account_id, EVP_PKEY* 
         cleanup_session(session);
         return result;
     }
+
+    //store challenge as a salt
+    memcpy(session->hkdf_salt, session->challenge, RSA_CHALLENGE_SIZE);
+    session->hkdf_salt_len = RSA_CHALLENGE_SIZE;
+
     // Use the provided public key for encryption
     EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(session->user->public_key, NULL);
     if (!ctx || EVP_PKEY_encrypt_init(ctx) <= 0 || EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0) {
@@ -1724,7 +1729,8 @@ rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* 
         
         snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] RSA authentication successful\n", account_id);
         FILE_LOG(log_message);
-    } else {
+    } 
+    else {
         result.success = 0;
         snprintf(result.response, sizeof(result.response), 
                 "%s Challenge verification failed", RSA_AUTH_FAILED);

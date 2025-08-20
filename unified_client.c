@@ -57,6 +57,8 @@ typedef struct {
     unsigned char *shared_secret;   
     size_t shared_secret_len;
     unsigned char symmetric_key[32]; // Final 256-bit key
+    unsigned char hkdf_salt[RSA_CHALLENGE_SIZE]; // Salt for HKDF
+    size_t hkdf_salt_len;
 } dh_session_t;
 
 dh_session_t dh_session;
@@ -136,13 +138,15 @@ int derive_session_key(dh_session_t *session) {
     if (session == NULL || session->shared_secret == NULL || session->shared_secret_len == 0) {
         return 0;
     }
-    // Use HKDF-SHA256 with no salt/info to derive a 32-byte session key
+    // Use HKDF-SHA256 with salt to derive a 32-byte session key
     EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
     if (!kctx) return 0;
     size_t outlen = sizeof(session->symmetric_key);
+    const unsigned char* hkdf_salt = session->hkdf_salt;
+    size_t hkdf_salt_len = session->hkdf_salt_len;
     int ok = EVP_PKEY_derive_init(kctx) == 1 &&
              EVP_PKEY_CTX_set_hkdf_md(kctx, EVP_sha256()) == 1 &&
-             EVP_PKEY_CTX_set1_hkdf_salt(kctx, NULL, 0) == 1 &&
+             EVP_PKEY_CTX_set1_hkdf_salt(kctx, hkdf_salt, hkdf_salt_len) == 1 &&
              EVP_PKEY_CTX_set1_hkdf_key(kctx, session->shared_secret, (int)session->shared_secret_len) == 1 &&
              EVP_PKEY_CTX_add1_hkdf_info(kctx, (const unsigned char*)"MFADH", 5) == 1 &&
              EVP_PKEY_derive(kctx, session->symmetric_key, &outlen) == 1;
@@ -505,6 +509,13 @@ int handle_rsa_challenge(int socket, const char* hex_challenge) {
         printf("Failed to decrypt RSA challenge\n");
         return 0;
     }
+    if(decrypted_len >= RSA_CHALLENGE_SIZE){
+        memcpy(dh_session.hkdf_salt, decrypted_challenge, RSA_CHALLENGE_SIZE);
+        dh_session.hkdf_salt_len = RSA_CHALLENGE_SIZE;
+    }else{
+        dh_session.hkdf_salt_len = 0;
+        dh_session.hkdf_salt[0] = 0;
+    }
     EVP_PKEY_CTX_free(decrypt_ctx);
     
     
@@ -725,9 +736,6 @@ MessageResult handle_rsa_messages(int client_socket, const char* buffer) {
         if (handle_rsa_challenge(client_socket, challenge_start)) {
             rsa_completed = 1;
             
-            //printf("[RSA] SUCCESS: RSA mutual authentication completed!\n");
-           // printf("[RSA] Secure encrypted channel established between client and server.\n");
-            //printf("[RSA] You may now login with your username and password.\n\n");
             return MSG_CONTINUE;
         } else {
             printf("[RSA] FAILED: RSA authentication failed! Connection may be terminated.\n");
@@ -758,7 +766,7 @@ MessageResult handle_rsa_messages(int client_socket, const char* buffer) {
 // Handle ECDH messages
 MessageResult handle_ecdh_messages(int client_socket, const char* buffer) {
     if (strncmp(buffer, "ECDH_SERVER_PUB", 15) == 0) {
-        printf("[ECDH] Received server public key\n");
+        //printf("[ECDH] Received server public key\n");
         const char* hex = buffer + 16;
         const char* nl = strchr(hex, '\n');
         char hexbuf[256];
@@ -779,7 +787,7 @@ MessageResult handle_ecdh_messages(int client_socket, const char* buffer) {
             printf("[ECDH] Failed to derive session key\n");
             return MSG_PROCESSED;
         }
-        printf("[ECDH] Session keys derived, waiting for ECDH_OK to enable encryption\n");
+        //printf("[ECDH] Session keys derived, waiting for ECDH_OK to enable encryption\n");
         // Send our ECDH public key to server
         char hexpub[256];
         if (!hex_encode(dh_session.ecdh_public_raw, dh_session.ecdh_public_len, hexpub, sizeof(hexpub))) {
@@ -788,12 +796,12 @@ MessageResult handle_ecdh_messages(int client_socket, const char* buffer) {
         char msg[300];
         snprintf(msg, sizeof(msg), "ECDH_CLIENT_PUB %s\n", hexpub);
         send(client_socket, msg, strlen(msg), 0);
-        printf("[ECDH] Sent client public key, waiting for ECDH_OK\n");
+        //printf("[ECDH] Sent client public key, waiting for ECDH_OK\n");
         return MSG_CONTINUE;
     }
     if (strncmp(buffer, "ECDH_OK", 7) == 0) {
         ecdh_ready = 1; // Enable encryption after receiving ECDH_OK confirmation
-        printf("[ECDH] ECDH_OK received - handshake complete, encryption now enabled\n");
+        //printf("[ECDH] ECDH_OK received - handshake complete, encryption now enabled\n");
         return MSG_CONTINUE;
     }
     return MSG_PROCESSED;
@@ -1009,7 +1017,7 @@ int client_mode(int client_socket, const char* username) {
         // When RSA and ECDH are both ready, we can proceed
         if (rsa_completed && ecdh_ready) {
             printf("[AUTH] RSA and ECDH authentication completed successfully!\n");
-            printf("[AUTH] You may now login with your username and password.\n\n");
+            printf("[AUTH] You may now login with your username and password. Use /login <username> <password> to login\n\n");
             rsa_auth_complete = 1;
         }
     }

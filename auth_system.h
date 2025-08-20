@@ -116,6 +116,8 @@ typedef struct {
     unsigned char session_key[32];
     unsigned char ecdh_peer_pub[64];
     size_t ecdh_peer_pub_len;
+    unsigned char hkdf_salt[RSA_CHALLENGE_SIZE];
+    size_t hkdf_salt_len;
     UT_hash_handle hh;  // Required for hash table functionality
 } session_t;
 
