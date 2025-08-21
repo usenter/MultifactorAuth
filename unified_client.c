@@ -19,6 +19,10 @@
 #include <sys/stat.h>
 #include <netinet/tcp.h>
 #include <sys/utsname.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include "JWT_tools/jwtOperations.h"
 #define PORT 12345
 #define BUFFER_SIZE 2048
 #define MAX_MESSAGES 100
@@ -40,6 +44,10 @@ int locked = 0;
 static int ecdh_ready = 0;
 static char g_username[MAX_USERNAME_LEN] = "";
 static char g_last_shutdown_reason[128] = "normal";
+
+// JWT token storage
+static char g_stored_jwt_token[2048] = "";
+static char g_jwt_token_file[MAX_FILE_PATH_LEN] = "";
 
 
 // RSA keys for automatic authentication + ECDH session state
@@ -71,6 +79,12 @@ unsigned int account_id = 0;  // Add account_id
 
 // Function to cleanup client resources
 void cleanup_client_resources(int client_socket);
+
+// JWT token management function declarations
+int load_jwt_token(const char* username);
+void save_jwt_token(const char* token);
+void clear_jwt_token();
+int is_jwt_token_expired(const char* token);
 
 // Global message storage
 typedef struct {
@@ -152,6 +166,12 @@ int derive_session_key(dh_session_t *session) {
              EVP_PKEY_derive(kctx, session->symmetric_key, &outlen) == 1;
     EVP_PKEY_CTX_free(kctx);
     if (ok) {
+        // Debug: Print first 8 bytes of derived key
+        printf("[ECDH] Session key derived successfully. First 8 bytes: ");
+        for (int i = 0; i < 8 && i < (int)sizeof(session->symmetric_key); i++) {
+            printf("%02x", session->symmetric_key[i]);
+        }
+        printf("\n");
         return 1;
     }
     else{
@@ -213,26 +233,65 @@ static int aes_gcm_decrypt_hex(const unsigned char* key,
                                size_t* out_written) {
     size_t bin_len_est = strlen(in_hex) / 2;
     unsigned char* bin = malloc(bin_len_est);
-    if (!bin) return 0;
+    if (!bin) {
+        printf("[DECRYPT_DEBUG] Failed to allocate memory for binary data\n");
+        return 0;
+    }
     size_t bin_len = 0;
-    if (!hex_decode(in_hex, bin, bin_len_est, &bin_len)) { free(bin); return 0; }
-    if (bin_len < 12 + 16) { free(bin); return 0; }
+    if (!hex_decode(in_hex, bin, bin_len_est, &bin_len)) { 
+        printf("[DECRYPT_DEBUG] Hex decode failed - hex length: %zu (should be even)\n", strlen(in_hex));
+        printf("[DECRYPT_DEBUG] Last 20 chars of hex: %.20s\n", in_hex + strlen(in_hex) - 20);
+        free(bin); 
+        return 0; 
+    }
+    if (bin_len < 12 + 16) { 
+        printf("[DECRYPT_DEBUG] Binary length too short: %zu, need at least 28\n", bin_len);
+        free(bin); 
+        return 0; 
+    }
+    //printf("[DECRYPT_DEBUG] Binary length OK: %zu bytes, ciphertext will be %zu bytes\n", bin_len, bin_len - 28);
     unsigned char *iv = bin;
     unsigned char *tag = bin + bin_len - 16;
     unsigned char *ciphertext = bin + 12;
     size_t clen = bin_len - 12 - 16;
-    if (clen > out_plain_sz) { free(bin); return 0; }
+    //printf("[DECRYPT_DEBUG] IV first 4 bytes: %02x%02x%02x%02x, Tag first 4 bytes: %02x%02x%02x%02x\n", 
+           //iv[0], iv[1], iv[2], iv[3], tag[0], tag[1], tag[2], tag[3]);
+    if (clen > out_plain_sz) { 
+        printf("[DECRYPT_DEBUG] Ciphertext too large: %zu > %zu\n", clen, out_plain_sz);
+        free(bin); 
+        return 0; 
+    }
 
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) { free(bin); return 0; }
     int ok = EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
              EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
              EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) == 1;
-    if (!ok) { EVP_CIPHER_CTX_free(ctx); free(bin); return 0; }
+    if (!ok) { 
+        printf("[DECRYPT_DEBUG] EVP_DecryptInit failed\n");
+        EVP_CIPHER_CTX_free(ctx); 
+        free(bin); 
+        return 0; 
+    }
     int outlen = 0, tmplen = 0;
-    if (EVP_DecryptUpdate(ctx, out_plain, &outlen, ciphertext, (int)clen) != 1) { EVP_CIPHER_CTX_free(ctx); free(bin); return 0; }
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag) != 1) { EVP_CIPHER_CTX_free(ctx); free(bin); return 0; }
-    if (EVP_DecryptFinal_ex(ctx, out_plain + outlen, &tmplen) != 1) { EVP_CIPHER_CTX_free(ctx); free(bin); return 0; }
+    if (EVP_DecryptUpdate(ctx, out_plain, &outlen, ciphertext, (int)clen) != 1) { 
+        printf("[DECRYPT_DEBUG] EVP_DecryptUpdate failed, clen=%zu\n", clen);
+        EVP_CIPHER_CTX_free(ctx); 
+        free(bin); 
+        return 0; 
+    }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag) != 1) { 
+        printf("[DECRYPT_DEBUG] EVP_CIPHER_CTX_ctrl SET_TAG failed\n");
+        EVP_CIPHER_CTX_free(ctx); 
+        free(bin); 
+        return 0; 
+    }
+    if (EVP_DecryptFinal_ex(ctx, out_plain + outlen, &tmplen) != 1) { 
+        printf("[DECRYPT_DEBUG] EVP_DecryptFinal_ex failed - authentication tag verification failed\n");
+        EVP_CIPHER_CTX_free(ctx); 
+        free(bin); 
+        return 0; 
+    }
     outlen += tmplen;
     EVP_CIPHER_CTX_free(ctx);
     free(bin);
@@ -634,31 +693,69 @@ void* receive_messages(void* arg) {
         
         // If secure and message is encrypted, decrypt first and then process
         if (ecdh_ready && strncmp(buffer, "ENC ", 4) == 0) {
-            char* hex = buffer + 4;
-            // Trim trailing newline/CR/whitespace from the hex payload
-            char* end = hex + strlen(hex);
-            while (end > hex && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) {
-                end--;
-            }
-            *end = '\0';
-            unsigned char plain[BUFFER_SIZE]; 
-            size_t written = 0;
-            if (aes_gcm_decrypt_hex(dh_session.symmetric_key, hex, plain, sizeof(plain)-1, &written)) {
-                plain[written] = '\0';
-                // Process decrypted plaintext as if received
-                MessageResult result = process_server_message(client_socket, (const char*)plain);
-                if (result == MSG_EXIT) {
-                    snprintf(g_last_shutdown_reason, sizeof(g_last_shutdown_reason), "auth_or_rsa_exit");
-                    generate_client_debug_report(g_last_shutdown_reason, client_socket, 0);
-                    break;
+            // Handle multiple ENC messages in the buffer
+            char* current_pos = buffer;
+            while (current_pos && strncmp(current_pos, "ENC ", 4) == 0) {
+                char* hex = current_pos + 4;
+                
+                // Find the end of this ENC message (look for next ENC or end of buffer)
+                char* next_enc = strstr(hex, "\nENC ");
+                char* msg_end = hex + strlen(hex);  // Default to end of buffer
+                
+                if (next_enc) {
+                    msg_end = next_enc;  // End at the newline before next ENC
+                    *msg_end = '\0';     // Temporarily null-terminate this message
                 }
-                if (result == MSG_PROCESSED) {
-                    show_appropriate_prompt();
+                
+                //printf("[DEBUG] Processing ENC message, hex length before trim: %zu\n", strlen(hex));
+                
+                // Trim trailing newline/CR/whitespace from this hex payload
+                char* end = hex + strlen(hex);
+                while (end > hex && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) {
+                    end--;
                 }
-                continue;
-            } else {
-                printf("[SECURE] Failed to decrypt incoming message\n");
+                *end = '\0';
+                
+                //printf("[DEBUG] After trimming, hex length: %zu (should be even)\n", strlen(hex));
+                if (strlen(hex) % 2 != 0) {
+                    printf("[DEBUG] ODD hex length detected! Last char: '%c' (0x%02x)\n", 
+                           hex[strlen(hex)-1], (unsigned char)hex[strlen(hex)-1]);
+                }
+                
+                unsigned char plain[BUFFER_SIZE]; 
+                size_t written = 0;
+                if (aes_gcm_decrypt_hex(dh_session.symmetric_key, hex, plain, sizeof(plain)-1, &written)) {
+                    plain[written] = '\0';
+                    // Process decrypted plaintext as if received
+                    MessageResult result = process_server_message(client_socket, (const char*)plain);
+                    if (result == MSG_EXIT) {
+                        snprintf(g_last_shutdown_reason, sizeof(g_last_shutdown_reason), "auth_or_rsa_exit");
+                        generate_client_debug_report(g_last_shutdown_reason, client_socket, 0);
+                        running = 0;
+                        goto exit_receive_loop;
+                    }
+                    if (result == MSG_PROCESSED) {
+                        show_appropriate_prompt();
+                    }
+                } else {
+                    printf("[SECURE] Failed to decrypt ENC message\n");
+                    printf("[DEBUG] Hex length: %zu, expected min: %d (12+16=28)\n", strlen(hex), 28);
+                    printf("[DEBUG] First 32 chars of hex: %.32s\n", hex);
+                    printf("[DEBUG] Key first 8 bytes: ");
+                    for (int i = 0; i < 8; i++) {
+                        printf("%02x", dh_session.symmetric_key[i]);
+                    }
+                    printf("\n");
+                }
+                
+                // Move to next ENC message if there is one
+                if (next_enc) {
+                    current_pos = next_enc + 1;  // Skip the newline
+                } else {
+                    break;  // No more ENC messages
+                }
             }
+            continue;
         }
         // Process the message and determine if we should continue the loop
         MessageResult result = process_server_message(client_socket, buffer);
@@ -674,12 +771,16 @@ void* receive_messages(void* arg) {
         }
     }
     
+exit_receive_loop:
     return NULL;
 }
 
 MessageResult process_server_message(int client_socket, const char* buffer) {
     // Store the message first
     store_message(buffer);
+    
+    // Debug: Print all received messages
+    //printf("[DEBUG] Client received: '%.100s%s'\n", buffer, strlen(buffer) > 100 ? "..." : "");
     
     // Handle RSA authentication
     MessageResult rsa_result = handle_rsa_messages(client_socket, buffer);
@@ -708,6 +809,19 @@ MessageResult process_server_message(int client_socket, const char* buffer) {
     MessageResult token_result = handle_token_messages(buffer);
     if (token_result != MSG_PROCESSED) {
         return token_result;
+    }
+    
+    // Handle JWT tokens
+    if (strncmp(buffer, "JWT ", 4) == 0) {
+        const char* token = buffer + 4;
+        // Remove trailing newline if present
+        char* newline = strchr(token, '\n');
+        if (newline) *newline = '\0';
+        
+        printf("[JWT] Received new token from server (length: %zu)\n", strlen(token));
+        printf("[JWT] Token preview: %.50s...\n", token);
+        save_jwt_token(token);
+        return MSG_PROCESSED;
     }
     
     // Handle authentication phase messages
@@ -801,7 +915,28 @@ MessageResult handle_ecdh_messages(int client_socket, const char* buffer) {
     }
     if (strncmp(buffer, "ECDH_OK", 7) == 0) {
         ecdh_ready = 1; // Enable encryption after receiving ECDH_OK confirmation
-        //printf("[ECDH] ECDH_OK received - handshake complete, encryption now enabled\n");
+        printf("[ECDH] ECDH_OK received - handshake complete, encryption now enabled\n");
+
+        // After ECDH is ready, try to resume with JWT token
+        if (strlen(g_stored_jwt_token) > 0) {
+            // Check if token is expired before attempting to resume
+            if (is_jwt_token_expired(g_stored_jwt_token)) {
+                printf("[JWT] Stored token is expired, cleaning up...\n");
+                clear_jwt_token();
+            } else {
+                printf("[JWT] ECDH handshake complete, attempting to resume session with stored token...\n");
+                char resume_cmd[BUFFER_SIZE];
+                snprintf(resume_cmd, sizeof(resume_cmd), "/resume %s", g_stored_jwt_token);
+
+                if (send_secure(client_socket, resume_cmd, strlen(resume_cmd)) > 0) {
+                    printf("[JWT] Resume command sent, waiting for server response...\n");
+                    return MSG_CONTINUE;
+                } else {
+                    printf("[JWT] Failed to send resume command, proceeding with normal authentication...\n");
+                }
+            }
+        }
+
         return MSG_CONTINUE;
     }
     return MSG_PROCESSED;
@@ -849,30 +984,38 @@ MessageResult handle_auth_state_messages(const char* buffer) {
 MessageResult handle_token_messages(const char* buffer) {
     if (strstr(buffer, "AUTH_TOKEN_EXPIRED")) {
         printf("\nYour token has expired. Use /newToken to request a new one.\n");
-        struct timespec delay = {0, 300000000}; 
+        struct timespec delay = {0, 300000000};
         nanosleep(&delay, NULL);
         show_appropriate_prompt();
 
         return MSG_CONTINUE;
     }
-    
+
     if (strstr(buffer, "AUTH_TOKEN_FAIL")) {
         const char* token_fail_message = buffer+ 16;
         printf("%s\n", token_fail_message);
-        struct timespec delay = {0, 300000000}; 
+        struct timespec delay = {0, 300000000};
         nanosleep(&delay, NULL);
         show_appropriate_prompt();
         return MSG_CONTINUE;
     }
-    
+
+    if (strstr(buffer, "JWT_TOKEN_FAILED")) {
+        printf("[JWT] Token verification failed, continuing with normal authentication flow...\n");
+        printf("Please use /login <username> <password> to login\n");
+        show_appropriate_prompt();
+        clear_jwt_token(); 
+        return MSG_CONTINUE;
+    }
+
     if (strstr(buffer, "AUTH_TOKEN_GEN_SUCCESS")) {
         printf("A new token has been sent to your email.\n");
-        struct timespec delay = {0, 150000000}; 
+        struct timespec delay = {0, 150000000};
         nanosleep(&delay, NULL);
         show_appropriate_prompt();
         return MSG_CONTINUE;
     }
-    
+
     return MSG_PROCESSED;
 }
 
@@ -882,13 +1025,23 @@ MessageResult handle_auth_phase_messages(const char* buffer) {
             printf("\nEmail verification successful! You are now fully authenticated.\n");
             printf("SERVER: %s\n", buffer);
             email_authenticated = 1;
+            // Save the new JWT token that should be received after full authentication
+            return MSG_CONTINUE;
+        }
+        if (strstr(buffer, "AUTH_SUCCESS") && strstr(buffer, "JWT")) {
+            password_authenticated = 1;
+            printf("\nPassword verified from JWT. Please check your email for a 6-digit token.\n");
+            printf("Use /token <code> to enter the token, or /newToken to request a new one.\n");
+            struct timespec delay = {0, 150000000};
+            nanosleep(&delay, NULL);
+            show_appropriate_prompt();
             return MSG_CONTINUE;
         }
         if (strstr(buffer, "Password verified")) {
             password_authenticated = 1;
             printf("\nPassword verified. Please check your email for a 6-digit token.\n");
             printf("Use /token <code> to enter the token, or /newToken to request a new one.\n");
-            struct timespec delay = {0, 150000000}; 
+            struct timespec delay = {0, 150000000};
             nanosleep(&delay, NULL);
             show_appropriate_prompt();
             return MSG_CONTINUE;
@@ -992,6 +1145,11 @@ int client_mode(int client_socket, const char* username) {
     }
     printf("Connected to secure MultiFactor Authentication chat server! Beginning RSA challenge-response authentication...\n");
 
+    // Try to resume with JWT token if available, but wait for server to be ready first
+    if (strlen(g_stored_jwt_token) > 0) {
+        printf("[JWT] Stored token found, will attempt resume after server initialization...\n");
+    }
+
     // Synchronously wait for and handle RSA challenge and ECDH handshake before starting receive thread
     int rsa_auth_complete = 0;
     while (!rsa_auth_complete && running) {
@@ -1007,6 +1165,12 @@ int client_mode(int client_socket, const char* username) {
         if (result == MSG_EXIT) {
             running = 0;
             return 0;
+        }
+        // If JWT resume was successful, skip to main loop
+        if (result == MSG_CONTINUE && password_authenticated && email_authenticated) {
+            printf("[JWT] Resuming to main chat loop...\n");
+            rsa_auth_complete = 1;
+            continue;
         }
         // If server indicates immediate success (no RSA/ECDH), finish bootstrap
         if (strstr(buffer, "AUTH_SUCCESS") && !strstr(buffer, "RSA_AUTH_SUCCESS")) {
@@ -1058,7 +1222,7 @@ int client_mode(int client_socket, const char* username) {
                     
                 }
                 else if (!locked) {
-                    printf("Please authenticate first. Use: /login <username> <password> or /register <username> <password>\n");
+                    printf("Please authenticate first. Use: /login <username> <password>\n");
                     printf("auth> ");
                     continue;
                 }
@@ -1111,6 +1275,156 @@ int client_mode(int client_socket, const char* username) {
     }
     generate_client_debug_report(g_last_shutdown_reason, client_socket, 0);
     return 1; // cleaned up and returned successfully
+}
+
+// JWT token management functions
+int load_jwt_token(const char* username) {
+    if (!username) return 0;
+    
+    // Set JWT token file path
+    snprintf(g_jwt_token_file, sizeof(g_jwt_token_file), "JWT_tokens/client_%s.jwt", username);
+    
+    // Create JWT_tokens directory if it doesn't exist
+    char dir_path[MAX_FILE_PATH_LEN];
+    snprintf(dir_path, sizeof(dir_path), "JWT_tokens");
+    mkdir(dir_path, 0755);
+    
+    // Try to load existing token
+    FILE* fp = fopen(g_jwt_token_file, "r");
+    if (!fp) {
+        printf("[JWT] No stored token found for user '%s'\n", username);
+        return 0;
+    }
+    
+    size_t bytes_read = fread(g_stored_jwt_token, 1, sizeof(g_stored_jwt_token) - 1, fp);
+    fclose(fp);
+    
+    if (bytes_read > 0) {
+        g_stored_jwt_token[bytes_read] = '\0';
+        // Remove trailing newlines
+        size_t len = strlen(g_stored_jwt_token);
+        while (len > 0 && (g_stored_jwt_token[len-1] == '\n' || g_stored_jwt_token[len-1] == '\r')) {
+            g_stored_jwt_token[--len] = '\0';
+        }
+        printf("[JWT] Loaded stored token for user '%s' (%zu bytes)\n", username, len);
+        return 1;
+    }
+    
+    return 0;
+}
+
+void save_jwt_token(const char* token) {
+    if (!token || strlen(token) == 0) return;
+    
+    FILE* fp = fopen(g_jwt_token_file, "w");
+    if (!fp) {
+        printf("[JWT] Warning: Could not save token to file\n");
+        return;
+    }
+    
+    fwrite(token, 1, strlen(token), fp);
+    fclose(fp);
+    
+    // Store in memory as well
+    strncpy(g_stored_jwt_token, token, sizeof(g_stored_jwt_token) - 1);
+    g_stored_jwt_token[sizeof(g_stored_jwt_token) - 1] = '\0';
+    
+    printf("[JWT] Token saved successfully\n");
+}
+
+void clear_jwt_token() {
+    // Clear from memory
+    memset(g_stored_jwt_token, 0, sizeof(g_stored_jwt_token));
+    
+    // Remove file if it exists
+    if (strlen(g_jwt_token_file) > 0) {
+        unlink(g_jwt_token_file);
+        printf("[JWT] Token cleared and file removed\n");
+    }
+}
+
+// Check if JWT token is expired
+int is_jwt_token_expired(const char* token) {
+    if (!token || strlen(token) == 0) return 1;
+    
+    // JWT format: header.payload.signature
+    char* first_dot = strchr(token, '.');
+    if (!first_dot) return 1;
+    
+    char* second_dot = strchr(first_dot + 1, '.');
+    if (!second_dot) return 1;
+    
+    // Extract payload section
+    size_t payload_len = second_dot - first_dot - 1;
+    if (payload_len == 0) return 1;
+    
+    char* payload_encoded = (char*)malloc(payload_len + 1);
+    if (!payload_encoded) return 1;
+    
+    memcpy(payload_encoded, first_dot + 1, payload_len);
+    payload_encoded[payload_len] = '\0';
+    
+    // Base64 decode payload
+    size_t decoded_len = (payload_len * 3) / 4; // Base64 decoding size estimate
+    unsigned char* payload_decoded = (unsigned char*)malloc(decoded_len + 1);
+    if (!payload_decoded) {
+        free(payload_encoded);
+        return 1;
+    }
+    
+    if (!b64url_to_raw(payload_encoded, payload_decoded, decoded_len, &decoded_len)) {
+        free(payload_encoded);
+        free(payload_decoded);
+        return 1;
+    }
+    
+    payload_decoded[decoded_len] = '\0';
+    free(payload_encoded);
+    
+    // Parse JSON payload to find "exp" field
+    char* exp_pos = strstr((char*)payload_decoded, "\"exp\"");
+    if (!exp_pos) {
+        free(payload_decoded);
+        return 1; // No expiration field found, assume expired
+    }
+    
+    // Look for the expiration timestamp value
+    char* colon_pos = strchr(exp_pos, ':');
+    if (!colon_pos) {
+        free(payload_decoded);
+        return 1;
+    }
+    
+    // Skip whitespace and find the number
+    char* num_start = colon_pos + 1;
+    while (*num_start == ' ' || *num_start == '\t' || *num_start == '\n' || *num_start == '\r') {
+        num_start++;
+    }
+    
+    // Extract the timestamp value
+    char* num_end = num_start;
+    while (*num_end >= '0' && *num_end <= '9') {
+        num_end++;
+    }
+    
+    if (num_end == num_start) {
+        free(payload_decoded);
+        return 1; // No valid number found
+    }
+    
+    // Temporarily null-terminate for strtol
+    char temp = *num_end;
+    *num_end = '\0';
+    long exp_timestamp = strtol(num_start, NULL, 10);
+    *num_end = temp; // Restore original character
+    
+    free(payload_decoded);
+    
+    if (exp_timestamp <= 0) return 1;
+    
+    // Compare with current time
+    time_t current_time = time(NULL);
+    return (current_time >= exp_timestamp);
 }
 
 // Helper function to generate a self-signed certificate
@@ -1198,6 +1512,9 @@ int main(int argc, char *argv[]) {
     // Set global client_id for use in RSA functions
     strncpy(client_id, username, sizeof(client_id) - 1);
     client_id[sizeof(client_id) - 1] = '\0';
+    
+    // Load JWT token if available
+    load_jwt_token(username);
     
     if (!skip_rsa) {
         // Check if RSA keys exist, generate if needed

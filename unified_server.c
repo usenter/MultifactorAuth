@@ -24,6 +24,7 @@
 #include "config_tools/serverConfigOperations.h"
 #include "REST_tools/serverRestOperations.h"
 #include "IPTable_tools/IPtableOperations.h"
+#include "JWT_tools/jwtOperations.h"
 
 // Function to check client connection health
 int check_client_health(int socket) {
@@ -46,7 +47,8 @@ int check_client_health(int socket) {
     return 1; // Socket is healthy
 }
 
-// Optional: Apply basic iptables mitigation at server start and remove at shutdown
+
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -125,6 +127,7 @@ static int hex_decode(const char* in, unsigned char* out, size_t outsz, size_t* 
 ssize_t send_secure(int client_socket, const char* data, size_t len) {
     socket_info_t *sinfo = get_socket_info(client_socket);
     session_t *session= (sinfo && sinfo->account_id > 0) ? find_session(sinfo->account_id) : NULL;
+    char log_message[BUFFER_SIZE];
     if (session&& session->session_key[0] != 0) {
         unsigned char iv[12];
         if (RAND_bytes(iv, sizeof(iv)) != 1) {
@@ -160,9 +163,60 @@ ssize_t send_secure(int client_socket, const char* data, size_t len) {
         char enc_frame[8300];
         int n = snprintf(enc_frame, sizeof(enc_frame), "ENC %s\n", hexbuf);
         if (n < 0) return -1;
+        snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] Sending encrypted message to socket %d\n", sinfo->account_id, client_socket);
+        FILE_LOG(log_message);
+        snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] Sending this message with encryption: %s\n", sinfo->account_id, data);
+        FILE_LOG(log_message);
         return send(client_socket, enc_frame, (size_t)n, 0);
     }
+    snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] Sending plaintext message to socket %d\n", sinfo->account_id, client_socket);
+    FILE_LOG(log_message);
     return send(client_socket, data, len, 0);
+}
+
+// Function to issue JWT token after password verification
+void issue_password_jwt(int client_socket, unsigned int account_id, const char* username) {
+    char log_message[BUFFER_SIZE];
+    
+    snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] Starting JWT issuance for account %d, username '%s'\n", account_id, account_id, username);
+    FILE_LOG(log_message);
+    
+    // Get current token version for this account
+    int current_version = jwt_get_current_version(account_id);
+    snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] Current token version: %d\n", account_id, current_version);
+    FILE_LOG(log_message);
+    
+    // Issue JWT for password stage (15 minute TTL)
+    char* token = jwt_issue_hs256_staged(account_id, username, 
+                                        JWT_TYPE_PASSWORD, current_version, 900);
+    
+    if (token) {
+        snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] JWT token created successfully, length: %zu\n", account_id, strlen(token));
+        FILE_LOG(log_message);
+        
+        // Send JWT to client
+        char jwt_msg[1200];
+        snprintf(jwt_msg, sizeof(jwt_msg), "JWT %s\n", token);
+        
+        snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] Sending JWT message: '%.50s...'\n", account_id, jwt_msg);
+        FILE_LOG(log_message);
+        
+        ssize_t sent_bytes = send(client_socket, jwt_msg, strlen(jwt_msg), 0);
+        if (sent_bytes > 0) {
+            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Issued password-stage JWT for account %d (sent %zd bytes)\n", account_id, account_id, sent_bytes);
+            FILE_LOG(log_message);
+        } else {
+            snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD][ID:%d] Failed to send JWT to socket %d (errno: %d - %s)\n", account_id, client_socket, errno, strerror(errno));
+            FILE_LOG(log_message);
+        }
+        
+        // Clean up token
+        OPENSSL_cleanse(token, strlen(token));
+        free(token);
+    } else {
+        snprintf(log_message, sizeof(log_message), "[WARN][AUTH_THREAD][ID:%d] Failed to issue JWT for account %d - jwt_issue_hs256_staged returned NULL\n", account_id, account_id);
+        FILE_LOG(log_message);
+    }
 }
 
 // Decrypt ENC frame in-place if present and key available
@@ -291,9 +345,22 @@ static int handle_ecdh_client_pub(int client_socket, unsigned int account_id, co
     if (kctx) EVP_PKEY_CTX_free(kctx);
     OPENSSL_free(sec);
     if (!ok) return 0;
+    
+    // Debug: Print first 8 bytes of derived key
+    snprintf(log_message, sizeof(log_message), "[ECDH][ID:%d] Session key derived successfully. First 8 bytes: ", account_id);
+    for (int i = 0; i < 8 && i < (int)sizeof(session->session_key); i++) {
+        char hex_byte[4];
+        snprintf(hex_byte, sizeof(hex_byte), "%02x", session->session_key[i]);
+        strncat(log_message, hex_byte, sizeof(log_message) - strlen(log_message) - 1);
+    }
+    FILE_LOG(log_message);
     snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] ECDH_OK to client\n", account_id);
     FILE_LOG(log_message);
     send(client_socket, "ECDH_OK\n", 8, 0);
+    
+    // Wait a moment for client to process ECDH_OK and potentially send resume command
+    usleep(200000); // 200ms delay
+   
     return 1;
 }
 
@@ -613,7 +680,7 @@ void get_client_list(char* list_buffer, size_t buffer_size) {
 }
 
 // Move socket from auth thread to command thread
-void promote_to_authenticated(int socket, unsigned int account_id) {
+void promote_to_authenticated(int socket, unsigned int account_id, int issue_new_jwt) {
     char log_message[BUFFER_SIZE];
     snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE][ID:%d] Starting promotion for socket %d\n", account_id, socket);
     FILE_LOG(log_message);
@@ -717,9 +784,10 @@ void promote_to_authenticated(int socket, unsigned int account_id) {
         FILE_LOG(log_message);
         remove_client(socket);
         return;
-    } else if (sent != (ssize_t)strlen(response)) {
-        snprintf(log_message, sizeof(log_message), "[WARN][PROMOTE][ID:%d] Partial send to socket %d: %zd of %zu bytes\n", 
-                 account_id, socket, sent, strlen(response));
+    } else if (sent > 0) {
+        // Note: send_secure may return encrypted message size, which is larger than plaintext
+        snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE][ID:%d] Successfully sent AUTH_SUCCESS to socket %d (%zd bytes)\n", 
+                 account_id, socket, sent);
         FILE_LOG(log_message);
     }
     
@@ -727,6 +795,32 @@ void promote_to_authenticated(int socket, unsigned int account_id) {
     FILE_LOG(log_message);
     snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE][ID:%d] Socket %d is fully authenticated\n", account_id, socket);
     FILE_LOG(log_message);
+    
+    // Issue JWT token for full authentication (only if requested)
+    if (user && issue_new_jwt) {
+        int current_version = jwt_get_current_version(account_id);
+        char* token = jwt_issue_hs256_staged(account_id, user->username, 
+                                            JWT_TYPE_FULL, current_version, 3600);
+        if (token) {
+            char jwt_msg[1200];
+            snprintf(jwt_msg, sizeof(jwt_msg), "JWT %s\n", token);
+            send_secure(socket, jwt_msg, strlen(jwt_msg));
+            
+            snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE][ID:%d] Issued full-auth JWT for account %d\n", account_id, account_id);
+            FILE_LOG(log_message);
+            
+            // Clean up token
+            OPENSSL_cleanse(token, strlen(token));
+            free(token);
+        } else {
+            snprintf(log_message, sizeof(log_message), "[WARN][PROMOTE][ID:%d] Failed to issue JWT for account %d\n", account_id, account_id);
+            FILE_LOG(log_message);
+        }
+    } else if (user && !issue_new_jwt) {
+        snprintf(log_message, sizeof(log_message), "[INFO][PROMOTE][ID:%d] Skipping JWT issuance for account %d (client authenticated via JWT resume)\n", account_id, account_id);
+        FILE_LOG(log_message);
+    }
+    
     // Announce new user
     char announcement[BUFFER_SIZE];
     snprintf(announcement, sizeof(announcement), "%s has joined the chat", new_client->nickname);
@@ -739,13 +833,14 @@ void promote_to_authenticated(int socket, unsigned int account_id) {
                  "  /file - Enter file mode\n"
                  "  /quit - Kill the overall program\n"
                  "Just type any message to chat with everyone!\n");
-    send(socket, response, strlen(response), 0);
+    send_secure(socket, response, strlen(response));
 }
 
 void handle_chat_mode(client_t *c, char *buffer, int client_socket){
     char broadcast_msg[BUFFER_SIZE];
     char log_message[BUFFER_SIZE];
     // Handle nickname change
+    decrypt_inplace_if_needed(client_socket, buffer, sizeof(buffer));
     if (strncmp(buffer, "/nick ", 6) == 0) {
         snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD][ID:%d] Handling /nick command from socket %d\n", c->account_id, client_socket);
         FILE_LOG(log_message);
@@ -859,7 +954,6 @@ void handle_chat_mode(client_t *c, char *buffer, int client_socket){
     
     // Regular chat message - broadcast to everyone
     if (strlen(buffer) > 0) {
-        decrypt_inplace_if_needed(client_socket, buffer, sizeof(buffer));
         // Ignore ECDH messages in chat path
         if (strncmp(buffer, "ECDH_", 5) == 0) {
             snprintf(log_message, sizeof(log_message), "[INFO][CMD_THREAD][ID:%d] Ignoring ECDH message in chat path: %s\n", c->account_id, buffer);
@@ -1003,6 +1097,99 @@ void* auth_thread_func(void *arg) {
                 continue;
             }
 
+            // Handle resume command with JWT token
+            if (strncmp(buffer, "/resume ", 8) == 0) {
+                const char* jwt_token = buffer + 8;
+                char log_message[BUFFER_SIZE];
+                snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Handling /resume command with JWT token: %s\n", info->account_id, jwt_token);
+                FILE_LOG(log_message);
+
+                // Log token length for debugging
+                size_t token_len = strlen(jwt_token);
+                snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] JWT token length: %zu bytes\n", info->account_id, token_len);
+                FILE_LOG(log_message);
+
+                // Verify the JWT token
+                unsigned int acc = 0;
+                jwt_type_t stage;
+                int token_version;
+                long iat = 0, exp = 0;
+                char uname[64];
+
+                int verify_result = jwt_verify_hs256(jwt_token, &acc, &stage, &token_version, &iat, &exp, uname, sizeof(uname));
+                if (verify_result) {
+                    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] JWT verification successful: acc=%d, stage=%d, token_version=%d, iat=%ld, exp=%ld, uname='%s'\n",
+                            info->account_id, acc, stage, token_version, iat, exp, uname);
+                    FILE_LOG(log_message);
+                    if (stage == JWT_TYPE_FULL) {
+                        // Fully authenticated - promote directly to chat
+                        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Resuming full authentication for account %d\n", info->account_id, acc);
+                        FILE_LOG(log_message);
+                        session_t* sess = find_session(acc);
+                        if (sess) {
+                            sess->auth_status = AUTH_FULLY_AUTHENTICATED;
+                        }
+                        
+                        const char* msg = "AUTH_SUCCESS Resumed from JWT token. Welcome back!\n";
+                        send_secure(client_socket, msg, strlen(msg));
+                        promote_to_authenticated(client_socket, acc, 0); // Don't issue new JWT for resume
+                        continue;
+                        
+                    } else if (stage == JWT_TYPE_PASSWORD) {
+                        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Resuming from password stage for account %d\n", info->account_id, acc);
+                        FILE_LOG(log_message);
+                        session_t* sess = find_session(acc);
+                        if (sess) {
+                            sess->auth_status = AUTH_RSA | AUTH_PASSWORD;
+                            // Set a flag to indicate this session was resumed from JWT
+                            // This helps prevent conflicts with normal auth flow
+                            snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Session marked as JWT resumed for account %d, auth_status=%d\n",
+                                    info->account_id, acc, sess->auth_status);
+                            FILE_LOG(log_message);
+                        } else {
+                            snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD][ID:%d] No session found for JWT resume account %d\n",
+                                    info->account_id, acc);
+                            FILE_LOG(log_message);
+                        }
+
+                        // Send PHASE:EMAIL AUTH_SUCCESS message to allow client to skip to correct phase
+                        const char* msg = "PHASE:EMAIL AUTH_SUCCESS through JWT\n";
+                        send_secure(client_socket, msg, strlen(msg));
+
+                        // Update socket info with account_id
+                        info->account_id = acc;
+                        continue;
+                        
+                    } else {
+                        // Invalid stage for resume
+                        const char* msg = "JWT_TOKEN_FAILED Token stage not suitable for resume. Please /login again.\n";
+                        send_secure(client_socket, msg, strlen(msg));
+                        continue;
+                    }
+                } else {
+                    // Token invalid - log detailed error and send JWT_TOKEN_FAILED message
+                    snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD][ID:%d] JWT verification failed for token: %.50s...\n", info->account_id, jwt_token);
+                    FILE_LOG(log_message);
+
+                    // Check if token is expired
+                    time_t current_time = time(NULL);
+                    if (exp > 0 && current_time > exp) {
+                        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD][ID:%d] JWT token expired: current=%ld, exp=%ld, diff=%ld seconds\n",
+                                info->account_id, current_time, exp, current_time - exp);
+                        FILE_LOG(log_message);
+                    }
+
+                    // Log token details for debugging
+                    snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] Token debug: acc=%d, stage=%d, token_version=%d, iat=%ld, exp=%ld, uname='%s', verify_result=%d\n",
+                            info->account_id, acc, stage, token_version, iat, exp, uname, verify_result);
+                    FILE_LOG(log_message);
+
+                    const char* msg = "JWT_TOKEN_FAILED\n";
+                    send_secure(client_socket, msg, strlen(msg));
+                    continue;
+                }
+            }
+
             // Process authentication messages
             snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Socket %d: received %zd bytes, state=%d, account_id=%d\n", 
                    info->account_id, client_socket, bytes_read, info->state, info->account_id);
@@ -1069,14 +1256,61 @@ void* auth_thread_func(void *arg) {
                     check_and_handle_lockout(account_id, client_socket);
                     continue; 
                 }
-                process_result = process_auth_message(buffer, account_id, response, sizeof(response));
-                snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] process_auth_message returned: success=%d, authenticated=%d\n", 
+                                // Prepare buffers for JWT token output
+                char jwt_token[2048];
+                int has_jwt_token = 0;
+
+                // Check if this session was resumed from JWT and is already in password auth state
+                session_t* sess = find_session(account_id);
+                if (sess && (sess->auth_status & AUTH_PASSWORD) && strncmp(buffer, "/login", 6) == 0) {
+                    snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Session already has password auth from JWT resume, skipping password verification\n", account_id);
+                    FILE_LOG(log_message);
+                  
+                }
+
+                process_result = process_auth_message(buffer, account_id, response, sizeof(response), jwt_token, sizeof(jwt_token), &has_jwt_token);
+                snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] process_auth_message returned: success=%d, authenticated=%d\n",
                         info->account_id, process_result.success, process_result.authenticated);
                 FILE_LOG(log_message);
-                
+
+                // Debug: Immediately check JWT token data after function call
+                snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] IMMEDIATE JWT check: has_jwt_token=%d, token_length=%zu, first_50_chars='%.50s'\n",
+                        info->account_id, has_jwt_token, strlen(jwt_token),
+                        jwt_token[0] ? jwt_token : "EMPTY");
+                FILE_LOG(log_message);
+
+                // Additional debug: Check memory addresses and content
+                snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] JWT debug: jwt_token_ptr=%p, has_jwt_token_ptr=%p, jwt_token[0]=%d, jwt_token[10]=%d\n",
+                        info->account_id, (void*)jwt_token, (void*)&has_jwt_token, jwt_token[0], jwt_token[10]);
+                FILE_LOG(log_message);
+
+                // Send JWT token first if one was created
+                snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] JWT token check: has_jwt_token=%d, token_length=%zu\n",
+                        info->account_id, has_jwt_token, strlen(jwt_token));
+                FILE_LOG(log_message);
+
+                if (has_jwt_token && strlen(jwt_token) > 0) {
+                    char jwt_msg[2100];
+                    snprintf(jwt_msg, sizeof(jwt_msg), "JWT %s\n", jwt_token);
+                    snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] Sending JWT token: %.50s...\n",
+                            info->account_id, jwt_msg);
+                    FILE_LOG(log_message);
+
+                    int send_result = send(client_socket, jwt_msg, strlen(jwt_msg), 0);
+                    if (send_result > 0) {
+                        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Sent JWT token to socket %d (%d bytes)\n",
+                                info->account_id, client_socket, send_result);
+                        FILE_LOG(log_message);
+                    } else {
+                        snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD][ID:%d] Failed to send JWT token to socket %d\n",
+                                info->account_id, client_socket);
+                        FILE_LOG(log_message);
+                    }
+                }
+
                 // Load the response from process_result into the response buffer
                 snprintf(response, sizeof(response), "%s", process_result.response);
-            } 
+            }
             else {
                 snprintf(response, sizeof(response), "Please use /login <username> <password> to authenticate\n");
                 snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_THREAD-ID:NA] No account_id available for socket %d, sending login prompt\n", client_socket);
@@ -1125,7 +1359,7 @@ void* auth_thread_func(void *arg) {
                         FILE_LOG(log_message);
                     }
                     
-                    promote_to_authenticated(client_socket, account_id);
+                    promote_to_authenticated(client_socket, account_id, 1); // Issue new JWT for normal auth
                     snprintf(log_message, sizeof(log_message), "[INFO][AUTH_THREAD][ID:%d] Promotion complete for socket %d\n", info->account_id, client_socket);
                     FILE_LOG(log_message);
                 } 
@@ -1143,7 +1377,26 @@ void* auth_thread_func(void *arg) {
                         FILE_LOG(log_message);
                     }
                     
+                    // Send the response message
                     send(client_socket, response, strlen(response), 0);
+                    
+                    // Password verification successful - no JWT token needed before ECDH
+                    if (strstr(response, "PHASE:EMAIL") && strstr(response, "Password verified")) {
+                        snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] Password verified, proceeding to email verification\n", account_id);
+                        FILE_LOG(log_message);
+                    }
+                    
+                    // Email verification successful - no JWT token needed before ECDH
+                    if (strstr(response, "Email token verified successfully")) {
+                        snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] Email verified, proceeding to RSA authentication\n", account_id);
+                        FILE_LOG(log_message);
+                    }
+                    
+                    // RSA authentication successful - no JWT token needed before ECDH
+                    if (strstr(response, "RSA authentication successful")) {
+                        snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_THREAD][ID:%d] RSA auth successful, proceeding to ECDH\n", account_id);
+                        FILE_LOG(log_message);
+                    }
                 }
             } 
             else {
@@ -1306,6 +1559,7 @@ void* cmd_thread_func(void *arg) {
                 if (client->mode == CLIENT_MODE_CHAT) {
                     handle_chat_mode(client, buffer, client_socket);
                 } else if (client->mode == CLIENT_MODE_FILE) {
+                    decrypt_inplace_if_needed(client_socket, buffer, sizeof(buffer));
                     handle_file_mode(client, buffer, client_socket);
                 } else {
                     snprintf(log_message, sizeof(log_message), "[ERROR][CMD_THREAD] Unknown client mode %d for socket %d\n", client->mode, client_socket);
@@ -1414,7 +1668,7 @@ void add_authenticated_client(client_t *new_client) {
     
 }
 
-void* handle_authenticated_client(void* arg) {
+/*void* handle_authenticated_client(void* arg) {
     int client_socket = *(int*)arg;
     free(arg); // Free the allocated memory for the socket
     
@@ -1533,7 +1787,7 @@ void* handle_authenticated_client(void* arg) {
     remove_client(client_socket);
     
     return NULL;
-}
+}*/
 
 X509* extract_client_cert(int client_socket) {
     uint32_t net_cert_len;
@@ -1976,7 +2230,7 @@ int setup_initial_connection(int client_socket) {
                 FILE_LOG(log_message);
                 
                 // Promote to authenticated chat
-                promote_to_authenticated(client_socket, account_id);
+                promote_to_authenticated(client_socket, account_id, 1); // Issue new JWT for auto-auth
                 
                 EVP_PKEY_free(client_pubkey);
                 X509_free(client_cert);
@@ -2328,6 +2582,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] Email system initialized!\n");
+    FILE_LOG(log_message);
+
+    // Initialize JWT system
+    if (!jwt_init_secret("config_tools/jwt_secret.bin")) {
+        snprintf(log_message, sizeof(log_message), "[FATAL][MAIN_THREAD] Failed to initialize JWT system\n");
+        FILE_LOG(log_message);
+        return 1;
+    }
+    snprintf(log_message, sizeof(log_message), "[INFO][MAIN_THREAD] JWT system initialized!\n");
     FILE_LOG(log_message);
 
     // Removed unused work queue initialization and thread creation
@@ -2749,6 +3012,12 @@ int main(int argc, char *argv[]) {
     
     snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Cleaning up authentication system\n");
     FILE_LOG(log_message);
+    
+    // Clean up JWT system
+    jwt_cleanup_states();
+    snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] JWT system cleanup completed\n");
+    FILE_LOG(log_message);
+    
     cleanup_auth_system(); // Clean up authentication system hashmaps
     snprintf(log_message, sizeof(log_message), "[DEBUG][MAIN_THREAD] Authentication system cleanup completed\n");
     FILE_LOG(log_message);

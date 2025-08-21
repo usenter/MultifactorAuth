@@ -8,6 +8,7 @@
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <openssl/crypto.h>
+#include "JWT_tools/jwtOperations.h"
 
 
 // Global variables
@@ -670,10 +671,18 @@ int check_and_send_unlock_message(int account_id, char* response, size_t respons
 }
 
 // Process authentication message based on current status
-auth_result_t process_auth_message(const char* message, int account_id, char* response, size_t response_size) {
+auth_result_t process_auth_message(const char* message, int account_id, char* response, size_t response_size, char* jwt_token_out, size_t jwt_token_size, int* has_jwt_token_out) {
     auth_result_t result;
     char log_message[BUFFER_SIZE];
     memset(&result, 0, sizeof(result)); // Initialize result struct
+
+    // Initialize output parameters
+    if (jwt_token_out && jwt_token_size > 0) {
+        jwt_token_out[0] = '\0';
+    }
+    if (has_jwt_token_out) {
+        *has_jwt_token_out = 0;
+    }
     
     if (!message || !response) {
         result.success = 0;
@@ -728,11 +737,25 @@ auth_result_t process_auth_message(const char* message, int account_id, char* re
     // Password authentication phase
     else if (!(status & AUTH_PASSWORD)) {
         if (is_auth_command(message)) {
-            auth_result_t auth_result = process_auth_command(message, account_id);
+            char temp_jwt_token[2048];
+            int temp_has_jwt_token = 0;
+            auth_result_t auth_result = process_auth_command(message, account_id, temp_jwt_token, sizeof(temp_jwt_token), &temp_has_jwt_token);
             // Use the response from process_auth_command directly - it already handles email verification
             snprintf(result.response, sizeof(result.response), "%s", auth_result.response);
             result.success = 1;
             result.authenticated = 0;
+
+            // Copy JWT token data to output parameters if any
+            if (temp_has_jwt_token && strlen(temp_jwt_token) > 0) {
+                if (jwt_token_out && jwt_token_size > 0) {
+                    strncpy(jwt_token_out, temp_jwt_token, jwt_token_size - 1);
+                    jwt_token_out[jwt_token_size - 1] = '\0';
+                }
+                if (has_jwt_token_out) {
+                    *has_jwt_token_out = 1;
+                }
+            }
+
             return result;
         }
         snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM][ID:%d] In password phase,  '%s' is not an appropriate auth command\n", account_id, message);
@@ -744,7 +767,10 @@ auth_result_t process_auth_message(const char* message, int account_id, char* re
     }
     // Email token authentication phase
     else if (!(status & AUTH_EMAIL)) {  // Only allow token commands after password auth
-        
+        snprintf(log_message, sizeof(log_message), "[DEBUG][AUTH_SYSTEM][ID:%d] In email phase, auth_status=%d, message='%s'\n",
+                account_id, status, message);
+        FILE_LOG(log_message);
+
         // Check lockout status FIRST before processing any token commands
         if (status & AUTH_STATUS_LOCKED) {
             int remaining = get_remaining_lockout_time(account_id);
@@ -793,8 +819,46 @@ auth_result_t process_auth_message(const char* message, int account_id, char* re
                 int verify_result = verify_email_token(account_id, token);
 
                 if (verify_result == 1) {
-                    snprintf(result.response, sizeof(result.response), 
-                            "%s Email token verified successfully! You are now fully authenticated.\n", 
+                    // Get user for JWT token issuance
+                    user_t *user = find_user(account_id);
+                    if (!user) {
+                        snprintf(result.response, sizeof(result.response), "%s Internal error - user not found", AUTH_FAILED);
+                        result.success = 0;
+                        result.authenticated = 0;
+                        return result;
+                    }
+
+                    // Issue JWT token for full authentication
+                    int current_version = jwt_get_current_version(account_id);
+                    char* jwt_token = jwt_issue_hs256_staged(account_id, user->username,
+                                                        JWT_TYPE_FULL, current_version, 3600);
+                    if (jwt_token) {
+                        // Copy JWT token to output parameters so server can send it
+                        if (jwt_token_out && jwt_token_size > 0) {
+                            strncpy(jwt_token_out, jwt_token, jwt_token_size - 1);
+                            jwt_token_out[jwt_token_size - 1] = '\0';
+                        }
+                        if (has_jwt_token_out) {
+                            *has_jwt_token_out = 1;
+                        }
+
+                        snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Created full-auth JWT for account %d, length=%zu, has_jwt_token=%d\n",
+                                account_id, account_id, strlen(jwt_token), has_jwt_token_out ? *has_jwt_token_out : 0);
+                        FILE_LOG(log_message);
+
+                        // Clean up token
+                        OPENSSL_cleanse(jwt_token, strlen(jwt_token));
+                        free(jwt_token);
+                    } else {
+                        snprintf(log_message, sizeof(log_message), "[WARN][AUTH_SYSTEM][ID:%d] Failed to issue JWT for account %d\n", account_id, account_id);
+                        FILE_LOG(log_message);
+                    }
+
+                    // Wait a little bit before sending AUTH_SUCCESS
+                    usleep(500000); // 500ms delay
+
+                    snprintf(result.response, sizeof(result.response),
+                            "%s Email token verified successfully! You are now fully authenticated.\n",
                             AUTH_SUCCESS);
                     result.success = 1;
                     result.authenticated = 1;
@@ -1296,8 +1360,17 @@ int is_token_command(const char* message) {
     return is_token;
 }
 
-auth_result_t process_auth_command(const char* message, int account_id) {
+auth_result_t process_auth_command(const char* message, int account_id, char* jwt_token_out, size_t jwt_token_size, int* has_jwt_token_out) {
+    char log_message[BUFFER_SIZE];
     auth_result_t result = {0};
+
+    // Initialize output parameters
+    if (jwt_token_out && jwt_token_size > 0) {
+        jwt_token_out[0] = '\0';
+    }
+    if (has_jwt_token_out) {
+        *has_jwt_token_out = 0;
+    }
     char command[64], username[MAX_USERNAME_LEN], password[MAX_PASSWORD_LEN];
     
     // Parse the authentication message
@@ -1327,8 +1400,38 @@ auth_result_t process_auth_command(const char* message, int account_id) {
             // Password verified, email token sent
             result.success = 1;
             result.authenticated = 0;  // Not fully authenticated yet
-            snprintf(result.response, sizeof(result.response), 
-                    "PHASE:EMAIL %s Password verified. Please check your email for a 6-digit token and enter it with: /token <code>", 
+
+            // Issue JWT token with password auth immediately after password verification
+            int current_version = jwt_get_current_version(account_id);
+            char* jwt_token = jwt_issue_hs256_staged(account_id, username,
+                                                JWT_TYPE_PASSWORD, current_version, 900);
+            if (jwt_token) {
+                // Copy JWT token to output parameters so server can send it
+                if (jwt_token_out && jwt_token_size > 0) {
+                    strncpy(jwt_token_out, jwt_token, jwt_token_size - 1);
+                    jwt_token_out[jwt_token_size - 1] = '\0';
+                }
+                if (has_jwt_token_out) {
+                    *has_jwt_token_out = 1;
+                }
+
+                snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] Created password-stage JWT for account %d, length=%zu, has_jwt_token=%d\n",
+                        account_id, account_id, strlen(jwt_token), has_jwt_token_out ? *has_jwt_token_out : 0);
+                FILE_LOG(log_message);
+
+                // Clean up token
+                OPENSSL_cleanse(jwt_token, strlen(jwt_token));
+                free(jwt_token);
+            } else {
+                snprintf(log_message, sizeof(log_message), "[ERROR][AUTH_SYSTEM][ID:%d] Failed to create password-stage JWT for account %d\n", account_id, account_id);
+                FILE_LOG(log_message);
+            }
+
+            // Wait a little bit before sending PHASE:EMAIL
+            usleep(500000); // 500ms delay
+
+            snprintf(result.response, sizeof(result.response),
+                    "PHASE:EMAIL %s Password verified. Please check your email for a 6-digit token and enter it with: /token <code>",
                     AUTH_SUCCESS);
         } else {
             // Authentication failed

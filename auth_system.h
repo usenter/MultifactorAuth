@@ -168,6 +168,8 @@ typedef struct {
     int authenticated;              // 1 if user is now authenticated, 0 otherwise
     char response[1024];           // Response message to send to client
     char username[MAX_USERNAME_LEN]; // Username from the command (for logging)
+    char jwt_token[2048];          // JWT token to send to client (if any)
+    int has_jwt_token;             // 1 if JWT token should be sent, 0 otherwise
 } auth_result_t;
 
 // Function declarations   
@@ -195,7 +197,7 @@ void load_users_from_file(const char* filename);
 int load_users_from_encrypted_file(const char* encrypted_filename, const char* key);
 
 // New authentication processing functions
-auth_result_t process_auth_command(const char* message, int account_id);
+auth_result_t process_auth_command(const char* message, int account_id, char* jwt_token_out, size_t jwt_token_size, int* has_jwt_token_out);
 int is_auth_command(const char* message);
 int is_token_command(const char* message);
 
@@ -226,7 +228,7 @@ int create_auth_session(int account_id);
 int reset_auth_session(int account_id);
 auth_flags_t get_auth_status(int account_id);
 int check_and_send_unlock_message(int account_id, char* response, size_t response_size);
-auth_result_t process_auth_message(const char* message, int account_id, char* response, size_t response_size);
+auth_result_t process_auth_message(const char* message, int account_id, char* response, size_t response_size, char* jwt_token_out, size_t jwt_token_size, int* has_jwt_token_out);
 int verify_email_token(int account_id, const char* token);
 int generate_new_token(int account_id);
 int is_token_expired(int account_id);

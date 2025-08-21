@@ -4,7 +4,7 @@ CFLAGS = -Wall -Wextra -std=c17 -pthread -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE
 LIBS = -lssl -lcrypto -lcurl -lcjson -lmicrohttpd 
 
 # Object files
-OBJS = encryptionOperations.o auth_system.o fileHandlingOperations.o emailHandlingOperations.o serverConfigOperations.o socketHandlingOperations.o serverRestOperations.o IPtableOperations.o
+OBJS = encryptionOperations.o auth_system.o fileHandlingOperations.o emailHandlingOperations.o serverConfigOperations.o socketHandlingOperations.o serverRestOperations.o IPtableOperations.o jwtOperations.o
 
 # Targets
 all: unified_server unified_client encryptionOperations user_encryptor generate_rsa_keys rest_client
@@ -39,6 +39,10 @@ serverRestOperations.o: REST_tools/serverRestOperations.c REST_tools/serverRestO
 IPtableOperations.o: IPTable_tools/IPtableOperations.c IPTable_tools/IPtableOperations.h
 	$(CC) $(CFLAGS) -c IPTable_tools/IPtableOperations.c -o $@
 
+# JWT operations
+jwtOperations.o: JWT_tools/jwtOperations.c JWT_tools/jwtOperations.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # REST client program
 rest_client: REST_tools/rest_client.c serverConfigOperations.o
 	$(CC) $(CFLAGS) -o $@ $< serverConfigOperations.o $(LIBS)
@@ -54,7 +58,7 @@ encryptionOperations: encryption_tools/encryptionOperations.c encryption_tools/e
 	$(CC) $(CFLAGS) -DTEST_MAIN -o $@ $< $(LIBS)
 
 # Unified client with authentication support (includes RSA authentication)
-unified_client: unified_client.c
+unified_client: unified_client.c jwtOperations.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 # RSA key generator utility
