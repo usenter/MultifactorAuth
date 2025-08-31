@@ -797,7 +797,7 @@ void promote_to_authenticated(int socket, unsigned int account_id, int issue_new
     }
     
     char response[BUFFER_SIZE];
-    snprintf(response, sizeof(response), "AUTH_SUCCESS You are now fully authenticated.\n");
+    snprintf(response, sizeof(response), "PHASE:FINAL FINAL_AUTH_SUCCESS You are now fully authenticated.\n");
     
     // Send with error checking
     ssize_t sent = send_secure(socket, response, strlen(response));
@@ -1153,7 +1153,7 @@ void* auth_thread_func(void *arg) {
                             sess->auth_status = AUTH_FULLY_AUTHENTICATED;
                         }
                         
-                        const char* msg = "PHASE:FINAL FINAL_AUTH_SUCCESS Resumed from JWT token. Welcome back!\n";
+                        const char* msg = "PHASE:FINAL FINAL_AUTH_SUCCESS by JWT Resumed from JWT token. Welcome back!\n";
                         send_secure(client_socket, msg, strlen(msg));
                         promote_to_authenticated(client_socket, acc, 0); // Don't issue new JWT for resume
                         continue;
@@ -1175,8 +1175,8 @@ void* auth_thread_func(void *arg) {
                             FILE_LOG(log_message);
                         }
 
-                        // Send PHASE:PASSWORD AUTH_SUCCESS message to allow client to skip to correct phase
-                        const char* msg = "PHASE:PASSWORD PASSWORD_AUTH_SUCCESS through JWT\n";
+                        // Send PASSWORD_AUTH_SUCCESS message to allow client to skip to correct phase
+                        const char* msg = "PHASE:PASSWORD PASSWORD_AUTH_SUCCESS by JWT Password verification bypassed through JWT\n";
                         send_secure(client_socket, msg, strlen(msg));
 
                         // Update socket info with account_id
@@ -1185,7 +1185,7 @@ void* auth_thread_func(void *arg) {
                         
                     } else {
                         // Invalid stage for resume
-                        const char* msg = "PHASE:TOKEN TOKEN_FAIL Token stage not suitable for resume. Please /login again.\n";
+                        const char* msg = "JWT_TOKEN_FAILED Token stage not suitable for resume. Please /login again.\n";
                         send_secure(client_socket, msg, strlen(msg));
                         continue;
                     }
@@ -1207,7 +1207,7 @@ void* auth_thread_func(void *arg) {
                             info->account_id, acc, stage, token_version, iat, exp, uname, verify_result);
                     FILE_LOG(log_message);
 
-                    const char* msg = "PHASE:TOKEN TOKEN_FAIL JWT verification failed.\n";
+                    const char* msg = "JWT_TOKEN_FAILED\n";
                     send_secure(client_socket, msg, strlen(msg));
                     continue;
                 }

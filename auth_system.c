@@ -717,7 +717,7 @@ auth_result_t process_auth_message(const char* message, int account_id, char* re
         if (is_rsa_command(message)) {
             rsa_challenge_result_t rsa_result = process_rsa_command(message, account_id);
             if (rsa_result.success && strstr(rsa_result.response, "RSA authentication successful")) {
-                snprintf(result.response, sizeof(result.response), "PHASE:RSA RSA_AUTH_SUCCESS You may now login with your username and password.");
+                snprintf(result.response, sizeof(result.response), "%s You may now login with your username and password.", rsa_result.response);
                 result.success = 1;
                 result.authenticated = 0;
                 return result;
@@ -858,13 +858,13 @@ auth_result_t process_auth_message(const char* message, int account_id, char* re
                     usleep(500000); // 500ms delay
 
                     snprintf(result.response, sizeof(result.response),
-                            "PHASE:EMAIL EMAIL_AUTH_SUCCESS You are now fully authenticated.\n");
+                            "PHASE:EMAIL EMAIL_AUTH_SUCCESS Email token verified successfully! You are now fully authenticated.\n");
                     result.success = 1;
                     result.authenticated = 1;
                     return result;
                 } 
                 else if (verify_result == -3) {
-                    snprintf(result.response, sizeof(result.response),
+                    snprintf(result.response, sizeof(result.response), 
                             "PHASE:TOKEN TOKEN_EXPIRED Token has expired. Use /newToken to request a new one.\n");
                     result.success = 1;
                     result.authenticated = 0;
@@ -881,8 +881,8 @@ auth_result_t process_auth_message(const char* message, int account_id, char* re
                     return result;
                 } 
                 else {
-                    snprintf(result.response, sizeof(result.response),
-                            "PHASE:TOKEN TOKEN_FAIL Invalid token. Please check your email and try again. %d attempts remaining.\n",
+                    snprintf(result.response, sizeof(result.response), 
+                            "PHASE:TOKEN TOKEN_FAIL Invalid token. Please check your email and try again. %d attempts remaining.\n", 
                             MAX_TOKEN_ATTEMPTS - get_current_failed_attempts(account_id));
                     result.success = 1;
                     result.authenticated = 0;
@@ -891,20 +891,20 @@ auth_result_t process_auth_message(const char* message, int account_id, char* re
             } 
             else if (strncmp(message, AUTH_NEW_TOKEN, strlen(AUTH_NEW_TOKEN)) == 0) {
                 if (generate_new_token(account_id)) {
-                    snprintf(result.response, sizeof(result.response),
-                            "PHASE:TOKEN TOKEN_GEN_SUCCESS A new token has been sent to your email. You have %d attempts remaining.\n",
+                    snprintf(result.response, sizeof(result.response), 
+                            "PHASE:TOKEN TOKEN_GEN_SUCCESS A new token has been sent to your email. You have %d attempts remaining.\n", 
                             MAX_TOKEN_ATTEMPTS - get_current_failed_attempts(account_id));
                 } else {
-                    snprintf(result.response, sizeof(result.response),
-                            "PHASE:TOKEN TOKEN_FAIL Failed to generate new token.\n");
+                    snprintf(result.response, sizeof(result.response), 
+                            "%s Failed to generate new token.\n", 
+                            AUTH_FAILED);
                 }
                 result.success = 1;
                 result.authenticated = 0;
                 return result;
             }
             else if(strstr(message, "/login") != NULL){
-                snprintf(result.response, sizeof(result.response), 
-                        "PHASE:EMAIL You are already in email verification phase. Please enter your email token with: /token <code> or request a new one with: /newToken");
+                snprintf(result.response, sizeof(result.response), "PHASE:EMAIL Password verified.");
                 result.success = 1;
                 result.authenticated = 0;
                 return result;
@@ -1019,8 +1019,8 @@ int handle_failed_token_attempt(int account_id) {
         FILE_LOG(log_message);
         return 0; // Authentication failed
     } else {
-        snprintf(response, sizeof(response),
-                 "PHASE:TOKEN TOKEN_FAIL Invalid token. You have %d attempts remaining before lockout.\n",
+        snprintf(response, sizeof(response), 
+                 "AUTH_TOKEN_FAIL Invalid token. You have %d attempts remaining before lockout.\n", 
                  3 - current_attempts);
         return 0;
     }
@@ -1385,27 +1385,14 @@ auth_result_t process_auth_command(const char* message, int account_id, char* jw
     strncpy(result.username, username, MAX_USERNAME_LEN - 1);
     result.username[MAX_USERNAME_LEN - 1] = '\0';
     
-    // Check if user is trying to login when already past password phase
-    if (strcmp(command, AUTH_LOGIN) == 0) {
-        auth_flags_t current_status = get_auth_status(account_id);
-        if ((current_status & AUTH_PASSWORD) && !(current_status & AUTH_EMAIL)) {
-            // User already has password auth but not email auth - they're in email phase
-            result.success = 1;
-            result.authenticated = 0;
-            snprintf(result.response, sizeof(result.response),
-                    "PHASE:EMAIL You are already in email verification phase. Please enter your email token with: /token <code> or request a new one with: /newToken");
-            return result;
-        }
-    }
-    
     if (strcmp(command, AUTH_LOGIN) == 0) {
         int auth_result = authenticate_user(username, password, account_id);
         if (auth_result == 1) {
             // Password verified, no email verification needed
             result.success = 1;
             result.authenticated = 1;
-            snprintf(result.response, sizeof(result.response),
-                    "PHASE:FINAL FINAL_AUTH_SUCCESS Welcome, %s! You are now fully authenticated.",
+            snprintf(result.response, sizeof(result.response), 
+                    "PHASE:FINAL FINAL_AUTH_SUCCESS Welcome, %s! You are now fully authenticated.", 
                     username);
         } else if (auth_result == 2) {
             // Password verified, email token sent
@@ -1442,7 +1429,7 @@ auth_result_t process_auth_command(const char* message, int account_id, char* jw
             usleep(500000); // 500ms delay
 
             snprintf(result.response, sizeof(result.response),
-                    "PHASE:PASSWORD PASSWORD_AUTH_SUCCESS Please check your email for a 6-digit token and enter it with: /token <code>");
+                    "PHASE:PASSWORD PASSWORD_AUTH_SUCCESS Password verified. Please check your email for a 6-digit token and enter it with: /token <code>");
         } else {
             // Authentication failed
             result.success = 0;
@@ -1460,8 +1447,8 @@ auth_result_t process_auth_command(const char* message, int account_id, char* jw
             result.success = 1;
             result.authenticated = 0; // Still need to login after registration
             snprintf(result.response, sizeof(result.response), 
-                    "%s User %s registered successfully. You can now login.", 
-                    AUTH_SUCCESS, username);
+                    "PHASE:REGISTER REGISTER_SUCCESS User %s registered successfully. You can now login.", 
+                    username);
         } else {
             result.success = 0;
             result.authenticated = 0;
@@ -1474,7 +1461,7 @@ auth_result_t process_auth_command(const char* message, int account_id, char* jw
         result.success = 1;
         result.authenticated = 0;
         snprintf(result.response, sizeof(result.response), 
-                "%s You have been logged out.", AUTH_SUCCESS);
+                "PHASE:LOGOUT LOGOUT_SUCCESS You have been logged out.");
     } else {
         result.success = 0;
         result.authenticated = 0;
@@ -1838,7 +1825,7 @@ rsa_challenge_result_t verify_rsa_response(int account_id, const unsigned char* 
         session->auth_status |= AUTH_RSA;  // Set RSA authentication flag
         result.success = 1;
         snprintf(result.response, sizeof(result.response), 
-                "%s RSA authentication successful.", RSA_AUTH_SUCCESS);
+                "PHASE:RSA RSA_AUTH_SUCCESS RSA authentication successful.");
         
         snprintf(log_message, sizeof(log_message), "[INFO][AUTH_SYSTEM][ID:%d] RSA authentication successful\n", account_id);
         FILE_LOG(log_message);

@@ -677,7 +677,7 @@ MessageResult handle_server_shutdown(int client_socket, const char* buffer);
 MessageResult handle_auth_state_messages(const char* buffer);
 MessageResult handle_token_messages(const char* buffer);
 MessageResult handle_auth_phase_messages(const char* buffer);
-MessageResult handle_final_auth_success(const char* buffer);
+
 static void show_appropriate_prompt(void);
 
 // Terminal mode function declarations
@@ -848,8 +848,8 @@ MessageResult process_server_message(int client_socket, const char* buffer) {
         char* newline = strchr(token, '\n');
         if (newline) *newline = '\0';
         
-        //printf("[JWT] Received new token from server (length: %zu)\n", strlen(token));
-        //printf("[JWT] Token preview: %.50s...\n", token);
+        printf("[JWT] Received new token from server (length: %zu)\n", strlen(token));
+        printf("[JWT] Token preview: %.50s...\n", token);
         save_jwt_token(token);
         return MSG_PROCESSED;
     }
@@ -860,10 +860,7 @@ MessageResult process_server_message(int client_socket, const char* buffer) {
         return phase_result;
     }
     
-    // Handle final authentication success
-    if (handle_final_auth_success(buffer) == MSG_CONTINUE) {
-        return MSG_CONTINUE;
-    }
+
     
     // Default: show server message
     printf("%s\n", buffer);
@@ -902,12 +899,7 @@ MessageResult handle_rsa_messages(int client_socket, const char* buffer) {
         }
     }
 
-    // Handle legacy RSA_AUTH_SUCCESS for backward compatibility
-    if (strncmp(buffer, "RSA_AUTH_SUCCESS", 16) == 0) {
-        rsa_completed = 1;
-        printf("\n[LEGACY] RSA authentication successful!\n");
-        return MSG_CONTINUE;
-    }
+
 
     // Handle error messages (unchanged - these are error conditions)
     if (strstr(buffer, "RSA_FAILED")) {
@@ -1056,37 +1048,12 @@ MessageResult handle_token_messages(const char* buffer) {
         return MSG_CONTINUE;
     }
 
-    // Handle legacy token messages for backward compatibility
-    if (strstr(buffer, "AUTH_TOKEN_EXPIRED")) {
-        printf("\n[LEGACY] Your token has expired. Use /newToken to request a new one.\n");
-        struct timespec delay = {0, 300000000};
-        nanosleep(&delay, NULL);
-        show_appropriate_prompt();
-        return MSG_CONTINUE;
-    }
-
-    if (strstr(buffer, "AUTH_TOKEN_FAIL")) {
-        const char* token_fail_message = buffer+ 16;
-        printf("[LEGACY] %s\n", token_fail_message);
-        struct timespec delay = {0, 300000000};
-        nanosleep(&delay, NULL);
-        show_appropriate_prompt();
-        return MSG_CONTINUE;
-    }
-
+    // Handle JWT token failure (still needed for JWT-specific errors)
     if (strstr(buffer, "JWT_TOKEN_FAILED")) {
         printf("[JWT] Token verification failed, continuing with normal authentication flow...\n");
         printf("Please use /login <username> <password> to login\n");
         show_appropriate_prompt();
         clear_jwt_token();
-        return MSG_CONTINUE;
-    }
-
-    if (strstr(buffer, "AUTH_TOKEN_GEN_SUCCESS")) {
-        printf("[LEGACY] A new token has been sent to your email.\n");
-        struct timespec delay = {0, 150000000};
-        nanosleep(&delay, NULL);
-        show_appropriate_prompt();
         return MSG_CONTINUE;
     }
 
@@ -1109,8 +1076,9 @@ MessageResult handle_auth_phase_messages(const char* buffer) {
             // Save the new JWT token that should be received after full authentication
             return MSG_CONTINUE;
         }
-        else if (strncmp(buffer, "PHASE:PASSWORD PASSWORD_AUTH_SUCCESS", 37) == 0) {
+        else if (strncmp(buffer, "PHASE:PASSWORD PASSWORD_AUTH_SUCCESS", 36) == 0) {
             password_authenticated = 1;
+            printf("[DEBUG] Setting password_authenticated = 1\n");
             printf("\nPassword verified. Please check your email for a 6-digit token.\n");
             printf("Use /token <code> to enter the token, or /newToken to request a new one.\n");
 
@@ -1144,66 +1112,12 @@ MessageResult handle_auth_phase_messages(const char* buffer) {
         }
     }
 
-    // Handle legacy PHASE:EMAIL messages for backward compatibility
-    if (strncmp(buffer, "PHASE:EMAIL", 11) == 0) {
-        if (strstr(buffer, "You are already in email verification phase")) {
-            printf("\n%s\n", buffer + 12); // Skip "PHASE:EMAIL " prefix
-            return MSG_CONTINUE;
-        }
-        
-        if (strstr(buffer, "AUTH_SUCCESS") && strstr(buffer, "Email token verified successfully")) {
-            printf("\n[LEGACY] Email verification successful! You are now fully authenticated.\n");
-            printf("SERVER: %s\n", buffer);
-            email_authenticated = 1;
-            return MSG_CONTINUE;
-        }
-        if (strstr(buffer, "AUTH_SUCCESS") && strstr(buffer, "JWT")) {
-            password_authenticated = 1;
-            printf("\n[LEGACY] Password verified from JWT. Please check your email for a 6-digit token.\n");
-            printf("Use /token <code> to enter the token, or /newToken to request a new one.\n");
-            struct timespec delay = {0, 150000000};
-            nanosleep(&delay, NULL);
-            show_appropriate_prompt();
-            return MSG_CONTINUE;
-        }
-        // Only treat as legacy auth success if it's the exact old format "Password verified."
-        if (strcmp(buffer, "PHASE:EMAIL Password verified.") == 0) {
-            password_authenticated = 1;
-            printf("\n[LEGACY] Password verified. Please check your email for a 6-digit token.\n");
-            printf("Use /token <code> to enter the token, or /newToken to request a new one.\n");
-            struct timespec delay = {0, 150000000};
-            nanosleep(&delay, NULL);
-            show_appropriate_prompt();
-            return MSG_CONTINUE;
-        }
 
-        // For all other PHASE:EMAIL messages, just display them
-        printf("\n%s\n", buffer + 12); // Skip "PHASE:EMAIL " prefix
-        return MSG_CONTINUE;
-    }
 
     return MSG_PROCESSED;
 }
 
-MessageResult handle_final_auth_success(const char* buffer) {
-    // This function now primarily handles legacy messages since FINAL_AUTH_SUCCESS
-    // is handled in handle_auth_phase_messages() for standardized format
 
-    // Handle legacy general AUTH_SUCCESS messages for backward compatibility
-    if (strstr(buffer, "AUTH_SUCCESS") && !strstr(buffer, "_AUTH_SUCCESS")) {
-        printf("\n[LEGACY] %s", buffer);
-        email_authenticated = 1;
-        password_authenticated = 1;
-        rsa_completed = 1;
-        locked = 0;
-        struct timespec delay = {0, 150000000};
-        nanosleep(&delay, NULL);
-        show_appropriate_prompt();
-        return MSG_CONTINUE;
-    }
-
-    return MSG_PROCESSED;
-}
 
 void show_appropriate_prompt(void) {
     if (password_authenticated && email_authenticated) {
@@ -1368,6 +1282,7 @@ int client_mode(int client_socket, const char* username) {
                     continue;
                 }
                 if (!password_authenticated) {
+                    printf("[DEBUG] password_authenticated = %d\n", password_authenticated);
                     if (strncmp(buffer, "/login", 6) == 0)  {
                         if (send_secure(client_socket, buffer, strlen(buffer)) < 0) {
                             printf("Failed to send message\n");

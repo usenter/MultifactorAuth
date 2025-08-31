@@ -88,12 +88,21 @@ void handle_file_mode(client_t *c, char *buffer, int client_socket){
 
     // Check if client is in PTY shell mode
     if (c->raw_mode && c->shell_active) {
-        // Process input through PTY shell
+        // Process input through PTY shell - input comes as complete lines
         process_shell_input(c, buffer, client_socket);
     } else if (c->raw_mode) {
-        // Raw mode but no shell - fallback to old behavior
-        printf("[DEBUG] Raw mode without active shell, falling back\n");
-        parse_shell_command(c, buffer, client_socket);
+        // Raw mode but no shell - use line editor for backward compatibility
+        printf("[DEBUG] Raw mode without active shell, using line editor\n");
+        // Process character by character for line editing
+        int command_ready = process_raw_input(c, buffer, strlen(buffer));
+        if (command_ready && strlen(c->line_editor.line) > 0) {
+            // Execute the completed command
+            parse_shell_command(c, c->line_editor.line, client_socket);
+            reset_line_editor(c);
+            // Show new prompt
+            char prompt[] = "\033[32m$\033[0m ";
+            send(c->socket, prompt, strlen(prompt), 0);
+        }
     } else {
         // Normal line-buffered mode
         parse_shell_command(c, buffer, client_socket);
@@ -643,7 +652,14 @@ int parse_shell_command(client_t *c, char *command_line, int client_socket) {
 
     // Check for enhanced shell exit command
     if (strcmp(command_line, "exit") == 0) {
-        if (c->raw_mode) {
+        if (c->raw_mode && c->shell_active) {
+            // Exit from PTY shell
+            stop_pty_shell(c);
+            c->raw_mode = 0;
+            send_response(client_socket, "Exited enhanced shell. Type 'enhanced' to re-enable.\n");
+            return 1;
+        } else if (c->raw_mode) {
+            // Exit from line editor mode
             disable_raw_mode(c);
             send_response(client_socket, "Exited enhanced shell. Type 'enhanced' to re-enable.\n");
             return 1;
@@ -912,7 +928,8 @@ int shell_filtered(client_t *c, int argc, char **argv, int client_socket) {
                         "  • Security filtering for dangerous commands\n"
                         "  • Full terminal features (colors, cursor movement)\n"
                         "  • Restricted to safe commands and your user directory\n"
-                        "  • Type 'exit' to return to file mode\n\n";
+                        "  • Type 'exit' to return to file mode\n"
+                        "  • Press Ctrl+C to interrupt commands, Ctrl+D to exit\n\n";
     send_response(client_socket, welcome_msg);
     
     return 1;
@@ -960,8 +977,14 @@ void add_command_to_history(client_t *c, const char *command) {
 void enable_raw_mode(client_t *c) {
     if (c->raw_mode) return;
 
-    // Use minimal terminal modifications to avoid permanent changes
-    // Avoid alternate screen buffer which can cause issues
+    // For PTY shell mode, we don't need to send escape sequences
+    // The PTY shell handles all terminal control naturally
+    if (c->shell_active) {
+        c->raw_mode = 1;
+        return;
+    }
+
+    // For legacy line editor mode (fallback)
     const char *setup_sequences[] = {
         "\033[2J",      // Clear entire screen
         "\033[1;1H",    // Move cursor to top-left
@@ -1000,8 +1023,12 @@ void force_terminal_reset(int client_socket) {
 void disable_raw_mode(client_t *c) {
     if (!c->raw_mode) return;
 
+    // stop active shells
+    if (c->shell_active) {
+        stop_pty_shell(c);
+    }
+
     // Send minimal reset sequences to restore normal terminal behavior
-    // Only reset what we actually changed
     const char *cleanup_sequences[] = {
         "\033[0m",      // Reset all text attributes
         "\r\n"          // New line
@@ -1549,18 +1576,27 @@ int start_pty_shell(client_t *c) {
         // Set proper terminal attributes for the slave PTY
         struct termios term_attrs;
         if (tcgetattr(STDIN_FILENO, &term_attrs) == 0) {
-            // Enable canonical mode and echo
-            term_attrs.c_lflag |= (ICANON | ECHO | ISIG);
-            term_attrs.c_iflag |= (BRKINT | ICRNL | IUTF8);
+            // Enable canonical mode, echo, and signal processing
+            term_attrs.c_lflag |= (ICANON | ECHO | ISIG | ECHOE | ECHOK | ECHONL);
+            term_attrs.c_iflag |= (BRKINT | ICRNL | IUTF8 | IXON);
             term_attrs.c_oflag |= (OPOST | ONLCR);
             term_attrs.c_cflag |= (CS8 | CREAD);
+            
+            // Set control characters for proper signal handling
+            term_attrs.c_cc[VINTR] = 3;   // Ctrl+C
+            term_attrs.c_cc[VQUIT] = 28;  // Ctrl+\
+            term_attrs.c_cc[VEOF] = 4;    // Ctrl+D
+            term_attrs.c_cc[VSUSP] = 26;  // Ctrl+Z
+            
             tcsetattr(STDIN_FILENO, TCSANOW, &term_attrs);
         }
 
-        // Set environment
+        // Set environment for proper terminal behavior
         setenv("TERM", "xterm-256color", 1);
         setenv("PS1", "\\[\\033[32m\\]$\\[\\033[0m\\] ", 1);
         setenv("BASH_ENV", "", 1); // Prevent bashrc issues
+        setenv("COLUMNS", "80", 1);   // Default terminal width
+        setenv("LINES", "24", 1);     // Default terminal height
 
         // Change to user directory
         if (chdir(c->cwd) != 0) {
@@ -1596,14 +1632,15 @@ void stop_pty_shell(client_t *c) {
     
     c->shell_active = 0;
     
-    // Close PTY master
+    // Close PTY master first to signal thread to exit
     if (c->pty_master_fd != -1) {
         close(c->pty_master_fd);
         c->pty_master_fd = -1;
     }
     
-    // Kill shell process
+    // Kill shell process gracefully
     if (c->shell_pid > 0) {
+        // Send SIGTERM first
         kill(c->shell_pid, SIGTERM);
         
         // Wait for process to exit (with timeout)
@@ -1624,10 +1661,10 @@ void stop_pty_shell(client_t *c) {
         c->shell_pid = -1;
     }
     
-    // Cancel and join thread
+    // Wait for thread to finish naturally (it should exit when shell_active becomes 0)
     if (c->shell_thread) {
-        pthread_cancel(c->shell_thread);
-        pthread_join(c->shell_thread, NULL);
+        void *thread_result;
+        pthread_join(c->shell_thread, &thread_result);
         c->shell_thread = 0;
     }
     
@@ -1646,8 +1683,8 @@ void* pty_shell_thread(void *arg) {
         FD_ZERO(&readfds);
         FD_SET(c->pty_master_fd, &readfds);
         
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 100000; // 100ms for more responsive I/O
         
         int ready = select(c->pty_master_fd + 1, &readfds, NULL, NULL, &timeout);
         
@@ -1655,12 +1692,15 @@ void* pty_shell_thread(void *arg) {
             ssize_t bytes_read = read(c->pty_master_fd, buffer, sizeof(buffer) - 1);
             
             if (bytes_read > 0) {
-                buffer[bytes_read] = '\0';
+                // Send output directly to client without modification
+                // The PTY already handles all terminal control sequences
+                ssize_t sent = send(c->socket, buffer, bytes_read, MSG_NOSIGNAL);
+                if (sent == -1) {
+                    printf("[ERROR] Failed to send shell output to client %s: %s\n", c->username, strerror(errno));
+                    break;
+                }
                 
-                // Send output directly to client
-                send(c->socket, buffer, bytes_read, 0);
-                
-                printf("[DEBUG] Shell output (%zd bytes): %.*s\n", bytes_read, (int)bytes_read, buffer);
+                printf("[DEBUG] Shell output (%zd bytes) sent to client %s\n", bytes_read, c->username);
             } else if (bytes_read == 0) {
                 // EOF - shell closed
                 printf("[INFO] Shell closed for user %s\n", c->username);
@@ -1678,6 +1718,13 @@ void* pty_shell_thread(void *arg) {
     
     printf("[INFO] Shell I/O thread ending for user %s\n", c->username);
     c->shell_active = 0;
+    
+    // Clean up when thread exits
+    if (c->raw_mode) {
+        c->raw_mode = 0;
+        send_response(c->socket, "\n\rShell session ended. Type 'enhanced' to restart.\n");
+    }
+    
     return NULL;
 }
 
@@ -1689,39 +1736,48 @@ int process_shell_input(client_t *c, const char *input, int client_socket) {
     size_t input_len = strlen(input);
     printf("[DEBUG] Processing shell input (%zu bytes): %.*s\n", input_len, (int)input_len, input);
     
-    // Check for exit command
+    // Check for exit command (only check complete commands)
     if (strncmp(input, "exit", 4) == 0 && (input_len == 4 || input[4] == '\n' || input[4] == '\r')) {
         stop_pty_shell(c);
         c->raw_mode = 0;
-        send_response(client_socket, "\nExited interactive shell. Type 'shell' to re-enable.\n");
+        send_response(client_socket, "\nExited interactive shell. Type 'enhanced' to re-enable.\n");
         return 1;
     }
     
-    // Add input to command buffer for filtering
-    for (size_t i = 0; i < input_len; i++) {
-        char ch = input[i];
-        
-        if (ch == '\n' || ch == '\r') {
-            // Command complete - check for dangerous commands
-            c->command_buffer[c->command_buffer_pos] = '\0';
-            
-            if (filter_command_on_enter(c, c->command_buffer)) {
-                // Command blocked - don't send to shell
-                char warning[] = "\r\n\033[31mCommand blocked for security reasons\033[0m\r\n$ ";
-                send(client_socket, warning, strlen(warning), 0);
-                c->command_buffer_pos = 0;
-                return 1;
-            }
-            
-            // Reset buffer after processing
-            c->command_buffer_pos = 0;
-        } else if (c->command_buffer_pos < sizeof(c->command_buffer) - 1) {
-            c->command_buffer[c->command_buffer_pos++] = ch;
-        }
+    // For PTY shell, we need to add newline if not present to complete the command
+    char processed_input[BUFFER_SIZE];
+    strncpy(processed_input, input, sizeof(processed_input) - 2);
+    processed_input[sizeof(processed_input) - 2] = '\0';
+    
+    // Add newline if not present (needed for command completion in shell)
+    if (input_len > 0 && input[input_len - 1] != '\n' && input[input_len - 1] != '\r') {
+        strncat(processed_input, "\n", sizeof(processed_input) - strlen(processed_input) - 1);
+    }
+    
+    // Extract command for filtering (up to first newline/space)
+    char command_to_check[256] = {0};
+    const char *cmd_start = processed_input;
+    // Skip whitespace
+    while (*cmd_start == ' ' || *cmd_start == '\t') cmd_start++;
+    
+    int cmd_len = 0;
+    while (cmd_len < sizeof(command_to_check) - 1 && cmd_start[cmd_len] && 
+           cmd_start[cmd_len] != ' ' && cmd_start[cmd_len] != '\n' && cmd_start[cmd_len] != '\r') {
+        command_to_check[cmd_len] = cmd_start[cmd_len];
+        cmd_len++;
+    }
+    command_to_check[cmd_len] = '\0';
+    
+    // Check if command is blocked (only check the base command, not arguments)
+    if (strlen(command_to_check) > 0 && filter_command_on_enter(c, command_to_check)) {
+        // Command blocked - don't send to shell
+        char warning[] = "\r\n\033[31mCommand blocked for security reasons\033[0m\r\n";
+        send(client_socket, warning, strlen(warning), 0);
+        return 1;
     }
     
     // Send input to shell
-    ssize_t bytes_written = write(c->pty_master_fd, input, input_len);
+    ssize_t bytes_written = write(c->pty_master_fd, processed_input, strlen(processed_input));
     if (bytes_written == -1) {
         printf("[ERROR] Failed to write to shell PTY: %s\n", strerror(errno));
         return 0;
