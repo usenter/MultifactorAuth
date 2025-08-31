@@ -18,6 +18,9 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <netinet/tcp.h>
+#include <termios.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <sys/utsname.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -40,6 +43,11 @@ volatile int running = 1;
 int password_authenticated = 0;
 int rsa_completed = 0;
 int email_authenticated = 0;
+
+// Terminal mode management
+static struct termios original_termios;
+static int raw_mode_enabled = 0;
+static int shell_mode_active = 0;
 int locked = 0;
 static int ecdh_ready = 0;
 static char g_username[MAX_USERNAME_LEN] = "";
@@ -672,6 +680,14 @@ MessageResult handle_auth_phase_messages(const char* buffer);
 MessageResult handle_final_auth_success(const char* buffer);
 static void show_appropriate_prompt(void);
 
+// Terminal mode function declarations
+void enable_raw_mode(void);
+void disable_raw_mode(void);
+void cleanup_terminal(void);
+void signal_handler(int sig);
+int detect_shell_mode(const char* message);
+int process_raw_input(int client_socket);
+
 // Function to receive messages from server (chat mode)
 void* receive_messages(void* arg) {
     int client_socket = *(int*)arg;
@@ -805,6 +821,20 @@ MessageResult process_server_message(int client_socket, const char* buffer) {
         return auth_result;
     }
     
+    // Handle shell mode changes
+    int shell_mode_change = detect_shell_mode(buffer);
+    if (shell_mode_change == 1 && !shell_mode_active) {
+        // Shell mode enabled
+        shell_mode_active = 1;
+        enable_raw_mode();
+        printf("[CLIENT] Switched to raw mode for interactive shell\n");
+    } else if (shell_mode_change == 0 && shell_mode_active) {
+        // Shell mode disabled
+        shell_mode_active = 0;
+        disable_raw_mode();
+        printf("[CLIENT] Switched back to line mode\n");
+    }
+    
     // Handle token-related messages  
     MessageResult token_result = handle_token_messages(buffer);
     if (token_result != MSG_PROCESSED) {
@@ -818,8 +848,8 @@ MessageResult process_server_message(int client_socket, const char* buffer) {
         char* newline = strchr(token, '\n');
         if (newline) *newline = '\0';
         
-        printf("[JWT] Received new token from server (length: %zu)\n", strlen(token));
-        printf("[JWT] Token preview: %.50s...\n", token);
+        //printf("[JWT] Received new token from server (length: %zu)\n", strlen(token));
+        //printf("[JWT] Token preview: %.50s...\n", token);
         save_jwt_token(token);
         return MSG_PROCESSED;
     }
@@ -841,39 +871,57 @@ MessageResult process_server_message(int client_socket, const char* buffer) {
 }
 
 MessageResult handle_rsa_messages(int client_socket, const char* buffer) {
+    // Handle standardized RSA auth success message
+    if (strncmp(buffer, "PHASE:RSA RSA_AUTH_SUCCESS", 26) == 0) {
+        rsa_completed = 1;
+        printf("\n[RSA] RSA authentication successful!\n");
+        printf("SERVER: %s\n", buffer);
+
+        // Check if this was done via JWT
+        if (strstr(buffer, "by JWT")) {
+            printf("[JWT] RSA authentication completed using JWT token.\n");
+        }
+
+        return MSG_CONTINUE;
+    }
+
+    // Handle RSA challenge (unchanged - this is a request, not a success message)
     if (strstr(buffer, "RSA_CHALLENGE:") && !rsa_completed) {
         char* challenge_start = strstr(buffer, "RSA_CHALLENGE:") + 14;
         char* challenge_end = strchr(challenge_start, '\n');
         if (challenge_end) *challenge_end = '\0';
-        
+
         printf("\n[RSA] Performing RSA mutual authentication...\n");
         if (handle_rsa_challenge(client_socket, challenge_start)) {
             rsa_completed = 1;
-            
+
             return MSG_CONTINUE;
         } else {
             printf("[RSA] FAILED: RSA authentication failed! Connection may be terminated.\n");
             return MSG_EXIT;
         }
     }
-    
+
+    // Handle legacy RSA_AUTH_SUCCESS for backward compatibility
+    if (strncmp(buffer, "RSA_AUTH_SUCCESS", 16) == 0) {
+        rsa_completed = 1;
+        printf("\n[LEGACY] RSA authentication successful!\n");
+        return MSG_CONTINUE;
+    }
+
+    // Handle error messages (unchanged - these are error conditions)
     if (strstr(buffer, "RSA_FAILED")) {
         printf("\nRSA authentication failed - connection may be terminated by server.\n");
         running = 0;
         return MSG_EXIT;
     }
-    
+
     if (strstr(buffer, "SECURITY_ERROR")) {
         printf("\nSECURITY ERROR: RSA authentication is required but failed.\n");
         printf("Make sure you have the correct RSA keys for your client.\n");
         return MSG_EXIT;
     }
-    
-    if (strncmp(buffer, "RSA_AUTH_SUCCESS", 16) == 0) {
-        rsa_completed = 1;
-        return MSG_CONTINUE;
-    }
-    
+
     return MSG_PROCESSED;
 }
 
@@ -982,18 +1030,44 @@ MessageResult handle_auth_state_messages(const char* buffer) {
 }
 
 MessageResult handle_token_messages(const char* buffer) {
-    if (strstr(buffer, "AUTH_TOKEN_EXPIRED")) {
-        printf("\nYour token has expired. Use /newToken to request a new one.\n");
+    // Handle standardized token-related messages
+    if (strncmp(buffer, "PHASE:TOKEN TOKEN_EXPIRED", 25) == 0) {
+        printf("\nYour authentication token has expired. Use /newToken to request a new one.\n");
         struct timespec delay = {0, 300000000};
         nanosleep(&delay, NULL);
         show_appropriate_prompt();
+        return MSG_CONTINUE;
+    }
 
+    if (strncmp(buffer, "PHASE:TOKEN TOKEN_FAIL", 22) == 0) {
+        const char* token_fail_message = buffer + 23;
+        printf("[TOKEN] %s\n", token_fail_message);
+        struct timespec delay = {0, 300000000};
+        nanosleep(&delay, NULL);
+        show_appropriate_prompt();
+        return MSG_CONTINUE;
+    }
+
+    if (strncmp(buffer, "PHASE:TOKEN TOKEN_GEN_SUCCESS", 29) == 0) {
+        printf("A new authentication token has been sent to your email.\n");
+        struct timespec delay = {0, 150000000};
+        nanosleep(&delay, NULL);
+        show_appropriate_prompt();
+        return MSG_CONTINUE;
+    }
+
+    // Handle legacy token messages for backward compatibility
+    if (strstr(buffer, "AUTH_TOKEN_EXPIRED")) {
+        printf("\n[LEGACY] Your token has expired. Use /newToken to request a new one.\n");
+        struct timespec delay = {0, 300000000};
+        nanosleep(&delay, NULL);
+        show_appropriate_prompt();
         return MSG_CONTINUE;
     }
 
     if (strstr(buffer, "AUTH_TOKEN_FAIL")) {
         const char* token_fail_message = buffer+ 16;
-        printf("%s\n", token_fail_message);
+        printf("[LEGACY] %s\n", token_fail_message);
         struct timespec delay = {0, 300000000};
         nanosleep(&delay, NULL);
         show_appropriate_prompt();
@@ -1004,12 +1078,12 @@ MessageResult handle_token_messages(const char* buffer) {
         printf("[JWT] Token verification failed, continuing with normal authentication flow...\n");
         printf("Please use /login <username> <password> to login\n");
         show_appropriate_prompt();
-        clear_jwt_token(); 
+        clear_jwt_token();
         return MSG_CONTINUE;
     }
 
     if (strstr(buffer, "AUTH_TOKEN_GEN_SUCCESS")) {
-        printf("A new token has been sent to your email.\n");
+        printf("[LEGACY] A new token has been sent to your email.\n");
         struct timespec delay = {0, 150000000};
         nanosleep(&delay, NULL);
         show_appropriate_prompt();
@@ -1020,53 +1094,114 @@ MessageResult handle_token_messages(const char* buffer) {
 }
 
 MessageResult handle_auth_phase_messages(const char* buffer) {
-    if (strncmp(buffer, "PHASE:EMAIL", 11) == 0) {
-        if (strstr(buffer, "AUTH_SUCCESS") && strstr(buffer, "Email token verified successfully")) {
+    // Handle standardized auth success messages
+    if (strstr(buffer, "_AUTH_SUCCESS")) {
+        if (strncmp(buffer, "PHASE:EMAIL EMAIL_AUTH_SUCCESS", 31) == 0) {
+            email_authenticated = 1;
             printf("\nEmail verification successful! You are now fully authenticated.\n");
             printf("SERVER: %s\n", buffer);
-            email_authenticated = 1;
+
+            // Check if this was done via JWT
+            if (strstr(buffer, "by JWT")) {
+                printf("[JWT] Email authentication completed using JWT token.\n");
+            }
+
             // Save the new JWT token that should be received after full authentication
+            return MSG_CONTINUE;
+        }
+        else if (strncmp(buffer, "PHASE:PASSWORD PASSWORD_AUTH_SUCCESS", 37) == 0) {
+            password_authenticated = 1;
+            printf("\nPassword verified. Please check your email for a 6-digit token.\n");
+            printf("Use /token <code> to enter the token, or /newToken to request a new one.\n");
+
+            // Check if this was done via JWT
+            if (strstr(buffer, "by JWT")) {
+                printf("[JWT] Password authentication completed using JWT token.\n");
+            }
+
+            struct timespec delay = {0, 150000000};
+            nanosleep(&delay, NULL);
+            show_appropriate_prompt();
+            return MSG_CONTINUE;
+        }
+        else if (strncmp(buffer, "PHASE:FINAL FINAL_AUTH_SUCCESS", 30) == 0) {
+            email_authenticated = 1;
+            password_authenticated = 1;
+            rsa_completed = 1;
+            locked = 0;
+            printf("\nFinal authentication successful! All authentication phases completed.\n");
+            printf("SERVER: %s\n", buffer);
+
+            // Check if this was done via JWT
+            if (strstr(buffer, "by JWT")) {
+                printf("[JWT] Final authentication completed using JWT token.\n");
+            }
+
+            struct timespec delay = {0, 150000000};
+            nanosleep(&delay, NULL);
+            show_appropriate_prompt();
+            return MSG_CONTINUE;
+        }
+    }
+
+    // Handle legacy PHASE:EMAIL messages for backward compatibility
+    if (strncmp(buffer, "PHASE:EMAIL", 11) == 0) {
+        if (strstr(buffer, "You are already in email verification phase")) {
+            printf("\n%s\n", buffer + 12); // Skip "PHASE:EMAIL " prefix
+            return MSG_CONTINUE;
+        }
+        
+        if (strstr(buffer, "AUTH_SUCCESS") && strstr(buffer, "Email token verified successfully")) {
+            printf("\n[LEGACY] Email verification successful! You are now fully authenticated.\n");
+            printf("SERVER: %s\n", buffer);
+            email_authenticated = 1;
             return MSG_CONTINUE;
         }
         if (strstr(buffer, "AUTH_SUCCESS") && strstr(buffer, "JWT")) {
             password_authenticated = 1;
-            printf("\nPassword verified from JWT. Please check your email for a 6-digit token.\n");
+            printf("\n[LEGACY] Password verified from JWT. Please check your email for a 6-digit token.\n");
             printf("Use /token <code> to enter the token, or /newToken to request a new one.\n");
             struct timespec delay = {0, 150000000};
             nanosleep(&delay, NULL);
             show_appropriate_prompt();
             return MSG_CONTINUE;
         }
-        if (strstr(buffer, "Password verified")) {
+        // Only treat as legacy auth success if it's the exact old format "Password verified."
+        if (strcmp(buffer, "PHASE:EMAIL Password verified.") == 0) {
             password_authenticated = 1;
-            printf("\nPassword verified. Please check your email for a 6-digit token.\n");
+            printf("\n[LEGACY] Password verified. Please check your email for a 6-digit token.\n");
             printf("Use /token <code> to enter the token, or /newToken to request a new one.\n");
             struct timespec delay = {0, 150000000};
             nanosleep(&delay, NULL);
             show_appropriate_prompt();
             return MSG_CONTINUE;
         }
-        
-        printf("\n%s", buffer);
+
+        // For all other PHASE:EMAIL messages, just display them
+        printf("\n%s\n", buffer + 12); // Skip "PHASE:EMAIL " prefix
         return MSG_CONTINUE;
     }
-    
+
     return MSG_PROCESSED;
 }
 
 MessageResult handle_final_auth_success(const char* buffer) {
-    if (strstr(buffer, "AUTH_SUCCESS")) {
-        printf("\n%s", buffer);
+    // This function now primarily handles legacy messages since FINAL_AUTH_SUCCESS
+    // is handled in handle_auth_phase_messages() for standardized format
+
+    // Handle legacy general AUTH_SUCCESS messages for backward compatibility
+    if (strstr(buffer, "AUTH_SUCCESS") && !strstr(buffer, "_AUTH_SUCCESS")) {
+        printf("\n[LEGACY] %s", buffer);
         email_authenticated = 1;
         password_authenticated = 1;
         rsa_completed = 1;
         locked = 0;
-        struct timespec delay = {0, 150000000}; 
+        struct timespec delay = {0, 150000000};
         nanosleep(&delay, NULL);
         show_appropriate_prompt();
         return MSG_CONTINUE;
     }
-    
+
     return MSG_PROCESSED;
 }
 
@@ -1197,74 +1332,92 @@ int client_mode(int client_socket, const char* username) {
     // Show appropriate prompt since authentication handshake is complete
     show_appropriate_prompt();
 
+    // Set up signal handlers
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
     // Main loop to send messages
-    while (running && fgets(buffer, BUFFER_SIZE, stdin)) {
-        buffer[strcspn(buffer, "\r\n")] = 0;
-        if (!running) break;
-        if (strcmp(buffer, "/quit") == 0) {
-            running = 0;
-            break;
-        }
-        if (strlen(buffer) > 0) {
-            if(locked){
-                snprintf(buffer, sizeof(buffer), "/time");
-                send_secure(client_socket, buffer, strlen(buffer));
-                continue;
-            }
-            if (!password_authenticated) {
-                if (strncmp(buffer, "/login", 6) == 0)  {
-                    
-                    if (send_secure(client_socket, buffer, strlen(buffer)) < 0) {
-                        printf("Failed to send message\n");
-                        running = 0;
-                        break;
-                    }
-                    
-                }
-                else if (!locked) {
-                    printf("Please authenticate first. Use: /login <username> <password>\n");
-                    printf("auth> ");
-                    continue;
-                }
-                else{
-                    printf("Please use /login <username> <password> to login\n");
-                    show_appropriate_prompt();
-                    continue;
-                }
-
-            }
-            else if(!email_authenticated) {
-                if(strncmp(buffer, "/token", 6) == 0 || strncmp(buffer, "/newToken", 9) == 0){
-                    //printf("[CLIENT_DEBUG] Sending token command to server: '%s'\n", buffer);
-                    if (send_secure(client_socket, buffer, strlen(buffer)) < 0) {
-                        printf("Failed to send message\n");
-                        running = 0;
-                        break;
-                    }
-                }
-                else {
-                    printf("Please authenticate first. Use: /token <code> or /newToken\n");
-                    printf("auth> ");
-                    continue;
-                }
-            } else {
-                // Use send_secure for all post-authentication messages
-                if (send_secure(client_socket, buffer, strlen(buffer)) < 0) {
-                    printf("Failed to send message\n");
-                    running = 0;
+    while (running) {
+        if (shell_mode_active && raw_mode_enabled) {
+            // Raw mode - process individual keystrokes
+            if (!process_raw_input(client_socket)) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     break;
                 }
             }
-        }
-        if (password_authenticated && email_authenticated) {
-            if(strncmp(buffer, "/file", 5) == 0){
-                file_handling(username);
+            usleep(1000); // Small delay to prevent busy waiting
+        } else {
+            // Line mode - use fgets
+            if (!fgets(buffer, BUFFER_SIZE, stdin)) {
+                if (!running) break;
+                continue;
             }
-            else{
-                show_appropriate_prompt();
+            
+            buffer[strcspn(buffer, "\r\n")] = 0;
+            if (!running) break;
+            if (strcmp(buffer, "/quit") == 0) {
+                running = 0;
+                break;
             }
-        } 
-    }
+            
+            // Process line mode input
+            if (strlen(buffer) > 0) {
+                if(locked){
+                    snprintf(buffer, sizeof(buffer), "/time");
+                    send_secure(client_socket, buffer, strlen(buffer));
+                    continue;
+                }
+                if (!password_authenticated) {
+                    if (strncmp(buffer, "/login", 6) == 0)  {
+                        if (send_secure(client_socket, buffer, strlen(buffer)) < 0) {
+                            printf("Failed to send message\n");
+                            running = 0;
+                            break;
+                        }
+                    }
+                    else{
+                        printf("Please use /login <username> <password> to login\n");
+                        show_appropriate_prompt();
+                        continue;
+                    }
+                }
+                else if(!email_authenticated) {
+                    if(strncmp(buffer, "/token", 6) == 0 || strncmp(buffer, "/newToken", 9) == 0){
+                        if (send_secure(client_socket, buffer, strlen(buffer)) < 0) {
+                            printf("Failed to send message\n");
+                            running = 0;
+                            break;
+                        }
+                    }
+                    else {
+                        printf("Please authenticate first. Use: /token <code> or /newToken\n");
+                        printf("auth> ");
+                        continue;
+                    }
+                } else {
+                    // Use send_secure for all post-authentication messages
+                    if (send_secure(client_socket, buffer, strlen(buffer)) < 0) {
+                        printf("Failed to send message\n");
+                        running = 0;
+                        break;
+                    }
+                }
+            }
+            
+            // Handle post-authentication actions
+            if (password_authenticated && email_authenticated) {
+                if(strncmp(buffer, "/file", 5) == 0){
+                    file_handling(username);
+                }
+                else{
+                    show_appropriate_prompt();
+                }
+            }
+        } // End of line mode block
+    } // End of main while loop
+    
+    // Cleanup
+    cleanup_terminal();
     running = 0;
     shutdown(client_socket, SHUT_RDWR);
     pthread_join(receive_thread, NULL);
@@ -1480,6 +1633,158 @@ int generate_self_signed_cert(const char* username) {
     X509_free(x509);
     EVP_PKEY_free(pkey);
     printf("Self-signed certificate generated: %s\n", cert_path);
+    return 1;
+}
+
+// ================= TERMINAL MODE FUNCTIONS =================
+
+void enable_raw_mode() {
+    if (raw_mode_enabled) return;
+    
+    // Get current terminal attributes
+    if (tcgetattr(STDIN_FILENO, &original_termios) == -1) {
+        perror("tcgetattr");
+        return;
+    }
+    
+    struct termios raw = original_termios;
+    
+    // Modify terminal attributes for raw mode
+    raw.c_lflag &= ~(ECHO | ICANON | ISIG | IEXTEN);
+    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_cflag |= CS8;
+    raw.c_oflag &= ~(OPOST);
+    
+    // Set minimum characters and timeout for read
+    raw.c_cc[VMIN] = 1;   // Read at least 1 character
+    raw.c_cc[VTIME] = 0;  // No timeout
+    
+    // Apply the new settings
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) {
+        perror("tcsetattr");
+        return;
+    }
+    
+    raw_mode_enabled = 1;
+    printf("[CLIENT] Raw mode enabled\n");
+}
+
+void disable_raw_mode() {
+    if (!raw_mode_enabled) return;
+    
+    // Restore original terminal attributes
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_termios) == -1) {
+        perror("tcsetattr");
+    }
+    
+    raw_mode_enabled = 0;
+    printf("[CLIENT] Raw mode disabled\n");
+}
+
+void cleanup_terminal() {
+    if (raw_mode_enabled) {
+        disable_raw_mode();
+    }
+}
+
+void signal_handler(int sig) {
+    if (sig == SIGINT || sig == SIGTERM) {
+        running = 0;
+        cleanup_terminal();
+        exit(0);
+    }
+}
+
+int detect_shell_mode(const char* message) {
+    // Detect when server enables shell mode
+    if (strstr(message, "Interactive shell enabled") || 
+        strstr(message, "Filtered shell enabled")) {
+        return 1;
+    }
+    
+    // Detect when server disables shell mode
+    if (strstr(message, "Exited interactive shell") || 
+        strstr(message, "Exited filtered shell")) {
+        return 0;
+    }
+    
+    return -1; // No change
+}
+
+int process_raw_input(int client_socket) {
+    char ch;
+    ssize_t bytes_read = read(STDIN_FILENO, &ch, 1);
+    
+    if (bytes_read <= 0) {
+        return 0;
+    }
+    
+    // Handle special key combinations
+    if (ch == 3) { // Ctrl+C
+        // Send Ctrl+C to server
+        if (send_secure(client_socket, "\003", 1) < 0) {
+            printf("Failed to send Ctrl+C\n");
+            return 0;
+        }
+        return 1;
+    }
+    
+    if (ch == 4) { // Ctrl+D
+        // Send Ctrl+D to server
+        if (send_secure(client_socket, "\004", 1) < 0) {
+            printf("Failed to send Ctrl+D\n");
+            return 0;
+        }
+        return 1;
+    }
+    
+    // Handle escape sequences (arrow keys, function keys, etc.)
+    if (ch == 27) { // ESC
+        char seq[3];
+        seq[0] = ch;
+        
+        // Try to read the next two characters
+        if (read(STDIN_FILENO, &seq[1], 1) == 1) {
+            if (seq[1] == '[') {
+                if (read(STDIN_FILENO, &seq[2], 1) == 1) {
+                    // Send the complete escape sequence
+                    if (send_secure(client_socket, seq, 3) < 0) {
+                        printf("Failed to send escape sequence\n");
+                        return 0;
+                    }
+                    return 1;
+                } else {
+                    // Send partial sequence
+                    if (send_secure(client_socket, seq, 2) < 0) {
+                        printf("Failed to send escape sequence\n");
+                        return 0;
+                    }
+                    return 1;
+                }
+            } else {
+                // Send partial sequence
+                if (send_secure(client_socket, seq, 2) < 0) {
+                    printf("Failed to send escape sequence\n");
+                    return 0;
+                }
+                return 1;
+            }
+        } else {
+            // Just ESC
+            if (send_secure(client_socket, &ch, 1) < 0) {
+                printf("Failed to send ESC\n");
+                return 0;
+            }
+            return 1;
+        }
+    }
+    
+    // Regular character - send it
+    if (send_secure(client_socket, &ch, 1) < 0) {
+        printf("Failed to send character\n");
+        return 0;
+    }
+    
     return 1;
 }
 

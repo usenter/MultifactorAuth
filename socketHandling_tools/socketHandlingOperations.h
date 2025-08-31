@@ -16,6 +16,24 @@ typedef enum {
     CLIENT_MODE_FILE
 } client_mode_t;
 
+#define MAX_HISTORY_SIZE 100
+#define MAX_LINE_LENGTH 1024
+
+// Command history entry
+typedef struct {
+    char command[MAX_LINE_LENGTH];
+    time_t timestamp;
+} history_entry_t;
+
+// Line editor state
+typedef struct {
+    char line[MAX_LINE_LENGTH];        // Current line being edited
+    int cursor_pos;                    // Cursor position in line
+    int line_length;                   // Current length of line
+    int history_index;                 // Current position in history (-1 = current line)
+    char saved_line[MAX_LINE_LENGTH];  // Saved line when browsing history
+} line_editor_t;
+
 // Complete client structure definition
 typedef struct client {
     int socket;
@@ -28,6 +46,22 @@ typedef struct client {
     time_t connect_time;
     client_mode_t mode;
     char cwd[256]; // Current working directory for file mode
+
+    // Enhanced shell features
+    history_entry_t command_history[MAX_HISTORY_SIZE];
+    int history_count;                 // Number of commands in history
+    int history_position;              // Current position for new commands
+    line_editor_t line_editor;         // Line editing state
+    int raw_mode;                      // Whether client is in raw mode
+    
+    // PTY shell for real shell interaction
+    int pty_master_fd;                 // Master PTY file descriptor
+    pid_t shell_pid;                   // Shell process ID
+    pthread_t shell_thread;            // Thread handling shell I/O
+    int shell_active;                  // Whether shell is running
+    char command_buffer[1024];         // Buffer for command filtering
+    int command_buffer_pos;            // Position in command buffer
+
     UT_hash_handle hh; // For uthash
 } client_t;
 

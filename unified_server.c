@@ -503,6 +503,13 @@ void remove_client(int client_socket) {
         }
         // Remove from socket tracking
         remove_socket_info(client_socket);
+        // Reset terminal state for any socket that might be in raw mode
+        // We can't check c->raw_mode here since we don't have the client struct,
+        // so we send the reset just in case
+        force_terminal_reset(client_socket);
+        snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Emergency terminal reset sent for socket %d\n", client_socket);
+        FILE_LOG(log_message);
+
         // Remove from epolls
         int epoll_result = epoll_ctl(auth_thread_ctx.epoll_fd, EPOLL_CTL_DEL, client_socket, NULL);
         if (epoll_result < 0 && errno != ENOENT) {
@@ -588,6 +595,14 @@ void remove_client(int client_socket) {
         FILE_LOG(log_message);
     }
     
+    // Reset terminal state if client was in raw mode before closing
+    if (c->raw_mode) {
+        force_terminal_reset(client_socket);
+        c->raw_mode = 0;
+        snprintf(log_message, sizeof(log_message), "[INFO][CLEANUP] Terminal reset sent for socket %d (client was in raw mode)\n", client_socket);
+        FILE_LOG(log_message);
+    }
+
     // Close socket outside of mutex
     close(client_socket);
     
@@ -717,6 +732,14 @@ void promote_to_authenticated(int socket, unsigned int account_id, int issue_new
         strncpy(new_client->nickname, user->username, sizeof(new_client->nickname) - 1);
         new_client->authLevel = user->authLevel; // Copy the user's authority level
     }
+
+    // Initialize enhanced shell features
+    memset(new_client->command_history, 0, sizeof(new_client->command_history));
+    new_client->history_count = 0;
+    new_client->history_position = 0;
+    memset(&new_client->line_editor, 0, sizeof(line_editor_t));
+    new_client->line_editor.history_index = -1;
+    new_client->raw_mode = 0;
     
     // Add to clients map
     pthread_mutex_lock(&clients_mutex);
@@ -1130,7 +1153,7 @@ void* auth_thread_func(void *arg) {
                             sess->auth_status = AUTH_FULLY_AUTHENTICATED;
                         }
                         
-                        const char* msg = "AUTH_SUCCESS Resumed from JWT token. Welcome back!\n";
+                        const char* msg = "PHASE:FINAL FINAL_AUTH_SUCCESS Resumed from JWT token. Welcome back!\n";
                         send_secure(client_socket, msg, strlen(msg));
                         promote_to_authenticated(client_socket, acc, 0); // Don't issue new JWT for resume
                         continue;
@@ -1152,8 +1175,8 @@ void* auth_thread_func(void *arg) {
                             FILE_LOG(log_message);
                         }
 
-                        // Send PHASE:EMAIL AUTH_SUCCESS message to allow client to skip to correct phase
-                        const char* msg = "PHASE:EMAIL AUTH_SUCCESS through JWT\n";
+                        // Send PHASE:PASSWORD AUTH_SUCCESS message to allow client to skip to correct phase
+                        const char* msg = "PHASE:PASSWORD PASSWORD_AUTH_SUCCESS through JWT\n";
                         send_secure(client_socket, msg, strlen(msg));
 
                         // Update socket info with account_id
@@ -1162,7 +1185,7 @@ void* auth_thread_func(void *arg) {
                         
                     } else {
                         // Invalid stage for resume
-                        const char* msg = "JWT_TOKEN_FAILED Token stage not suitable for resume. Please /login again.\n";
+                        const char* msg = "PHASE:TOKEN TOKEN_FAIL Token stage not suitable for resume. Please /login again.\n";
                         send_secure(client_socket, msg, strlen(msg));
                         continue;
                     }
@@ -1184,7 +1207,7 @@ void* auth_thread_func(void *arg) {
                             info->account_id, acc, stage, token_version, iat, exp, uname, verify_result);
                     FILE_LOG(log_message);
 
-                    const char* msg = "JWT_TOKEN_FAILED\n";
+                    const char* msg = "PHASE:TOKEN TOKEN_FAIL JWT verification failed.\n";
                     send_secure(client_socket, msg, strlen(msg));
                     continue;
                 }

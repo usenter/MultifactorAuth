@@ -1,7 +1,7 @@
 # Simplified Makefile for TCP Server/Client Project (Linux)
 CC = clang
 CFLAGS = -Wall -Wextra -std=c17 -pthread -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -g
-LIBS = -lssl -lcrypto -lcurl -lcjson -lmicrohttpd 
+LIBS = -lssl -lcrypto -lcurl -lcjson -lmicrohttpd -lutil 
 
 # Object files
 OBJS = encryptionOperations.o auth_system.o fileHandlingOperations.o emailHandlingOperations.o serverConfigOperations.o socketHandlingOperations.o serverRestOperations.o IPtableOperations.o jwtOperations.o

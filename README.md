@@ -9,6 +9,7 @@ Authenticated chat server with RSA authentication, password protection, and an e
 - **Session Management**: Automatic timeout and cleanup
 - **DOS Protection**: Creates tunable IP Table rules to limit DOS attacks
 - **Multi-Client Chat**: Nicknames, user list, message broadcasting
+- **JWT token generation**: Creates tokens for clients to save authentication status for short periods of time
 
 ### Project layout
 
@@ -24,6 +25,7 @@ MultifactorAuth/
 ├── socketHandling_tools/            # Socket helpers
 ├── IPTable_tools/                   # IPTables rules helpers
 ├── REST_tools/                      # rest_client and server REST helpers
+├── JWT_tools/                       # JSON web token management and issuing
 ├── userDBencryption_tools/          # user_encryptor utility
 ├── RSAkeys/                         # Generated keys/certs (created at runtime)
 ├── UserDirectory/                   # Client-accessible working directory
